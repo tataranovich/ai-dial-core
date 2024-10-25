@@ -2,11 +2,11 @@ package com.epam.aidial.core.server.controller;
 
 import com.epam.aidial.core.server.Proxy;
 import com.epam.aidial.core.server.ProxyContext;
-import com.epam.aidial.core.server.data.ResourceAccessType;
-import com.epam.aidial.core.server.resource.ResourceDescriptor;
-import com.epam.aidial.core.server.resource.ResourceDescriptorFactory;
 import com.epam.aidial.core.server.security.AccessService;
-import com.epam.aidial.core.server.util.HttpStatus;
+import com.epam.aidial.core.server.util.ResourceDescriptorFactory;
+import com.epam.aidial.core.storage.data.ResourceAccessType;
+import com.epam.aidial.core.storage.http.HttpStatus;
+import com.epam.aidial.core.storage.resource.ResourceDescriptor;
 import io.vertx.core.Future;
 import lombok.AllArgsConstructor;
 

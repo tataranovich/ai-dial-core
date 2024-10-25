@@ -7,13 +7,13 @@ import com.epam.aidial.core.server.ProxyContext;
 import com.epam.aidial.core.server.data.ItemLimitStats;
 import com.epam.aidial.core.server.data.LimitStats;
 import com.epam.aidial.core.server.data.ResourceTypes;
-import com.epam.aidial.core.server.resource.ResourceDescriptor;
-import com.epam.aidial.core.server.resource.ResourceDescriptorFactory;
-import com.epam.aidial.core.server.service.ResourceService;
 import com.epam.aidial.core.server.token.TokenUsage;
 import com.epam.aidial.core.server.util.BucketBuilder;
-import com.epam.aidial.core.server.util.HttpStatus;
 import com.epam.aidial.core.server.util.ProxyUtil;
+import com.epam.aidial.core.server.util.ResourceDescriptorFactory;
+import com.epam.aidial.core.storage.http.HttpStatus;
+import com.epam.aidial.core.storage.resource.ResourceDescriptor;
+import com.epam.aidial.core.storage.service.ResourceService;
 import io.vertx.core.Future;
 import io.vertx.core.Vertx;
 import lombok.RequiredArgsConstructor;
@@ -103,7 +103,7 @@ public class RateLimiter {
     private void collectTokenLimitStats(ProxyContext context, LimitStats limitStats, long timestamp, String deploymentName) {
         String tokensPath = getPathToTokens(deploymentName);
         ResourceDescriptor resourceDescription = getResourceDescription(context, tokensPath);
-        String json = resourceService.getResource(resourceDescription, true);
+        String json = resourceService.getResource(resourceDescription);
         TokenRateLimit rateLimit = ProxyUtil.convertToObject(json, TokenRateLimit.class);
         if (rateLimit == null) {
             return;
@@ -114,7 +114,7 @@ public class RateLimiter {
     private void collectRequestLimitStats(ProxyContext context, LimitStats limitStats, long timestamp, String deploymentName) {
         String requestsPath = getPathToRequests(deploymentName);
         ResourceDescriptor resourceDescription = getResourceDescription(context, requestsPath);
-        String json = resourceService.getResource(resourceDescription, true);
+        String json = resourceService.getResource(resourceDescription);
         RequestRateLimit rateLimit = ProxyUtil.convertToObject(json, RequestRateLimit.class);
         if (rateLimit == null) {
             return;

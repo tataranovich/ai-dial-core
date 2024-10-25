@@ -10,12 +10,12 @@ import com.epam.aidial.core.server.data.DeploymentData;
 import com.epam.aidial.core.server.data.FeaturesData;
 import com.epam.aidial.core.server.data.ListData;
 import com.epam.aidial.core.server.data.ResourceTypes;
-import com.epam.aidial.core.server.resource.ResourceDescriptor;
-import com.epam.aidial.core.server.resource.ResourceDescriptorFactory;
 import com.epam.aidial.core.server.service.PermissionDeniedException;
 import com.epam.aidial.core.server.service.ResourceNotFoundException;
-import com.epam.aidial.core.server.util.HttpStatus;
-import com.epam.aidial.core.server.util.UrlUtil;
+import com.epam.aidial.core.server.util.ResourceDescriptorFactory;
+import com.epam.aidial.core.storage.http.HttpStatus;
+import com.epam.aidial.core.storage.resource.ResourceDescriptor;
+import com.epam.aidial.core.storage.util.UrlUtil;
 import io.vertx.core.Future;
 import lombok.RequiredArgsConstructor;
 

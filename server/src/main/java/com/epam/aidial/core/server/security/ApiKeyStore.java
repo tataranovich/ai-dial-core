@@ -4,13 +4,13 @@ import com.epam.aidial.core.config.Key;
 import com.epam.aidial.core.server.config.FileConfigStore;
 import com.epam.aidial.core.server.data.ApiKeyData;
 import com.epam.aidial.core.server.data.ResourceTypes;
-import com.epam.aidial.core.server.resource.ResourceDescriptor;
-import com.epam.aidial.core.server.resource.ResourceDescriptorFactory;
-import com.epam.aidial.core.server.service.ResourceService;
-import com.epam.aidial.core.server.util.EtagHeader;
-import com.epam.aidial.core.server.util.HttpException;
-import com.epam.aidial.core.server.util.HttpStatus;
 import com.epam.aidial.core.server.util.ProxyUtil;
+import com.epam.aidial.core.server.util.ResourceDescriptorFactory;
+import com.epam.aidial.core.storage.http.HttpException;
+import com.epam.aidial.core.storage.http.HttpStatus;
+import com.epam.aidial.core.storage.resource.ResourceDescriptor;
+import com.epam.aidial.core.storage.service.ResourceService;
+import com.epam.aidial.core.storage.util.EtagHeader;
 import io.vertx.core.Future;
 import io.vertx.core.Vertx;
 import lombok.extern.slf4j.Slf4j;
@@ -20,8 +20,8 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.function.Function;
 
-import static com.epam.aidial.core.server.resource.ResourceDescriptor.PATH_SEPARATOR;
 import static com.epam.aidial.core.server.security.ApiKeyGenerator.generateKey;
+import static com.epam.aidial.core.storage.resource.ResourceDescriptor.PATH_SEPARATOR;
 
 /**
  * The store keeps per request and project API key data.
@@ -62,7 +62,7 @@ public class ApiKeyStore {
         data.setPerRequestKey(perRequestKey);
         String json = ProxyUtil.convertToString(data);
         try {
-            resourceService.putResource(resource, json, EtagHeader.NEW_ONLY, false);
+            resourceService.putResource(resource, json, EtagHeader.NEW_ONLY);
         } catch (HttpException exception) {
             throw exception.getStatus() == HttpStatus.PRECONDITION_FAILED
                     ? new IllegalStateException(String.format("API key %s already exists in the storage", perRequestKey))
