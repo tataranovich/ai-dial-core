@@ -157,8 +157,13 @@ public class ProxyContext {
 
     public Future<?> respond(Throwable error, String fallbackError) {
         return error instanceof HttpException exception
-                ? respond(exception.getStatus(), exception.getMessage())
+                ? respond(exception)
                 : respond(HttpStatus.INTERNAL_SERVER_ERROR, fallbackError);
+    }
+
+    public Future<?> respond(HttpException exception) {
+        response.headers().addAll(exception.getHeaders());
+        return respond(exception.getStatus(), exception.getMessage());
     }
 
     public String getProject() {
