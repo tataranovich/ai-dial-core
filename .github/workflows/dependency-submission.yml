@@ -2,25 +2,8 @@ name: Dependency Submission
 
 on:
   push:
-    branches: [ 'development' ]
-
-permissions:
-  contents: write
+    branches: [ 'test-ci' ]
 
 jobs:
   dependency-submission:
-    runs-on: ubuntu-latest
-    steps:
-    - name: Checkout sources
-      uses: actions/checkout@v4
-      with:
-        lfs: 'true'
-    - name: Setup Java
-      uses: actions/setup-java@v4
-      with:
-        distribution: 'temurin'
-        java-version: 17
-    - name: Debug gradle files
-      run: ls -l gradle/wrapper/
-    - name: Generate and submit dependency graph
-      uses: gradle/actions/dependency-submission@v4
+    uses: epam/ai-dial-ci/.github/workflows/generic_docker_release.yml@gradle-dependency-submission
