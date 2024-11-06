@@ -18,7 +18,9 @@ jobs:
       with:
         distribution: 'temurin'
         java-version: 17
-    - name: Setup Gradle
-      run: ./gradlew --version
+    - name: Debug gradle files
+      run: |
+        ls -l
+        ls -l gradle/wrapper/
     - name: Generate and submit dependency graph
       uses: gradle/actions/dependency-submission@v4
