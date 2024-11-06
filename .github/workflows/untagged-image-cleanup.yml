@@ -8,7 +8,7 @@ on:
 
 jobs:
   cleanup-untagged-images:
-    uses: epam/ai-dial-ci/.github/workflows/ghcr-image-cleanup.yml@main
+    uses: epam/ai-dial-ci/.github/workflows/ghcr-image-cleanup.yml@image-cleanup
     with:
       image-names: ai-dial-chat
       dry-run: true
