@@ -1,16 +1,14 @@
 name: Cleanup untagged images
 
 on:
-  workflow_dispatch:
-    secrets:
-      GHCR_TOKEN:
-        required: true
+  schedule:
+    - cron: "5 11 * * *"
 
 jobs:
   cleanup-untagged-images:
     uses: epam/ai-dial-ci/.github/workflows/ghcr-image-cleanup.yml@image-cleanup
     with:
-      image-names: ai-dial-chat
+      image-names: ai-dial-core
       dry-run: true
     secrets:
       GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
