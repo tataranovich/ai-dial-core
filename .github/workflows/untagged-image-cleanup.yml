@@ -1,14 +1,31 @@
 name: Cleanup untagged images
 
 on:
-  schedule:
-    - cron: "0 0 * * *"
+  # schedule:
+  #   - cron: "0 0 * * *"
+  workflow_dispatch:
+    inputs:
+      cut-off:
+        type: string
+        description: Specifies how old package versions need to be before being considered for deletion.
+        default: 1d
+      dry-run:
+        type: string
+        description: Run in dry-run mode
+        default: true
 
 jobs:
-  cleanup-untagged-images:
-    uses: epam/ai-dial-ci/.github/workflows/ghcr-image-cleanup.yml@image-cleanup
-    with:
-      image-names: ai-dial-core
-      dry-run: true
-    secrets:
-      GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+  clean:
+    name: Delete untagged images
+    runs-on: ubuntu-latest
+    permissions:
+      packages: admin
+    steps:
+      - uses: snok/container-retention-policy@4f22ef80902ad409ed55a99dc5133cc1250a0d03 # v3.0.0
+        with:
+          account: "user"
+          token: ${{ secrets.GITHUB_TOKEN }}
+          image-names: "ai-dial-core"
+          tag-selection: "untagged"
+          cut-off: ${{ inputs.cut-off }}
+          dry-run: ${{ inputs.dry-run }}
