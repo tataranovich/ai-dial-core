@@ -19,6 +19,7 @@ jobs:
     name: Delete untagged images
     runs-on: ubuntu-latest
     permissions:
+      id-token: write
       packages: write
     steps:
       - uses: snok/container-retention-policy@4f22ef80902ad409ed55a99dc5133cc1250a0d03 # v3.0.0
