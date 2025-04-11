@@ -16,4 +16,4 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           package: ${{ github.event.repository.name }}
           delete-untagged: true
-          dry-run: true
+          dry-run: false
