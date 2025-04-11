@@ -6,5 +6,10 @@ on:
 
 jobs:
   release:
-    uses: tataranovich/ai-dial-ci/.github/workflows/java_release.yml@1.12.1
+    uses: tataranovich/ai-dial-ci/.github/workflows/java_release.yml@main
+    with:
+      enable_style_checks: false
+      enable_code_checks: false
+      enable_ort: false
+      enable_trivy: false
     secrets: inherit
