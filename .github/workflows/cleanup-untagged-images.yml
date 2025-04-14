@@ -7,13 +7,13 @@ jobs:
   clean:
     name: Delete untagged images
     runs-on: ubuntu-latest
-    permissions:
-      packages: write
+    #permissions:
+    #  packages: write
     steps:
       - uses: dataaxiom/ghcr-cleanup-action@v1
         with:
           owner: ${{ github.repository_owner }}
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.ACTIONS_BOT_TOKEN }}
           package: ${{ github.event.repository.name }}
           delete-untagged: true
           dry-run: false
