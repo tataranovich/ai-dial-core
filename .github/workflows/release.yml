@@ -8,7 +8,3 @@ jobs:
   release:
     uses: tataranovich/ai-dial-ci/.github/workflows/java_release.yml@arm64-builds
     secrets: inherit
-    with:
-      code-checks-enabled: false
-      ort-enabled: false
-      style-checks-enabled: false
