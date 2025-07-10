@@ -2,6 +2,9 @@ package com.epam.aidial.core.server;
 
 import com.epam.aidial.core.server.config.ConfigStore;
 import com.epam.aidial.core.server.config.FileConfigStore;
+import com.epam.aidial.core.server.config.PathNormalizerSpanProcessor;
+import com.epam.aidial.core.server.config.RouteNormalizingMeterFilter;
+import com.epam.aidial.core.server.controller.HealthCheckController;
 import com.epam.aidial.core.server.limiter.RateLimiter;
 import com.epam.aidial.core.server.log.GfLogStore;
 import com.epam.aidial.core.server.log.LogStore;
@@ -36,9 +39,12 @@ import com.epam.aidial.core.storage.service.TimerService;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.google.common.annotations.VisibleForTesting;
 import io.micrometer.core.instrument.Clock;
+import io.micrometer.prometheus.PrometheusConfig;
+import io.micrometer.prometheus.PrometheusMeterRegistry;
 import io.micrometer.registry.otlp.OtlpMeterRegistry;
 import io.opentelemetry.api.OpenTelemetry;
 import io.opentelemetry.sdk.autoconfigure.AutoConfiguredOpenTelemetrySdk;
+import io.opentelemetry.sdk.trace.SpanProcessor;
 import io.vertx.config.spi.utils.JsonObjectHelper;
 import io.vertx.core.Future;
 import io.vertx.core.Vertx;
@@ -89,6 +95,7 @@ public class AiDial {
 
     private BlobStorage storage;
     private ResourceService resourceService;
+    private EncryptionService encryptionService;
 
     private LongSupplier clock = System::currentTimeMillis;
     private Supplier<String> generator = () -> UUID.randomUUID().toString().replace("-", "");
@@ -116,7 +123,7 @@ public class AiDial {
                 Storage storageConfig = Json.decodeValue(settings("storage").toBuffer(), Storage.class);
                 storage = new BlobStorage(storageConfig);
             }
-            EncryptionService encryptionService = new EncryptionService(settings("encryption"));
+            encryptionService = new EncryptionService(settings("encryption"));
 
             redis = CacheClientFactory.create(toJsonNode(settings("redis")));
 
@@ -125,19 +132,19 @@ public class AiDial {
             ResourceService.Settings resourceServiceSettings = Json.decodeValue(settings("resources").toBuffer(), ResourceService.Settings.class);
             resourceService = new ResourceService(timerService, redis, storage, lockService, resourceServiceSettings, storage.getPrefix());
             InvitationService invitationService = new InvitationService(resourceService, encryptionService, settings("invitations"));
-            ApiKeyStore apiKeyStore = new ApiKeyStore(resourceService, vertx);
+            ApiKeyStore apiKeyStore = new ApiKeyStore(vertx, redis, storage.getPrefix());
             ConfigStore configStore = new FileConfigStore(vertx, settings("config"), apiKeyStore);
             ApplicationOperatorService operatorService = new ApplicationOperatorService(client, settings("applications"));
             ApplicationService applicationService = new ApplicationService(vertx, redis, apiKeyStore, encryptionService,
-                    resourceService, lockService, operatorService, generator, settings("applications"));
-            ShareService shareService = new ShareService(resourceService, invitationService, encryptionService, applicationService, configStore);
+                    resourceService, lockService, operatorService, generator, settings("applications"), configStore);
+            ShareService shareService = new ShareService(resourceService, invitationService, encryptionService, applicationService, lockService, configStore);
             RuleService ruleService = new RuleService(resourceService);
             AccessService accessService = new AccessService(encryptionService, shareService, ruleService, settings("access"));
             NotificationService notificationService = new NotificationService(resourceService, encryptionService);
             ResourceOperationService resourceOperationService = new ResourceOperationService(applicationService,
                     resourceService, invitationService, shareService, lockService);
             PublicationService publicationService = new PublicationService(encryptionService, resourceService, accessService,
-                    ruleService, notificationService, applicationService, resourceOperationService, generator, clock);
+                    ruleService, notificationService, applicationService, resourceOperationService, generator, clock, configStore);
             RateLimiter rateLimiter = new RateLimiter(vertx, resourceService);
             CodeInterpreterService codeInterpreterService = new CodeInterpreterService(vertx, redis, resourceService,
                     accessService, encryptionService, operatorService, generator, settings("codeInterpreter"));
@@ -154,12 +161,14 @@ public class AiDial {
 
             ConsentService consentService = new ConsentService(deploymentService, resourceService);
 
+            HealthCheckController healthCheckController = new HealthCheckController(redis, vertx);
+
             proxy = new Proxy(vertx, clientOptions, client, configStore, logStore,
                     rateLimiter, upstreamRouteProvider, accessTokenValidator,
                     storage, encryptionService, apiKeyStore, tokenStatsTracker, resourceService, invitationService,
                     shareService, publicationService, accessService, lockService, resourceOperationService, ruleService,
                     notificationService, applicationService, codeInterpreterService, heartbeatService, upstreamCacheService,
-                    consentService, deploymentService, version());
+                    consentService, deploymentService, healthCheckController, version());
 
             server = vertx.createHttpServer(new HttpServerOptions(settings("server"))).requestHandler(proxy);
             open(server, HttpServer::listen);
@@ -314,13 +323,21 @@ public class AiDial {
             return;
         }
 
-        JsonObject oltp = metrics.toJson().getJsonObject("oltpOptions", new JsonObject());
-        if (oltp == null || !oltp.getBoolean("enabled", false)) {
-            return;
+        MicrometerMetricsOptions micrometer = new MicrometerMetricsOptions(metrics.toJson());
+
+        JsonObject prometheus = metrics.toJson().getJsonObject("prometheusOptions", new JsonObject());
+        if (prometheus != null && prometheus.getBoolean("enabled", false)) {
+            var prometheusReg = new PrometheusMeterRegistry(PrometheusConfig.DEFAULT);
+            prometheusReg.config().meterFilter(new RouteNormalizingMeterFilter());
+            micrometer.setMicrometerRegistry(prometheusReg);
         }
 
-        MicrometerMetricsOptions micrometer = new MicrometerMetricsOptions(metrics.toJson());
-        micrometer.setMicrometerRegistry(new OtlpMeterRegistry(oltp::getString, Clock.SYSTEM));
+        JsonObject oltp = metrics.toJson().getJsonObject("oltpOptions", new JsonObject());
+        if (oltp != null && oltp.getBoolean("enabled", false)) {
+            var otlpReg = new OtlpMeterRegistry(oltp::getString, Clock.SYSTEM);
+            otlpReg.config().meterFilter(new RouteNormalizingMeterFilter());
+            micrometer.setMicrometerRegistry(otlpReg);
+        }
 
         options.setMetricsOptions(micrometer);
     }
@@ -339,7 +356,13 @@ public class AiDial {
         if (otlExporterEndpoint == null) {
             System.setProperty("otel.traces.exporter", "none");
         }
-        OpenTelemetry openTelemetry = AutoConfiguredOpenTelemetrySdk.builder().build().getOpenTelemetrySdk();
+
+        OpenTelemetry openTelemetry = AutoConfiguredOpenTelemetrySdk.builder()
+                .addSpanProcessorCustomizer(((spanProcessor, configProperties) ->
+                        SpanProcessor.composite(new PathNormalizerSpanProcessor(), spanProcessor)))
+                .build()
+                .getOpenTelemetrySdk();
+
         OpenTelemetryOptions otelOpts = new OpenTelemetryOptions(openTelemetry);
         otelOpts.setFactory(new DialTracingFactory(otelOpts.getFactory()));
         vertxOptions.setTracingOptions(otelOpts);

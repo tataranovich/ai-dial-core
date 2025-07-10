@@ -13,6 +13,7 @@ public class ApplicationUtil {
 
     public ApplicationData mapApplication(Application application) {
         ApplicationData data = new ApplicationData();
+        data.setInvalid(application.getInvalid());
         data.setId(application.getName());
         data.setApplication(application.getName());
         data.setDisplayName(application.getDisplayName());
@@ -41,6 +42,8 @@ public class ApplicationUtil {
         if (application.getUpdatedAt() != null) {
             data.setUpdatedAt(application.getUpdatedAt());
         }
+
+        data.setRoutes(application.getRoutes());
 
         return data;
     }

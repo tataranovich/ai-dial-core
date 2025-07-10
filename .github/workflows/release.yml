@@ -6,7 +6,5 @@ on:
 
 jobs:
   release:
-    uses: tataranovich/ai-dial-ci/.github/workflows/java_release.yml@main
-    with:
-      enable_ort: false
+    uses: tataranovich/ai-dial-ci/.github/workflows/java_release.yml@arm64-builds
     secrets: inherit

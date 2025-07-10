@@ -1,10 +1,10 @@
 package com.epam.aidial.core.server.controller;
 
+import com.epam.aidial.core.config.ResourceAccessType;
 import com.epam.aidial.core.server.Proxy;
 import com.epam.aidial.core.server.ProxyContext;
 import com.epam.aidial.core.server.security.AccessService;
 import com.epam.aidial.core.server.util.ResourceDescriptorFactory;
-import com.epam.aidial.core.storage.data.ResourceAccessType;
 import com.epam.aidial.core.storage.http.HttpStatus;
 import com.epam.aidial.core.storage.resource.ResourceDescriptor;
 import io.vertx.core.Future;
@@ -50,4 +50,14 @@ public abstract class AccessControlBaseController {
      * @return a successful future to read the request body after its completion.
      */
     protected abstract Future<?> handle(ResourceDescriptor resource, boolean hasWriteAccess);
+
+    protected boolean shouldHide(ResourceDescriptor resource) {
+        if (resource.isHidden() && resource.isPublic()) {
+            if (context.getApiKeyData().getPerRequestKey() != null) {
+                return false;
+            }
+            return !proxy.getAccessService().hasAdminAccess(context);
+        }
+        return false;
+    }
 }

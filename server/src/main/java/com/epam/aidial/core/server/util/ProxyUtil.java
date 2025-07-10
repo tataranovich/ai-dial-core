@@ -50,7 +50,6 @@ public class ProxyUtil {
             .add(HttpHeaders.TRANSFER_ENCODING, "whatever")
             .add(HttpHeaders.UPGRADE, "whatever")
             .add(HttpHeaders.CONTENT_LENGTH, "whatever")
-            .add(HttpHeaders.ACCEPT_ENCODING, "whatever")
             .add(Proxy.HEADER_API_KEY, "whatever");
     public static final String METADATA_PREFIX = "metadata/";
 
@@ -277,7 +276,7 @@ public class ProxyUtil {
         try {
             return MAPPER.readValue(payload, clazz);
         } catch (JsonProcessingException e) {
-            log.error("Failed to convert payload to the object", e);
+            log.warn("Failed to convert payload to the object", e);
             if (e instanceof MismatchedInputException mismatchedInputException && mismatchedInputException.getPath() != null && !mismatchedInputException.getPath().isEmpty()) {
                 String missingField = mismatchedInputException.getPath().stream()
                         .map(JsonMappingException.Reference::getFieldName)

@@ -5,9 +5,11 @@ import com.epam.aidial.core.server.Proxy;
 import com.epam.aidial.core.server.ProxyContext;
 import com.epam.aidial.core.server.data.ApiKeyData;
 import com.epam.aidial.core.server.function.BaseRequestFunction;
-import com.epam.aidial.core.server.function.CollectRequestAttachmentsFn;
+import com.epam.aidial.core.server.function.CollectRequestChatCompletionAttachmentsFn;
 import com.epam.aidial.core.server.function.CollectRequestDataFn;
 import com.epam.aidial.core.server.function.CollectResponseAttachmentsFn;
+import com.epam.aidial.core.server.function.CollectResponseChatCompletionAttachmentsFn;
+import com.epam.aidial.core.server.function.enhancement.ApplyDefaultDeploymentSettingsFn;
 import com.epam.aidial.core.server.util.ProxyUtil;
 import com.epam.aidial.core.server.vertx.stream.BufferingReadStream;
 import com.epam.aidial.core.storage.http.HttpException;
@@ -38,7 +40,9 @@ public class InterceptorController {
     public InterceptorController(Proxy proxy, ProxyContext context) {
         this.proxy = proxy;
         this.context = context;
-        this.enhancementFunctions = List.of(new CollectRequestAttachmentsFn(proxy, context), new CollectRequestDataFn(proxy, context));
+        this.enhancementFunctions = List.of(new ApplyDefaultDeploymentSettingsFn(proxy, context),
+                new CollectRequestChatCompletionAttachmentsFn(proxy, context),
+                new CollectRequestDataFn(proxy, context));
     }
 
     public Future<?> handle() {
@@ -171,7 +175,7 @@ public class InterceptorController {
                 context.getDeployment().getEndpoint(),
                 proxyResponse.statusCode(), proxyResponse.headers().size());
 
-        CollectResponseAttachmentsFn handler = context.isStreamingRequest() ? new CollectResponseAttachmentsFn(proxy, context) : null;
+        CollectResponseAttachmentsFn handler = context.isStreamingRequest() ? new CollectResponseChatCompletionAttachmentsFn(proxy, context) : null;
 
         BufferingReadStream responseStream = new BufferingReadStream(proxyResponse,
                 ProxyUtil.contentLength(proxyResponse, 1024), handler);
@@ -212,7 +216,7 @@ public class InterceptorController {
         }
         try (InputStream stream = new ByteBufInputStream(responseBody.getByteBuf())) {
             ObjectNode tree = (ObjectNode) ProxyUtil.MAPPER.readTree(stream);
-            var fn = new CollectResponseAttachmentsFn(proxy, context);
+            var fn = new CollectResponseChatCompletionAttachmentsFn(proxy, context);
             return fn.apply(tree);
         } catch (Throwable e) {
             log.warn("Can't parse JSON response body. Trace: {}. Span: {}. Error:",

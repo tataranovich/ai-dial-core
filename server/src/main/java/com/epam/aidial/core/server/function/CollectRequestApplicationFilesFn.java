@@ -2,6 +2,7 @@ package com.epam.aidial.core.server.function;
 
 import com.epam.aidial.core.config.Application;
 import com.epam.aidial.core.config.Deployment;
+import com.epam.aidial.core.config.ResourceAccessType;
 import com.epam.aidial.core.server.Proxy;
 import com.epam.aidial.core.server.ProxyContext;
 import com.epam.aidial.core.server.data.ApiKeyData;
@@ -9,7 +10,6 @@ import com.epam.aidial.core.server.data.AutoSharedData;
 import com.epam.aidial.core.server.security.AccessService;
 import com.epam.aidial.core.server.util.ApplicationTypeSchemaUtils;
 import com.epam.aidial.core.server.validation.ApplicationTypeResourceException;
-import com.epam.aidial.core.storage.data.ResourceAccessType;
 import com.epam.aidial.core.storage.http.HttpException;
 import com.epam.aidial.core.storage.http.HttpStatus;
 import com.epam.aidial.core.storage.resource.ResourceDescriptor;
@@ -42,7 +42,7 @@ public class CollectRequestApplicationFilesFn extends BaseRequestFunction<Object
         } catch (HttpException ex) {
             throw ex;
         } catch (ApplicationTypeResourceException ex) {
-            throw new HttpException(HttpStatus.FORBIDDEN, ex.getMessage());
+            throw new HttpException(HttpStatus.FORBIDDEN, ex.getMessage() + " : " + ex.getResourceUri());
         } catch (Exception e) {
             throw new HttpException(HttpStatus.INTERNAL_SERVER_ERROR, e.getMessage());
         }

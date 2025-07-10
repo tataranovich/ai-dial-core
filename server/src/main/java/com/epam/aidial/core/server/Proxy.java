@@ -5,6 +5,7 @@ import com.epam.aidial.core.server.config.ConfigStore;
 import com.epam.aidial.core.server.controller.Controller;
 import com.epam.aidial.core.server.controller.ControllerSelector;
 import com.epam.aidial.core.server.controller.ControllerTemplate;
+import com.epam.aidial.core.server.controller.HealthCheckController;
 import com.epam.aidial.core.server.data.ApiKeyData;
 import com.epam.aidial.core.server.limiter.RateLimiter;
 import com.epam.aidial.core.server.log.LogStore;
@@ -78,7 +79,7 @@ public class Proxy implements Handler<HttpServerRequest> {
     public static final String HEADER_CONTENT_TYPE_APPLICATION_JSON = "application/json";
     public static final String HEADER_APPLICATION_PROPERTIES = "X-DIAL-APPLICATION-PROPERTIES";
     public static final String HEADER_APPLICATION_ID = "X-DIAL-APPLICATION-ID";
-    private static final Set<HttpMethod> ALLOWED_HTTP_METHODS = Set.of(HttpMethod.GET, HttpMethod.POST, HttpMethod.PUT, HttpMethod.DELETE, HttpMethod.HEAD);
+    public static final Set<HttpMethod> ALLOWED_HTTP_METHODS = Set.of(HttpMethod.GET, HttpMethod.POST, HttpMethod.PUT, HttpMethod.DELETE, HttpMethod.HEAD);
 
     private final Vertx vertx;
     private final HttpClientOptions clientOptions;
@@ -107,6 +108,7 @@ public class Proxy implements Handler<HttpServerRequest> {
     private final UpstreamCacheService upstreamCacheService;
     private final ConsentService consentService;
     private final DeploymentService deploymentService;
+    private final HealthCheckController healthCheckController;
     private final String version;
 
     @Override
@@ -175,7 +177,7 @@ public class Proxy implements Handler<HttpServerRequest> {
 
         String path = URLDecoder.decode(request.path(), StandardCharsets.UTF_8);
         if (request.method() == HttpMethod.GET && path.equals(HEALTH_CHECK_PATH)) {
-            respond(request, HttpStatus.OK);
+            healthCheckController.handle(request);
             return;
         }
 
@@ -233,10 +235,7 @@ public class Proxy implements Handler<HttpServerRequest> {
         if (apiKey == null) {
             return tokenValidator.extractClaims(authorization)
                     .compose(extractedClaims -> Future.succeededFuture(new AuthorizationResult(new ApiKeyData(), extractedClaims)),
-                            error -> {
-                                log.error("Can't extract claims from authorization header", error);
-                                return Future.failedFuture(new HttpException(HttpStatus.UNAUTHORIZED, "Bad Authorization header"));
-                            });
+                            error -> Future.failedFuture(new HttpException(HttpStatus.UNAUTHORIZED, "Bad Authorization header")));
         }
 
         // see https://github.com/epam/ai-dial-core/issues/675

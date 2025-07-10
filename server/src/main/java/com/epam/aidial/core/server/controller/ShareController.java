@@ -1,5 +1,6 @@
 package com.epam.aidial.core.server.controller;
 
+import com.epam.aidial.core.config.ResourceAccessType;
 import com.epam.aidial.core.server.Proxy;
 import com.epam.aidial.core.server.ProxyContext;
 import com.epam.aidial.core.server.data.CopySharedAccessRequest;
@@ -14,7 +15,6 @@ import com.epam.aidial.core.server.service.ShareService;
 import com.epam.aidial.core.server.util.BucketBuilder;
 import com.epam.aidial.core.server.util.ProxyUtil;
 import com.epam.aidial.core.server.util.ResourceDescriptorFactory;
-import com.epam.aidial.core.storage.data.ResourceAccessType;
 import com.epam.aidial.core.storage.http.HttpException;
 import com.epam.aidial.core.storage.http.HttpStatus;
 import com.epam.aidial.core.storage.resource.ResourceDescriptor;
@@ -67,8 +67,8 @@ public class ShareController {
         return Future.succeededFuture();
     }
 
-    public Future<?> listSharedResources() {
-        return context.getRequest()
+    public void listSharedResources() {
+        context.getRequest()
                 .body()
                 .compose(buffer -> {
                     ListSharedResourcesRequest request;
@@ -76,7 +76,7 @@ public class ShareController {
                         String body = buffer.toString(StandardCharsets.UTF_8);
                         request = ProxyUtil.convertToObject(body, ListSharedResourcesRequest.class);
                     } catch (Exception e) {
-                        log.error("Invalid request body provided", e);
+                        log.warn("Invalid request body provided", e);
                         throw new IllegalArgumentException("Can't list shared resources. Incorrect body");
                     }
 
@@ -96,8 +96,8 @@ public class ShareController {
                 .onFailure(this::handleServiceError);
     }
 
-    public Future<?> createSharedResources() {
-        return context.getRequest()
+    public void createSharedResources() {
+        context.getRequest()
                 .body()
                 .compose(buffer -> {
                     ShareResourcesRequest request;
@@ -105,7 +105,7 @@ public class ShareController {
                         String body = buffer.toString(StandardCharsets.UTF_8);
                         request = ProxyUtil.convertToObject(body, ShareResourcesRequest.class);
                     } catch (Exception e) {
-                        log.error("Invalid request body provided", e);
+                        log.warn("Invalid request body provided", e);
                         throw new IllegalArgumentException("Can't initiate share request. Incorrect body");
                     }
 
@@ -115,8 +115,8 @@ public class ShareController {
                 .onFailure(this::handleServiceError);
     }
 
-    public Future<?> discardSharedResources() {
-        return context.getRequest()
+    public void discardSharedResources() {
+        context.getRequest()
                 .body()
                 .compose(buffer -> {
                     ResourceLinkCollection request = getResourceLinkCollection(buffer, Operation.DISCARD);
@@ -132,8 +132,8 @@ public class ShareController {
                 .onFailure(this::handleServiceError);
     }
 
-    public Future<?> revokeSharedResources() {
-        return context.getRequest()
+    public void revokeSharedResources() {
+        context.getRequest()
                 .body()
                 .compose(buffer -> {
                     RevokeResourcesRequest request = getRevokeResourcesRequest(buffer, Operation.REVOKE);
@@ -141,8 +141,8 @@ public class ShareController {
                     String bucket = encryptionService.encrypt(bucketLocation);
                     Map<ResourceDescriptor, Set<ResourceAccessType>> permissionsToRevoke = request.getResources().stream()
                             .collect(Collectors.toUnmodifiableMap(
-                                    resource -> ShareService.resourceFromUrl(resource.url(), encryptionService),
-                                    SharedResource::permissions));
+                                    resource -> ShareService.resourceFromUrl(resource.getUrl(), encryptionService),
+                                    SharedResource::getPermissions));
                     return proxy.getVertx()
                             .executeBlocking(() -> lockService.underBucketLock(bucketLocation, () -> {
                                 invitationService.cleanUpPermissions(bucket, bucketLocation, permissionsToRevoke);
@@ -154,15 +154,15 @@ public class ShareController {
                 .onFailure(this::handleServiceError);
     }
 
-    public Future<?> copySharedAccess() {
-        return context.getRequest()
+    public void copySharedAccess() {
+        context.getRequest()
                 .body()
                 .compose(buffer -> {
                     CopySharedAccessRequest request;
                     try {
                         request = ProxyUtil.convertToObject(buffer, CopySharedAccessRequest.class);
                     } catch (Exception e) {
-                        log.error("Invalid request body provided", e);
+                        log.warn("Invalid request body provided", e);
                         throw new IllegalArgumentException("Can't initiate copy shared access request. Incorrect body provided");
                     }
 
@@ -216,7 +216,7 @@ public class ShareController {
             String body = buffer.toString(StandardCharsets.UTF_8);
             return ProxyUtil.convertToObject(body, ResourceLinkCollection.class);
         } catch (Exception e) {
-            log.error("Invalid request body provided", e);
+            log.warn("Invalid request body provided", e);
             throw new HttpException(HttpStatus.BAD_REQUEST, "Can't %s shared resources. Incorrect body".formatted(operation));
         }
     }
@@ -226,7 +226,7 @@ public class ShareController {
             String body = buffer.toString(StandardCharsets.UTF_8);
             return ProxyUtil.convertToObject(body, RevokeResourcesRequest.class);
         } catch (Exception e) {
-            log.error("Invalid request body provided", e);
+            log.warn("Invalid request body provided", e);
             throw new HttpException(HttpStatus.BAD_REQUEST, "Can't %s shared resources. Incorrect body".formatted(operation));
         }
     }

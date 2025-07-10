@@ -13,13 +13,11 @@ import com.epam.aidial.core.server.service.ApplicationService;
 import com.epam.aidial.core.server.service.DeploymentService;
 import com.epam.aidial.core.server.service.PermissionDeniedException;
 import com.epam.aidial.core.server.service.ResourceNotFoundException;
-import com.epam.aidial.core.server.util.ApplicationTypeSchemaUtils;
 import com.epam.aidial.core.server.util.ProxyUtil;
 import com.epam.aidial.core.server.util.ResourceDescriptorFactory;
 import com.epam.aidial.core.storage.http.HttpException;
 import com.epam.aidial.core.storage.http.HttpStatus;
 import com.epam.aidial.core.storage.resource.ResourceDescriptor;
-import com.epam.aidial.core.storage.util.UrlUtil;
 import io.vertx.core.Future;
 import io.vertx.core.Vertx;
 import lombok.extern.slf4j.Slf4j;
@@ -27,6 +25,8 @@ import lombok.extern.slf4j.Slf4j;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+
+import static com.epam.aidial.core.server.util.ApplicationTypeSchemaUtils.modifySchemaRichApplication;
 
 @Slf4j
 public class ApplicationController {
@@ -49,15 +49,11 @@ public class ApplicationController {
     }
 
     public Future<?> getApplication(String applicationId) {
-        boolean propertyFilteringRequired = !applicationId.equals(context.getDecodedSourceDeployment());
         vertx.executeBlocking(() -> deploymentService.findDeployment(context, applicationId), false)
                 .map(deployment -> {
                     if (deployment instanceof Application application) {
-                        if (propertyFilteringRequired) {
-                            application = ApplicationTypeSchemaUtils.filterCustomClientProperties(context.getConfig(), application);
-                        }
-                        application = ApplicationTypeSchemaUtils.modifyEndpointsForCustomApplication(context.getConfig(), application);
-                        return application;
+                        boolean applicationRequestInfoAboutItSelf = applicationId.equals(context.getDecodedSourceDeployment());
+                        return modifySchemaRichApplication(application, !applicationRequestInfoAboutItSelf, context);
                     }
                     throw new ResourceNotFoundException("Application is not found: " + applicationId);
                 })
@@ -68,6 +64,8 @@ public class ApplicationController {
         return Future.succeededFuture();
     }
 
+
+
     public Future<?> getApplications() {
         Config config = context.getConfig();
         Proxy proxy = context.getProxy();
@@ -76,11 +74,8 @@ public class ApplicationController {
             List<Application> list = new ArrayList<>();
             for (Application application : config.getApplications().values()) {
                 if (application.hasAccess(context.getUserRoles())) {
-                    boolean applicationRequestInfoAboutItSelf = Objects.equals(context.getDecodedSourceDeployment(), UrlUtil.decodePath(application.getName()));
-                    if (!applicationRequestInfoAboutItSelf) {
-                        application = ApplicationTypeSchemaUtils.filterCustomClientProperties(config, application);
-                    }
-                    application = ApplicationTypeSchemaUtils.modifyEndpointsForCustomApplication(config, application);
+                    boolean applicationRequestInfoAboutItSelf = Objects.equals(context.getDecodedSourceDeployment(), application.getName());
+                    application = modifySchemaRichApplication(application, !applicationRequestInfoAboutItSelf, context);
                     list.add(application);
                 }
             }

@@ -103,22 +103,29 @@ public class ResourceController extends AccessControlBaseController {
             return context.respond(BAD_REQUEST, "Bad query parameters. Limit must be in [0, 1000] range. Recursive must be true/false");
         }
 
-        vertx.executeBlocking(() -> resourceService.getMetadata(descriptor, token, limit, recursive), false)
-                .onSuccess(result -> {
-                    if (result == null) {
-                        context.respond(HttpStatus.NOT_FOUND, "Not found: " + descriptor.getUrl());
-                    } else {
-                        accessService.filterForbidden(context, descriptor, result);
-                        if (context.getBooleanRequestQueryParam("permissions")) {
-                            accessService.populatePermissions(context, List.of(result));
-                        }
-                        context.respond(HttpStatus.OK, getContentType(), result);
-                    }
-                })
-                .onFailure(error -> {
-                    log.warn("Can't list resource: {}", descriptor.getUrl(), error);
-                    context.respond(HttpStatus.INTERNAL_SERVER_ERROR);
-                });
+        vertx.executeBlocking(() -> {
+            if (shouldHide(descriptor)) {
+                return null;
+            }
+            MetadataBase result = resourceService.getMetadata(descriptor, token, limit, recursive);
+            if (result == null) {
+                return null;
+            }
+            accessService.filterForbidden(context, descriptor, result);
+            if (context.getBooleanRequestQueryParam("permissions")) {
+                accessService.populatePermissions(context, List.of(result));
+            }
+            return result;
+        }, false).onSuccess(result -> {
+            if (result == null) {
+                context.respond(HttpStatus.NOT_FOUND, "Not found: " + descriptor.getUrl());
+            } else {
+                context.respond(HttpStatus.OK, getContentType(), result);
+            }
+        }).onFailure(error -> {
+            log.warn("Can't list resource: {}", descriptor.getUrl(), error);
+            context.respond(HttpStatus.INTERNAL_SERVER_ERROR);
+        });
 
         return Future.succeededFuture();
     }
@@ -164,7 +171,14 @@ public class ResourceController extends AccessControlBaseController {
             features.setTokenizeEndpoint(null);
             features.setTruncatePromptEndpoint(null);
         }
-        return ApplicationTypeSchemaUtils.filterCustomClientProperties(config, application);
+        try {
+            return ApplicationTypeSchemaUtils.filterCustomClientProperties(config, application);
+        } catch (ApplicationTypeSchemaProcessingException | ApplicationTypeResourceException | ApplicationTypeSchemaValidationException ex) {
+            log.warn("Failed to modify application to fulfill schema's restrictions %s".formatted(application.getName()), ex);
+            application.setApplicationProperties(null);
+            application.setInvalid(true);
+            return application;
+        }
     }
 
     private Future<Pair<ResourceItemMetadata, String>> getResourceData(ResourceDescriptor descriptor, EtagHeader etag) {
@@ -182,15 +196,19 @@ public class ResourceController extends AccessControlBaseController {
     private void validateCustomApplication(Application application) {
         try {
             checkCreateCodeApp(application);
-            Config config = context.getConfig();
-            List<ResourceDescriptor> files = ApplicationTypeSchemaUtils.getFiles(config, application, encryptionService,
-                    resourceService);
-            files.stream().filter(resource -> !(accessService.hasReadAccess(resource, context)))
-                    .findAny().ifPresent(file -> {
-                        throw new HttpException(BAD_REQUEST, "No read access to file: " + file.getUrl());
-                    });
-        } catch (ValidationException | IllegalArgumentException | ApplicationTypeSchemaValidationException e) {
-            throw new HttpException(BAD_REQUEST, "Custom application validation failed", e);
+            if (application.getApplicationProperties() != null) {
+                Config config = context.getConfig();
+                List<ResourceDescriptor> files = ApplicationTypeSchemaUtils.getFiles(config, application, encryptionService,
+                        resourceService);
+                files.stream().filter(resource -> !(accessService.hasReadAccess(resource, context)))
+                        .findAny().ifPresent(file -> {
+                            throw new HttpException(FORBIDDEN, "No read access to file: " + file.getUrl());
+                        });
+            }
+        } catch (IllegalArgumentException | ValidationException e) {
+            throw new HttpException(BAD_REQUEST, String.format("Custom application validation failed %s", e.getMessage()), e);
+        } catch (ApplicationTypeSchemaValidationException e) {
+            throw new HttpException(BAD_REQUEST, String.format("Custom application validation failed %s", e.validationMessages), e);
         } catch (ApplicationTypeResourceException e) {
             throw new HttpException(FORBIDDEN, "Failed to access application resource " + e.getResourceUri(), e);
         } catch (ApplicationTypeSchemaProcessingException e) {

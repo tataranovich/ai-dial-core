@@ -5,7 +5,6 @@ import com.epam.aidial.core.config.Deployment;
 import com.epam.aidial.core.config.Features;
 import com.epam.aidial.core.config.Interceptor;
 import com.epam.aidial.core.config.Model;
-import com.epam.aidial.core.config.ModelType;
 import com.epam.aidial.core.config.Pricing;
 import com.epam.aidial.core.config.Upstream;
 import com.epam.aidial.core.server.Proxy;
@@ -15,9 +14,10 @@ import com.epam.aidial.core.server.data.ErrorData;
 import com.epam.aidial.core.server.function.BaseRequestFunction;
 import com.epam.aidial.core.server.function.BuildUpstreamCacheFn;
 import com.epam.aidial.core.server.function.CollectRequestApplicationFilesFn;
-import com.epam.aidial.core.server.function.CollectRequestAttachmentsFn;
+import com.epam.aidial.core.server.function.CollectRequestChatCompletionAttachmentsFn;
 import com.epam.aidial.core.server.function.CollectRequestDataFn;
 import com.epam.aidial.core.server.function.CollectResponseAttachmentsFn;
+import com.epam.aidial.core.server.function.CollectResponseChatCompletionAttachmentsFn;
 import com.epam.aidial.core.server.function.enhancement.ApplyDefaultDeploymentSettingsFn;
 import com.epam.aidial.core.server.function.enhancement.EnhanceAssistantRequestFn;
 import com.epam.aidial.core.server.function.enhancement.EnhanceModelRequestFn;
@@ -74,7 +74,7 @@ public class DeploymentPostController {
     public DeploymentPostController(Proxy proxy, ProxyContext context) {
         this.proxy = proxy;
         this.context = context;
-        this.enhancementFunctions = List.of(new CollectRequestAttachmentsFn(proxy, context),
+        this.enhancementFunctions = List.of(new CollectRequestChatCompletionAttachmentsFn(proxy, context),
                 new CollectRequestDataFn(proxy, context),
                 new ApplyDefaultDeploymentSettingsFn(proxy, context),
                 new EnhanceAssistantRequestFn(proxy, context),
@@ -180,13 +180,13 @@ public class DeploymentPostController {
 
     private void handleRequestError(String deploymentId, Throwable error) {
         if (error instanceof PermissionDeniedException) {
-            log.error("Forbidden deployment {}. Project: {}. User sub: {}", deploymentId, context.getProject(), context.getUserSub());
+            log.warn("Forbidden deployment {}. Project: {}. User sub: {}", deploymentId, context.getProject(), context.getUserSub());
             respond(HttpStatus.FORBIDDEN, error.getMessage());
         } else if (error instanceof ResourceNotFoundException) {
-            log.error("Deployment not found {}", deploymentId, error);
+            log.warn("Deployment not found {}", deploymentId, error);
             respond(HttpStatus.NOT_FOUND, error.getMessage());
         } else if (error instanceof HttpException e) {
-            log.error("Deployment error {}", deploymentId, error);
+            log.warn("Deployment error {}", deploymentId, error);
             respond(e.getStatus(), e.getMessage());
         } else {
             log.error("Failed to handle deployment {}", deploymentId, error);
@@ -222,8 +222,9 @@ public class DeploymentPostController {
         ErrorData rateLimitError = new ErrorData();
         rateLimitError.getError().setCode(String.valueOf(result.status().getCode()));
         rateLimitError.getError().setMessage(result.errorMessage());
+        rateLimitError.getError().setDisplayMessage(result.displayErrorMessage());
 
-        log.error("Rate limit error {}. Project: {}. User sub: {}. Deployment: {}. Trace: {}. Span: {}", result.errorMessage(),
+        log.warn("Rate limit error {}. Project: {}. User sub: {}. Deployment: {}. Trace: {}. Span: {}", result.errorMessage(),
                 context.getProject(), context.getUserSub(), deploymentId, context.getTraceId(), context.getSpanId());
 
         String errorMessage = ProxyUtil.convertToString(rateLimitError);
@@ -363,11 +364,12 @@ public class DeploymentPostController {
     private void handleProxyResponse(HttpClientResponse proxyResponse) {
         UpstreamRoute upstreamRoute = context.getUpstreamRoute();
         Upstream currentUpstream = upstreamRoute.get();
-        log.info("Received header from origin. Trace: {}. Span: {}. Project: {}. Deployment: {}. Endpoint: {}. Upstream: {}. Status: {}. Headers: {}",
+        log.info("Received header from origin. Trace: {}. Span: {}. Project: {}. Deployment: {}. Endpoint: {}."
+                        + " Upstream: {}. Status: {}. Headers: {}. Upstream.extraData: {}",
                 context.getTraceId(), context.getSpanId(),
                 context.getProject(), context.getDeployment().getName(),
                 context.getDeployment().getEndpoint(), currentUpstream == null ? "N/A" : currentUpstream.getEndpoint(),
-                proxyResponse.statusCode(), proxyResponse.headers().size());
+                proxyResponse.statusCode(), proxyResponse.headers().size(), currentUpstream == null ? "N/A" : currentUpstream.getExtraData());
 
         int responseStatusCode = proxyResponse.statusCode();
         if (isRetriableError(responseStatusCode)) {
@@ -387,7 +389,7 @@ public class DeploymentPostController {
             upstreamRoute.fail(proxyResponse);
         }
 
-        CollectResponseAttachmentsFn handler = context.isStreamingRequest() ? new CollectResponseAttachmentsFn(proxy, context) : null;
+        CollectResponseAttachmentsFn handler = context.isStreamingRequest() ? new CollectResponseChatCompletionAttachmentsFn(proxy, context) : null;
 
         BufferingReadStream responseStream = new BufferingReadStream(proxyResponse,
                 ProxyUtil.contentLength(proxyResponse, 1024), handler);
@@ -409,7 +411,7 @@ public class DeploymentPostController {
                 .endOnSuccess(false)
                 .to(response)
                 .onSuccess(ignored -> handleResponse(responseStream))
-                .onFailure(this::handleResponseError);
+                .onFailure(error -> handleResponseError(error, responseStream));
     }
 
     private boolean isRetriableError(int statusCode) {
@@ -451,13 +453,16 @@ public class DeploymentPostController {
                 if (tokenUsage == null) {
                     Pricing pricing = model.getPricing();
                     if (pricing == null || "token".equals(pricing.getUnit())) {
-                        log.warn("Can't find token usage. Trace: {}. Span: {}. Project: {}. Deployment: {}. Endpoint: {}. Upstream: {}. Status: {}. Length: {}",
+                        Upstream currentUpstream = context.getUpstreamRoute().get();
+                        log.warn("Can't find token usage. Trace: {}. Span: {}. Project: {}. Deployment: {}."
+                                        + " Endpoint: {}. Upstream: {}. Status: {}. Length: {}. Upstream.extraData: {}",
                                 context.getTraceId(), context.getSpanId(),
                                 context.getProject(), context.getDeployment().getName(),
                                 context.getDeployment().getEndpoint(),
-                                context.getUpstreamRoute().get().getEndpoint(),
+                                currentUpstream == null ? "N/A" : currentUpstream.getEndpoint(),
                                 context.getResponse().getStatusCode(),
-                                context.getResponseBody().length());
+                                context.getResponseBody().length(),
+                                currentUpstream == null ? "N/A" : currentUpstream.getExtraData());
                     }
                     tokenUsage = new TokenUsage();
                 }
@@ -486,7 +491,7 @@ public class DeploymentPostController {
         }
         try (InputStream stream = new ByteBufInputStream(responseBody.getByteBuf())) {
             ObjectNode tree = (ObjectNode) ProxyUtil.MAPPER.readTree(stream);
-            var fn = new CollectResponseAttachmentsFn(proxy, context);
+            var fn = new CollectResponseChatCompletionAttachmentsFn(proxy, context);
             return fn.apply(tree);
         } catch (IOException e) {
             log.warn("Can't parse JSON response body. Trace: {}. Span: {}. Error:",
@@ -500,13 +505,14 @@ public class DeploymentPostController {
         responseStream.end(response);
 
         proxy.getLogStore().save(context);
-
-        log.info("Sent response to client. Trace: {}. Span: {}. Project: {}. Deployment: {}. Endpoint: {}. Upstream: {}. Status: {}. Length: {}."
-                        + " Timing: {} (body={}, connect={}, header={}, body={}). Tokens: {}",
+        Upstream currentUpstream = context.getUpstreamRoute().get();
+        log.info("Sent response to client. Trace: {}. Span: {}. Project: {}. Deployment: {}."
+                        + " Endpoint: {}. Upstream: {}. Status: {}. Length: {}."
+                        + " Timing: {} (body={}, connect={}, header={}, body={}). Tokens: {}. Upstream.extraData: {}",
                 context.getTraceId(), context.getSpanId(),
                 context.getProject(), context.getDeployment().getName(),
                 context.getDeployment().getEndpoint(),
-                context.getUpstreamRoute().get().getEndpoint(),
+                currentUpstream == null ? "N/A" : currentUpstream.getEndpoint(),
                 context.getResponse().getStatusCode(),
                 context.getResponseBody().length(),
                 context.getResponseBodyTimestamp() - context.getRequestTimestamp(),
@@ -514,7 +520,8 @@ public class DeploymentPostController {
                 context.getProxyConnectTimestamp() - context.getRequestBodyTimestamp(),
                 context.getProxyResponseTimestamp() - context.getProxyConnectTimestamp(),
                 context.getResponseBodyTimestamp() - context.getProxyResponseTimestamp(),
-                context.getTokenUsage() == null ? "n/a" : context.getTokenUsage());
+                context.getTokenUsage() == null ? "N/A" : context.getTokenUsage(),
+                currentUpstream == null ? "N/A" : currentUpstream.getExtraData());
 
         finalizeRequest();
     }
@@ -562,34 +569,29 @@ public class DeploymentPostController {
     /**
      * Called when proxy failed to send response to the client.
      */
-    private void handleResponseError(Throwable error) {
+    private void handleResponseError(Throwable error, BufferingReadStream responseStream) {
         log.warn("Can't send response to client. Trace: {}. Span: {}. Error:",
                 context.getTraceId(), context.getSpanId(), error);
-
-        context.getProxyRequest().reset(); // drop connection to stop origin response
         context.getResponse().reset();     // drop connection, so that partial client response won't seem complete
-        finalizeRequest();
-    }
-
-    private static boolean isValidDeploymentApi(Deployment deployment, String deploymentApi) {
-        ModelType type = switch (deploymentApi) {
-            case "completions" -> ModelType.COMPLETION;
-            case "chat/completions" -> ModelType.CHAT;
-            case "embeddings" -> ModelType.EMBEDDING;
-            default -> null;
-        };
-
-        if (type == null) {
-            return false;
+        Deployment deployment = context.getDeployment();
+        if (deployment instanceof Model) {
+            // make sure we collect token usage in case if client accidentally closed the connection
+            responseStream.endStreamFuture()
+                    .onFailure(ignore -> {
+                        context.getProxyRequest().reset(); // drop connection to stop origin response
+                    })
+                    .compose(ignore -> {
+                        Buffer responseBody = context.getResponseStream().getContent();
+                        context.setResponseBody(responseBody);
+                        context.setResponseBodyTimestamp(System.currentTimeMillis());
+                        return collectTokenUsage(responseBody);
+                    })
+                    .onSuccess(ignored -> proxy.getLogStore().save(context))
+                    .onComplete(ignored -> finalizeRequest());
+        } else {
+            // drop connection to stop application responding
+            context.getProxyRequest().reset();
         }
-
-        // Models support all APIs
-        if (deployment instanceof Model model) {
-            return type == model.getType();
-        }
-
-        // Assistants and applications only support chat API
-        return type == ModelType.CHAT;
     }
 
     private static String buildUri(ProxyContext context) {
@@ -604,7 +606,7 @@ public class DeploymentPostController {
         try {
             route.next();
         } catch (HttpException e) {
-            log.error("No route. Trace: {}. Span: {}. Project: {}. Deployment: {}. User sub: {}",
+            log.warn("No route. Trace: {}. Span: {}. Project: {}. Deployment: {}. User sub: {}",
                     context.getTraceId(), context.getSpanId(),
                     context.getProject(), context.getDeployment().getName(), context.getUserSub());
             respond(e);

@@ -1,6 +1,7 @@
 package com.epam.aidial.core.server.security;
 
 import com.epam.aidial.core.config.Application;
+import com.epam.aidial.core.config.ResourceAccessType;
 import com.epam.aidial.core.server.ProxyContext;
 import com.epam.aidial.core.server.data.AutoSharedData;
 import com.epam.aidial.core.server.data.ResourceTypes;
@@ -13,12 +14,12 @@ import com.epam.aidial.core.server.util.BucketBuilder;
 import com.epam.aidial.core.server.util.ProxyUtil;
 import com.epam.aidial.core.server.util.ResourceDescriptorFactory;
 import com.epam.aidial.core.storage.data.MetadataBase;
-import com.epam.aidial.core.storage.data.ResourceAccessType;
 import com.epam.aidial.core.storage.data.ResourceFolderMetadata;
 import com.epam.aidial.core.storage.resource.ResourceDescriptor;
 import com.google.common.collect.Sets;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
+import lombok.extern.slf4j.Slf4j;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -26,12 +27,14 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.function.BiFunction;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
 
+@Slf4j
 public class AccessService {
 
     private final EncryptionService encryptionService;
@@ -178,10 +181,27 @@ public class AccessService {
      */
     private Map<ResourceDescriptor, Set<ResourceAccessType>> getPublicAccess(
             Set<ResourceDescriptor> resources, ProxyContext context) {
+        if (!isApplicationContext(context)) {
+            resources = resources.stream()
+                    .filter(resource -> !resource.isHidden())
+                    .collect(Collectors.toUnmodifiableSet());
+        }
+
         return ruleService.getAllowedPublicResources(context, resources).stream()
                 .collect(Collectors.toUnmodifiableMap(
                         Function.identity(),
                         resource -> ResourceAccessType.READ_ONLY));
+    }
+
+    /**
+     * Checks if the context represents an application rather than a user.
+     * Applications should have access to their own published system resources.
+     *
+     * @param context The proxy context
+     * @return true if this appears to be an application context, false for user contexts
+     */
+    public static boolean isApplicationContext(ProxyContext context) {
+        return context.getApiKeyData().getPerRequestKey() != null;
     }
 
     private static Map<ResourceDescriptor, Set<ResourceAccessType>> getAutoSharedAccess(
@@ -319,8 +339,32 @@ public class AccessService {
     public void filterForbidden(ProxyContext context, ResourceDescriptor descriptor, MetadataBase metadata) {
         if (descriptor.isPublic() && descriptor.isFolder() && !hasAdminAccess(context)) {
             ResourceFolderMetadata folder = (ResourceFolderMetadata) metadata;
+            if (!isApplicationContext(context)) {
+                if (folder.getItems() != null) {
+                    folder.setItems(folder.getItems().stream()
+                            .map(this::recursiveFilterHiddenResource)
+                            .filter(Objects::nonNull)
+                            .toList());
+                }
+            }
             ruleService.filterForbidden(context, descriptor, folder);
         }
+    }
+
+    public MetadataBase recursiveFilterHiddenResource(MetadataBase metadata) {
+        ResourceDescriptor resource = ResourceDescriptorFactory.fromAnyUrl(metadata.getUrl(), encryptionService);
+        if (resource.isHidden()) {
+            return null;
+        }
+        if (metadata instanceof ResourceFolderMetadata folderMetadata && folderMetadata.getItems() != null) {
+            List<MetadataBase> items = folderMetadata.getItems().stream()
+                    .map(this::recursiveFilterHiddenResource)
+                    .filter(Objects::nonNull)
+                    .toList();
+
+            folderMetadata.setItems(items);
+        }
+        return metadata;
     }
 
     public void populatePermissions(ProxyContext context, Collection<MetadataBase> metadata) {
@@ -334,12 +378,16 @@ public class AccessService {
     }
 
     private void expandMetadata(MetadataBase metadata, Map<ResourceDescriptor, MetadataBase> result) {
-        ResourceDescriptor resource = ResourceDescriptorFactory.fromAnyUrl(metadata.getUrl(), encryptionService);
-        result.put(resource, metadata);
-        if (metadata instanceof ResourceFolderMetadata folderMetadata && folderMetadata.getItems() != null) {
-            for (MetadataBase item : folderMetadata.getItems()) {
-                expandMetadata(item, result);
+        try {
+            ResourceDescriptor resource = ResourceDescriptorFactory.fromAnyUrl(metadata.getUrl(), encryptionService);
+            result.put(resource, metadata);
+            if (metadata instanceof ResourceFolderMetadata folderMetadata && folderMetadata.getItems() != null) {
+                for (MetadataBase item : folderMetadata.getItems()) {
+                    expandMetadata(item, result);
+                }
             }
+        } catch (Exception error) {
+            log.warn("Unable to expand resource metadata {} due to the error: ", metadata.getUrl(), error);
         }
     }
 
