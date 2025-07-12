@@ -6,7 +6,7 @@ on:
 
 jobs:
   release:
-    uses: tataranovich/ai-dial-ci/.github/workflows/java_release.yml@arm64-builds
+    uses: epam/ai-dial-ci/.github/workflows/java_release.yml@2.4.0
     secrets: inherit
     with:
       platforms: "linux/amd64,linux/arm64"

@@ -6,7 +6,7 @@ on:
 
 jobs:
   run_tests:
-    uses: tataranovich/ai-dial-ci/.github/workflows/java_pr.yml@arm64-builds
+    uses: epam/ai-dial-ci/.github/workflows/java_pr.yml@2.4.0
     secrets: inherit
     with:
       platforms: "linux/amd64,linux/arm64"
