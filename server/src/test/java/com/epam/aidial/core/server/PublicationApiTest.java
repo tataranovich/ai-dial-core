@@ -2393,6 +2393,63 @@ class PublicationApiTest extends ResourceBaseTest {
     }
 
     @Test
+    void testPublicationUpdate_WithoutResources() {
+        // Create initial publication
+        Response response = operationRequest("/v1/ops/publication/create", """
+                {
+                  "name": "Publication name",
+                  "targetFolder": "public/folder/",
+                  "rules": [
+                    {
+                      "source": "roles",
+                      "function": "EQUAL",
+                      "targets": ["user"]
+                    }
+                  ]
+                }
+                """);
+        verify(response, 200);
+
+        // Update as admin
+        response = operationRequest("/v1/ops/publication/update", """
+                {
+                  "url": "publications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/0123",
+                  "targetFolder": "public/folder/",
+                  "rules": [
+                    {
+                       "source": "roles",
+                        "function": "EQUAL",
+                        "targets": ["manager"]
+                    }
+                  ]
+                }
+                """, "authorization", "admin");
+        verify(response, 200);
+
+        // list publications
+        response = operationRequest("/v1/ops/publication/list", """
+                {"url": "publications/public/"}
+                """, "authorization", "admin");
+        verifyJson(response, 200, """
+                {
+                   "publications" : [ {
+                     "url" : "publications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/0123",
+                     "name" : "Publication name",
+                     "targetFolder" : "public/folder/",
+                     "status" : "PENDING",
+                     "createdAt" : 0,
+                     "resourceTypes" : [ ],
+                     "author" : "EPM-RTC-GPT"
+                   } ]
+                 }
+                """);
+
+        // Approve the publication
+        response = operationRequest("/v1/ops/publication/approve", PUBLICATION_URL, "authorization", "admin");
+        verify(response, 200);
+    }
+
+    @Test
     void testPublicationUpdate() {
         Response response = resourceRequest(HttpMethod.PUT, "/my/folder/conversation", CONVERSATION_BODY_1);
         verify(response, 200);
@@ -2627,6 +2684,87 @@ class PublicationApiTest extends ResourceBaseTest {
         response = send(HttpMethod.GET, "/v1/conversations/public/folder/conversation1");
         verifyJsonNotExact(response, 200, conversationTemplate.formatted("conversations/public/folder/conversation1",
                 "conversations/public/folder", "files/public/folder/new_file"));
+
+    }
+
+    @Test
+    void testUpdatePublication_WhenNewResourceTypeAdded() throws Exception {
+        Response response = upload(HttpMethod.PUT, "/v1/files/" + bucket + "/file", null, "text data");
+        verify(response, 200);
+        String conversationTemplate = """
+                {
+                "id": "%s",
+                "name": "display_name",
+                "model": {"id": "model_id"},
+                "prompt": "system prompt",
+                "temperature": 1,
+                "folderId": "%s",
+                "messages": [{
+                    "role": "user",
+                    "content": "what's the file?",
+                    "custom_content": {
+                        "attachments": [
+                          {
+                            "type": "text/markdown",
+                            "title": "title",
+                            "url": "%s"
+                          }
+                        ]
+                    }
+                }],
+                "selectedAddons": ["R", "T", "G"],
+                "assistantModelId": "assistantId",
+                "lastActivityDate": 4848683153
+                }
+                """;
+        JsonNode fileResponse = ProxyUtil.MAPPER.readTree(response.body());
+        String conversation = conversationTemplate.formatted("conversation_id", "folder1", fileResponse.get("url").asText());
+
+        response = resourceRequest(HttpMethod.PUT, "/my/folder/conversation", conversation);
+        verify(response, 200);
+
+        response = operationRequest("/v1/ops/publication/create", PUBLICATION_REQUEST.formatted(bucket));
+        verify(response, 200);
+
+        // Update as admin
+        response = operationRequest("/v1/ops/publication/update", """
+            {
+              "url": "publications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/0123",
+              "name": "Publication name",
+              "targetFolder": "public/folder/",
+              "resources": [
+                {
+                  "action": "ADD",
+                  "sourceUrl": "conversations/%s/my/folder/conversation%s",
+                  "targetUrl": "conversations/public/folder/conversation%s"
+                },
+                {
+                  "action": "ADD",
+                  "sourceUrl": "files/%s/file",
+                  "targetUrl": "files/public/folder/new_file"
+                }
+              ]
+            }
+            """.formatted(bucket, "", "1", bucket), "authorization", "admin");
+        verify(response, 200);
+
+        // list publications
+        response = operationRequest("/v1/ops/publication/list", """
+                {"url": "publications/public/"}
+                """, "authorization", "admin");
+        verifyJson(response, 200, """
+                {
+                   "publications" : [ {
+                     "url" : "publications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/0123",
+                     "name" : "Publication name",
+                     "targetFolder" : "public/folder/",
+                     "status" : "PENDING",
+                     "createdAt" : 0,
+                     "resourceTypes" : [ "CONVERSATION", "FILE" ],
+                     "author" : "EPM-RTC-GPT"
+                   } ]
+                 }
+                """);
 
     }
 
