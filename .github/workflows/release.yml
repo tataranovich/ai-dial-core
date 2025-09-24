@@ -9,6 +9,5 @@ jobs:
     uses: tataranovich/ai-dial-ci/.github/workflows/java_release.yml@gh-e2e-test
     secrets: inherit
     with:
-      #platforms: "linux/amd64,linux/arm64"
+      platforms: "linux/amd64,linux/arm64"
       java-version: 21
-      docker-build-cache: false
