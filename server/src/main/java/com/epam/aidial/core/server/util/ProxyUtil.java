@@ -21,9 +21,11 @@ import io.vertx.core.http.HttpServerRequest;
 import lombok.experimental.UtilityClass;
 import lombok.extern.slf4j.Slf4j;
 
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import javax.annotation.Nullable;
@@ -288,6 +290,18 @@ public class ProxyUtil {
     }
 
     @Nullable
+    public static <T> T convertToObject(byte[] payload, Class<T> clazz) {
+        if (payload == null) {
+            return null;
+        }
+        try {
+            return MAPPER.readValue(payload, clazz);
+        } catch (IOException e) {
+            throw new IllegalArgumentException(e);
+        }
+    }
+
+    @Nullable
     public static String convertToString(Object data) {
         if (data == null) {
             return null;
@@ -312,5 +326,9 @@ public class ProxyUtil {
 
     public static EtagHeader etag(HttpServerRequest request) {
         return EtagHeader.fromHeader(request.getHeader(HttpHeaders.IF_MATCH), request.getHeader(HttpHeaders.IF_NONE_MATCH), request.method().name());
+    }
+
+    public String generateReference() {
+        return UUID.randomUUID().toString();
     }
 }

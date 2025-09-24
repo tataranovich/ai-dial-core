@@ -13,6 +13,7 @@ import com.epam.aidial.core.server.util.ResourceDescriptorFactory;
 import com.epam.aidial.core.storage.http.HttpException;
 import com.epam.aidial.core.storage.http.HttpStatus;
 import com.epam.aidial.core.storage.resource.ResourceDescriptor;
+import com.epam.aidial.core.storage.util.UrlUtil;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.netty.buffer.ByteBufInputStream;
 import io.vertx.core.Future;
@@ -24,10 +25,11 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.Collection;
 import java.util.Comparator;
-import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
+
+import static com.epam.aidial.core.server.Proxy.HEADER_APPLICATION_PROPERTIES;
 
 @Slf4j
 public class ApplicationRouteController extends BaseRouteController {
@@ -40,19 +42,19 @@ public class ApplicationRouteController extends BaseRouteController {
         super(proxy, context);
         this.deploymentId = deploymentId;
         this.routePath = routePath;
-        this.enhancementFunctions.add(new CollectRequestCustomAttachmentsFn(proxy, context));
     }
 
     @Override
     protected Future<Boolean> hasRequiredPermissions(Set<ResourceAccessType> permissions) {
         ResourceDescriptor appResource;
         try {
-            appResource = ResourceDescriptorFactory.fromAnyUrl(deploymentId, proxy.getEncryptionService());
+            String encodedPath = UrlUtil.encodePath(deploymentId);
+            appResource = ResourceDescriptorFactory.fromAnyUrl(encodedPath, proxy.getEncryptionService());
         } catch (IllegalArgumentException e) {
             // it looks like deployment id is not a custom application
             return Future.succeededFuture(true);
         }
-        return proxy.getVertx().executeBlocking(() -> {
+        return proxy.getTaskExecutor().submit(() -> {
             Map<ResourceDescriptor, Set<ResourceAccessType>> result = proxy.getAccessService().lookupPermissions(Set.of(appResource), context);
             Set<ResourceAccessType> actual = result.get(appResource);
             if (actual == null) {
@@ -64,37 +66,60 @@ public class ApplicationRouteController extends BaseRouteController {
     }
 
     @Override
-    protected void injectAdditionalHeaders(HttpClientRequest proxyRequest) {
-        proxyRequest.putHeader(Proxy.HEADER_APPLICATION_ID, deploymentId);
+    protected boolean hasAccessByUserRoles(Route route) {
+        if (route.getUserRoles() != null) {
+            return super.hasAccessByUserRoles(route);
+        }
+        return context.getDeployment().hasAccess(context.getUserRoles());
     }
 
     @Override
-    protected Future<Void> handleProxyResponseBody(Buffer responseBody) {
-        try (InputStream stream = new ByteBufInputStream(responseBody.getByteBuf())) {
-            ObjectNode tree = (ObjectNode) ProxyUtil.MAPPER.readTree(stream);
-            var fn = new CollectResponseCustomAttachmentsFn(proxy, context);
-            return fn.apply(tree);
-        } catch (IOException e) {
-            log.warn("Can't parse JSON response body. Trace: {}. Span: {}. Error:",
-                    context.getTraceId(), context.getSpanId(), e);
-            return Future.failedFuture(e);
+    protected void injectAdditionalHeaders(HttpClientRequest proxyRequest) {
+        proxyRequest.putHeader(Proxy.HEADER_APPLICATION_ID, deploymentId);
+        if ((context.getDeployment() instanceof Application application && application.hasApplicationTypeSchemaId())) {
+            proxy.getApplicationSchemaService().consumeMetadataProperties(application, (properties, appendApplicationPropertiesHeader) -> {
+                if (appendApplicationPropertiesHeader) {
+                    String propsString = ProxyUtil.MAPPER.writeValueAsString(properties);
+                    proxyRequest.putHeader(HEADER_APPLICATION_PROPERTIES, propsString);
+                }
+            });
         }
     }
 
     @Override
+    protected Future<Void> handleProxyResponseBody(Buffer responseBody) {
+        Route route = context.getRoute();
+        if (!route.getAttachmentPaths().getResponseBody().isEmpty()) {
+            try (InputStream stream = new ByteBufInputStream(responseBody.getByteBuf())) {
+                ObjectNode tree = (ObjectNode) ProxyUtil.MAPPER.readTree(stream);
+                var fn = new CollectResponseCustomAttachmentsFn(proxy, context);
+                return fn.apply(tree);
+            } catch (IOException e) {
+                log.warn("Can't parse JSON response body. Error:", e);
+                return Future.failedFuture(e);
+            }
+        }
+        return Future.succeededFuture();
+    }
+
+    @Override
     protected Future<Collection<Route>> getRoutes() {
-        return proxy.getVertx().executeBlocking(() -> {
+        return proxy.getTaskExecutor().submit(() -> {
             Deployment deployment = proxy.getDeploymentService().findDeployment(context, deploymentId);
             context.setDeployment(deployment);
             if (deployment instanceof Application application) {
-                return sortRoutes(application.getRoutes());
+                Map<String, Route> routes = proxy.getApplicationSchemaService().getRoutes(application);
+                if (routes == null) {
+                    routes = application.getRoutes();
+                }
+                return sortRoutes(routes);
             } else {
                 throw new HttpException(HttpStatus.NOT_FOUND, "Application is not found: " + deploymentId);
             }
         });
     }
 
-    private Collection<Route> sortRoutes(LinkedHashMap<String, Route> routes) {
+    private Collection<Route> sortRoutes(Map<String, Route> routes) {
         return routes.entrySet().stream().map(e -> {
             Route route = e.getValue();
             route.setName(e.getKey());
@@ -107,5 +132,11 @@ public class ApplicationRouteController extends BaseRouteController {
         return routePath;
     }
 
-
+    @Override
+    protected void setupEnhancementFunctions() {
+        Route route = context.getRoute();
+        if (!route.getAttachmentPaths().getRequestBody().isEmpty()) {
+            enhancementFunctions.add(new CollectRequestCustomAttachmentsFn(proxy, context));
+        }
+    }
 }

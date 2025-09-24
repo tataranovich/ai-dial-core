@@ -154,6 +154,11 @@ public enum RouteTemplate {
             "/v1/ops/code_interpreter/{operation}"
     ),
 
+    TOOL_SET_CREDENTIALS(
+        "^/v1/ops/toolset/(signin|signout)",
+        "/v1/ops/toolset/{operation}"
+    ),
+
     // Other routes
     CONFIG(
             "^/v1/ops/config/reload$",
@@ -170,6 +175,22 @@ public enum RouteTemplate {
     APP_SCHEMAS(
             "^/v1/application_type_schemas/(schemas|schema|meta_schema)$",
             "/v1/application_type_schemas/{operation}"
+    ),
+    TOOL_SET(
+            "^/+openai/toolsets/(?<id>.+?)$",
+            "/openai/toolsets/{id}"
+    ),
+    TOOL_SETS(
+            "^/+openai/toolsets$",
+            "/openai/toolsets"
+    ),
+    TOOL_SET_PROXY(
+            "^/v1/toolset/(?<id>.+?)/mcp$",
+            "/v1/toolset/{id}/mcp"
+    ),
+    TOOL_SET_PROXY_METADATA(
+            "^/\\.well-known/oauth-protected-resource/v1/toolset/(?<id>.+?)/mcp$",
+            "/.well-known/oauth-protected-resource/v1/toolset/{id}/mcp"
     );
 
     private final Pattern pattern;

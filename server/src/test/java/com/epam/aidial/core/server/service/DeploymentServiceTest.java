@@ -7,6 +7,7 @@ import com.epam.aidial.core.server.ProxyContext;
 import com.epam.aidial.core.server.security.AccessService;
 import com.epam.aidial.core.server.security.EncryptionService;
 import com.epam.aidial.core.storage.data.ResourceItemMetadata;
+import com.epam.aidial.core.storage.exception.ResourceNotFoundException;
 import com.epam.aidial.core.storage.resource.ResourceDescriptor;
 import org.apache.commons.lang3.tuple.Pair;
 import org.junit.jupiter.api.BeforeEach;
@@ -81,9 +82,9 @@ public class DeploymentServiceTest {
     }
 
     @Test
-    public void testFindDeployment_WhenTypeIsNotApplication() {
+    public void testFindDeployment_WhenAccessDenied() {
 
-        assertThrows(ResourceNotFoundException.class, () -> service.findDeployment(context, "files/public/my-app"));
+        assertThrows(PermissionDeniedException.class, () -> service.findDeployment(context, "files/public/my-app"));
     }
 
     @Test

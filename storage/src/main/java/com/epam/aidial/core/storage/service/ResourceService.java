@@ -47,6 +47,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
@@ -171,7 +172,7 @@ public class ResourceService implements AutoCloseable {
 
                 if (!copyResource(sourceFile, targetFile, null, overwrite)) {
                     throw new IllegalArgumentException("Can't copy source file: " + sourceFileUrl
-                                                       + " to target file: " + targetFileUrl);
+                            + " to target file: " + targetFileUrl);
                 }
             }
 
@@ -213,44 +214,49 @@ public class ResourceService implements AutoCloseable {
             return null;
         }
 
-        List<MetadataBase> resources = set.stream().map(meta -> {
-            Map<String, String> metadata = meta.getUserMetadata();
-            String path = meta.getName();
-            ResourceDescriptor description = descriptor.resolveByPath(path);
-
-            if (meta.getType() != StorageType.BLOB) {
-                return new ResourceFolderMetadata(description);
-            }
-
-            Long createdAt = null;
-            Long updatedAt = null;
-            String author = null;
-
-            if (metadata != null) {
-                createdAt = metadata.containsKey(CREATED_AT_ATTRIBUTE) ? Long.parseLong(metadata.get(CREATED_AT_ATTRIBUTE)) : null;
-                updatedAt = metadata.containsKey(UPDATED_AT_ATTRIBUTE) ? Long.parseLong(metadata.get(UPDATED_AT_ATTRIBUTE)) : null;
-                author = decode(metadata.get(AUTHOR_ATTRIBUTE));
-            }
-
-            if (createdAt == null && meta.getCreationDate() != null) {
-                createdAt = meta.getCreationDate().getTime();
-            }
-
-            if (updatedAt == null && meta.getLastModified() != null) {
-                updatedAt = meta.getLastModified().getTime();
-            }
-
-            if (description.getType().requireCompression()) {
-                return new ResourceItemMetadata(description).setCreatedAt(createdAt).setUpdatedAt(updatedAt).setAuthor(author);
-            }
-
-            return new FileMetadata(description, meta.getSize(), BlobStorage.resolveContentType((BlobMetadata) meta))
-                    .setCreatedAt(createdAt)
-                    .setAuthor(author)
-                    .setUpdatedAt(updatedAt);
-        }).toList();
+        List<MetadataBase> resources = set.stream()
+                // blob store never returns folder however local FS provider may return
+                .filter(meta -> !recursive || meta.getType() == StorageType.BLOB)
+                .map(meta -> storageToResourceMetadata(meta, descriptor)).toList();
 
         return new ResourceFolderMetadata(descriptor, resources, set.getNextMarker());
+    }
+
+    private static MetadataBase storageToResourceMetadata(StorageMetadata meta, ResourceDescriptor folder) {
+        Map<String, String> metadata = meta.getUserMetadata();
+        String path = meta.getName();
+        ResourceDescriptor description = folder.resolveByPath(path);
+
+        if (meta.getType() != StorageType.BLOB) {
+            return new ResourceFolderMetadata(description);
+        }
+
+        Long createdAt = null;
+        Long updatedAt = null;
+        String author = null;
+
+        if (metadata != null) {
+            createdAt = metadata.containsKey(CREATED_AT_ATTRIBUTE) ? Long.parseLong(metadata.get(CREATED_AT_ATTRIBUTE)) : null;
+            updatedAt = metadata.containsKey(UPDATED_AT_ATTRIBUTE) ? Long.parseLong(metadata.get(UPDATED_AT_ATTRIBUTE)) : null;
+            author = decode(metadata.get(AUTHOR_ATTRIBUTE));
+        }
+
+        if (createdAt == null && meta.getCreationDate() != null) {
+            createdAt = meta.getCreationDate().getTime();
+        }
+
+        if (updatedAt == null && meta.getLastModified() != null) {
+            updatedAt = meta.getLastModified().getTime();
+        }
+
+        if (description.getType().requireCompression()) {
+            return new ResourceItemMetadata(description).setCreatedAt(createdAt).setUpdatedAt(updatedAt).setAuthor(author);
+        }
+
+        return new FileMetadata(description, meta.getSize(), BlobStorage.resolveContentType((BlobMetadata) meta))
+                .setCreatedAt(createdAt)
+                .setAuthor(author)
+                .setUpdatedAt(updatedAt);
     }
 
     @Nullable
@@ -313,6 +319,32 @@ public class ResourceService implements AutoCloseable {
 
     @Nullable
     private Pair<ResourceItemMetadata, String> getResourceWithMetadata(ResourceDescriptor descriptor, EtagHeader etagHeader, boolean lock) {
+        Pair<ResourceItemMetadata, byte[]> result = getResourceBytesWithMetadata(descriptor, etagHeader, lock);
+        if (result == null) {
+            return null;
+        }
+        return Pair.of(result.getLeft(), new String(result.getRight(), StandardCharsets.UTF_8));
+    }
+
+    @Nullable
+    public String getResource(ResourceDescriptor descriptor) {
+        return getResource(descriptor, EtagHeader.ANY, true);
+    }
+
+    @Nullable
+    public String getResource(ResourceDescriptor descriptor, EtagHeader etag, boolean lock) {
+        Pair<ResourceItemMetadata, String> result = getResourceWithMetadata(descriptor, etag, lock);
+        return (result == null) ? null : result.getRight();
+    }
+
+    @Nullable
+    public byte[] getResourceBytes(ResourceDescriptor descriptor) {
+        Pair<ResourceItemMetadata, byte[]> result = getResourceBytesWithMetadata(descriptor, EtagHeader.ANY, true);
+        return (result == null) ? null : result.getRight();
+    }
+
+    @Nullable
+    private Pair<ResourceItemMetadata, byte[]> getResourceBytesWithMetadata(ResourceDescriptor descriptor, EtagHeader etagHeader, boolean lock) {
         String redisKey = redisKey(descriptor);
         Result result = redisGet(redisKey, true);
 
@@ -330,23 +362,10 @@ public class ResourceService implements AutoCloseable {
 
         if (result.exists()) {
             etagHeader.validate(result.etag);
-            return Pair.of(
-                    toResourceItemMetadata(descriptor, result),
-                    new String(result.body, StandardCharsets.UTF_8));
+            return Pair.of(toResourceItemMetadata(descriptor, result), result.body);
         }
 
         return null;
-    }
-
-    @Nullable
-    public String getResource(ResourceDescriptor descriptor) {
-        return getResource(descriptor, EtagHeader.ANY, true);
-    }
-
-    @Nullable
-    public String getResource(ResourceDescriptor descriptor, EtagHeader etag, boolean lock) {
-        Pair<ResourceItemMetadata, String> result = getResourceWithMetadata(descriptor, etag, lock);
-        return (result == null) ? null : result.getRight();
     }
 
     public ResourceStream getResourceStream(ResourceDescriptor resource, EtagHeader etagHeader) throws IOException {
@@ -449,6 +468,16 @@ public class ResourceService implements AutoCloseable {
         }
     }
 
+    public ResourceItemMetadata putResourceBytes(
+            ResourceDescriptor descriptor, byte[] body, EtagHeader etag) {
+        return putResource(descriptor, body, etag, "application/json", null, true);
+    }
+
+    public ResourceItemMetadata putResourceBytes(
+            ResourceDescriptor descriptor, byte[] body, EtagHeader etag, String author, boolean lock) {
+        return putResource(descriptor, body, etag, "application/json", author, lock);
+    }
+
     public FileMetadata putFile(ResourceDescriptor descriptor, byte[] body, EtagHeader etag, String contentType, String author) {
         if (descriptor.getType().requireCompression()) {
             throw new IllegalArgumentException("Resource must be uncompressed, got %s".formatted(descriptor.getType()));
@@ -513,13 +542,32 @@ public class ResourceService implements AutoCloseable {
     }
 
     public ResourceItemMetadata computeResource(ResourceDescriptor descriptor, EtagHeader etag, String author, Function<String, String> fn) {
+        Function<byte[], byte[]> wrapper = bytes -> {
+            String json = null;
+            if (bytes != null) {
+                json = new String(bytes, StandardCharsets.UTF_8);
+            }
+            String result = fn.apply(json);
+            if (result != null) {
+                return result.getBytes(StandardCharsets.UTF_8);
+            }
+            return null;
+        };
+        return computeResourceBytes(descriptor, etag, author, wrapper);
+    }
+
+    public ResourceItemMetadata computeResourceBytes(ResourceDescriptor descriptor, Function<byte[], byte[]> fn) {
+        return computeResourceBytes(descriptor, EtagHeader.ANY, null, fn);
+    }
+
+    public ResourceItemMetadata computeResourceBytes(ResourceDescriptor descriptor, EtagHeader etag, String author, Function<byte[], byte[]> fn) {
         String redisKey = redisKey(descriptor);
 
         try (var ignore = lockService.lock(redisKey)) {
-            Pair<ResourceItemMetadata, String> oldResult = getResourceWithMetadata(descriptor, etag, false);
+            Pair<ResourceItemMetadata, byte[]> oldResult = getResourceBytesWithMetadata(descriptor, etag, false);
 
-            String oldBody = oldResult == null ? null : oldResult.getValue();
-            String newBody = fn.apply(oldBody);
+            byte[] oldBody = oldResult == null ? null : oldResult.getValue();
+            byte[] newBody = fn.apply(oldBody);
 
             if (oldBody == null && newBody == null) {
                 return null;
@@ -530,11 +578,11 @@ public class ResourceService implements AutoCloseable {
                 return oldResult.getKey();
             }
 
-            if (Objects.equals(oldBody, newBody)) {
+            if (Arrays.equals(oldBody, newBody)) {
                 return oldResult.getKey();
             }
 
-            return putResource(descriptor, newBody, etag, author, false);
+            return putResourceBytes(descriptor, newBody, etag, author, false);
         }
     }
 

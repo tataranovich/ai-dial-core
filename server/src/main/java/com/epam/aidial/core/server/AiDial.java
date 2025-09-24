@@ -1,10 +1,37 @@
 package com.epam.aidial.core.server;
 
+import com.epam.aidial.core.credentials.data.configuration.EncryptionSettings;
+import com.epam.aidial.core.credentials.data.configuration.KmsSettings;
+import com.epam.aidial.core.credentials.encryption.ContentEncryptionKeyGenerator;
+import com.epam.aidial.core.credentials.encryption.ContentEncryptionKeyManager;
+import com.epam.aidial.core.credentials.encryption.ContentEncryptionKeyManagerFactory;
+import com.epam.aidial.core.credentials.encryption.ContentEncryptionKeyService;
+import com.epam.aidial.core.credentials.encryption.CredentialEncryptionService;
+import com.epam.aidial.core.credentials.encryption.DataEncryptionService;
+import com.epam.aidial.core.credentials.factory.ResourceCredentialsFactoryProvider;
+import com.epam.aidial.core.credentials.keymanagement.KeyManagementService;
+import com.epam.aidial.core.credentials.keymanagement.KeyManagementServiceFactory;
+import com.epam.aidial.core.credentials.service.AuthorizationHeaderProvider;
+import com.epam.aidial.core.credentials.service.ResourceAuthSettingsEncryptionService;
+import com.epam.aidial.core.credentials.service.ResourceAuthSettingsService;
+import com.epam.aidial.core.credentials.service.ResourceAuthorizationClient;
+import com.epam.aidial.core.credentials.service.ResourceCredentialsService;
+import com.epam.aidial.core.credentials.service.TokenService;
+import com.epam.aidial.core.credentials.service.metadata.AuthorizationServerMetadataService;
+import com.epam.aidial.core.credentials.service.metadata.HttpHeadersHandler;
+import com.epam.aidial.core.credentials.service.metadata.ProtectedResourceMetadataService;
+import com.epam.aidial.core.credentials.service.registration.ResourceRegistrationService;
+import com.epam.aidial.core.credentials.service.token.TokenRefreshStrategyFactory;
+import com.epam.aidial.core.credentials.util.TimeProvider;
+import com.epam.aidial.core.credentials.validation.AuthorizationServerMetadataValidator;
+import com.epam.aidial.core.credentials.validation.ProtectedResourceMetadataValidator;
+import com.epam.aidial.core.credentials.validation.ResourceAuthSettingsValidator;
 import com.epam.aidial.core.server.config.ConfigStore;
 import com.epam.aidial.core.server.config.FileConfigStore;
 import com.epam.aidial.core.server.config.PathNormalizerSpanProcessor;
 import com.epam.aidial.core.server.config.RouteNormalizingMeterFilter;
 import com.epam.aidial.core.server.controller.HealthCheckController;
+import com.epam.aidial.core.server.controller.WellKnownResourceMetadataController;
 import com.epam.aidial.core.server.limiter.RateLimiter;
 import com.epam.aidial.core.server.log.GfLogStore;
 import com.epam.aidial.core.server.log.LogStore;
@@ -13,6 +40,7 @@ import com.epam.aidial.core.server.security.AccessTokenValidator;
 import com.epam.aidial.core.server.security.ApiKeyStore;
 import com.epam.aidial.core.server.security.EncryptionService;
 import com.epam.aidial.core.server.service.ApplicationOperatorService;
+import com.epam.aidial.core.server.service.ApplicationSchemaService;
 import com.epam.aidial.core.server.service.ApplicationService;
 import com.epam.aidial.core.server.service.ConsentService;
 import com.epam.aidial.core.server.service.DeploymentService;
@@ -23,13 +51,16 @@ import com.epam.aidial.core.server.service.PublicationService;
 import com.epam.aidial.core.server.service.ResourceOperationService;
 import com.epam.aidial.core.server.service.RuleService;
 import com.epam.aidial.core.server.service.ShareService;
+import com.epam.aidial.core.server.service.ToolSetService;
 import com.epam.aidial.core.server.service.UpstreamCacheService;
 import com.epam.aidial.core.server.service.VertxTimerService;
+import com.epam.aidial.core.server.service.WellKnownResourceMetadataService;
 import com.epam.aidial.core.server.service.codeinterpreter.CodeInterpreterService;
 import com.epam.aidial.core.server.token.TokenStatsTracker;
 import com.epam.aidial.core.server.tracing.DialTracingFactory;
 import com.epam.aidial.core.server.upstream.UpstreamRouteProvider;
 import com.epam.aidial.core.server.util.ProxyUtil;
+import com.epam.aidial.core.server.vertx.AsyncTaskExecutor;
 import com.epam.aidial.core.storage.blobstore.BlobStorage;
 import com.epam.aidial.core.storage.blobstore.Storage;
 import com.epam.aidial.core.storage.cache.CacheClientFactory;
@@ -54,6 +85,7 @@ import io.vertx.core.http.HttpClientOptions;
 import io.vertx.core.http.HttpServer;
 import io.vertx.core.http.HttpServerOptions;
 import io.vertx.core.json.Json;
+import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 import io.vertx.core.metrics.MetricsOptions;
 import io.vertx.micrometer.MicrometerMetricsOptions;
@@ -68,10 +100,13 @@ import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.security.SecureRandom;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Properties;
 import java.util.Random;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -83,6 +118,7 @@ import java.util.function.Supplier;
 @Getter
 public class AiDial {
 
+    private static final Set<String> NON_PRINTABLE_SETTINGS = Set.of("secret", "password", "key", "credential", "identity");
     private JsonObject settings;
     private Vertx vertx;
     private HttpServer server;
@@ -105,6 +141,7 @@ public class AiDial {
         System.setProperty("io.opentelemetry.context.contextStorageProvider", "io.vertx.tracing.opentelemetry.VertxContextStorageProvider");
         try {
             settings = (settings == null) ? settings() : settings;
+            printSettings(settings);
             VertxOptions vertxOptions = new VertxOptions(settings("vertx"));
             setupMetrics(vertxOptions);
             setupTracing(vertxOptions);
@@ -113,10 +150,12 @@ public class AiDial {
             HttpClientOptions clientOptions = new HttpClientOptions(settings("client"));
             client = vertx.createHttpClient(clientOptions);
 
-            LogStore logStore = new GfLogStore(vertx);
+            AsyncTaskExecutor taskExecutor = new AsyncTaskExecutor(vertx, settings("asyncTaskExecutor"));
+
+            LogStore logStore = new GfLogStore();
 
             if (accessTokenValidator == null) {
-                accessTokenValidator = new AccessTokenValidator(settings("identityProviders"), vertx, client, clientOptions);
+                accessTokenValidator = new AccessTokenValidator(settings("identityProviders"), vertx, taskExecutor, client, clientOptions);
             }
 
             if (storage == null) {
@@ -128,47 +167,69 @@ public class AiDial {
             redis = CacheClientFactory.create(toJsonNode(settings("redis")));
 
             LockService lockService = new LockService(redis, storage.getPrefix());
-            TimerService timerService = new VertxTimerService(vertx);
+            TimerService timerService = new VertxTimerService(vertx, taskExecutor);
             ResourceService.Settings resourceServiceSettings = Json.decodeValue(settings("resources").toBuffer(), ResourceService.Settings.class);
             resourceService = new ResourceService(timerService, redis, storage, lockService, resourceServiceSettings, storage.getPrefix());
             InvitationService invitationService = new InvitationService(resourceService, encryptionService, settings("invitations"));
-            ApiKeyStore apiKeyStore = new ApiKeyStore(vertx, redis, storage.getPrefix());
+            ApiKeyStore apiKeyStore = new ApiKeyStore(taskExecutor, redis, storage.getPrefix(), settings("perRequestApiKey"));
             ConfigStore configStore = new FileConfigStore(vertx, settings("config"), apiKeyStore);
             ApplicationOperatorService operatorService = new ApplicationOperatorService(client, settings("applications"));
-            ApplicationService applicationService = new ApplicationService(vertx, redis, apiKeyStore, encryptionService,
-                    resourceService, lockService, operatorService, generator, settings("applications"), configStore);
-            ShareService shareService = new ShareService(resourceService, invitationService, encryptionService, applicationService, lockService, configStore);
+            ApplicationSchemaService applicationSchemaService = new ApplicationSchemaService(resourceService, configStore, encryptionService);
+            ApplicationService applicationService = new ApplicationService(vertx, taskExecutor, redis, apiKeyStore, encryptionService,
+                    resourceService, lockService, operatorService, applicationSchemaService, generator, settings("applications"));
+            ShareService shareService = new ShareService(resourceService, invitationService, encryptionService, applicationService, lockService, applicationSchemaService, clock);
             RuleService ruleService = new RuleService(resourceService);
-            AccessService accessService = new AccessService(encryptionService, shareService, ruleService, settings("access"));
+            AccessService accessService = new AccessService(encryptionService, shareService, ruleService, applicationSchemaService, settings("access"));
             NotificationService notificationService = new NotificationService(resourceService, encryptionService);
             ResourceOperationService resourceOperationService = new ResourceOperationService(applicationService,
                     resourceService, invitationService, shareService, lockService);
-            PublicationService publicationService = new PublicationService(encryptionService, resourceService, accessService,
-                    ruleService, notificationService, applicationService, resourceOperationService, generator, clock, configStore);
-            RateLimiter rateLimiter = new RateLimiter(vertx, resourceService);
-            CodeInterpreterService codeInterpreterService = new CodeInterpreterService(vertx, redis, resourceService,
+            RateLimiter rateLimiter = new RateLimiter(taskExecutor, resourceService);
+            CodeInterpreterService codeInterpreterService = new CodeInterpreterService(vertx, taskExecutor, redis, resourceService,
                     accessService, encryptionService, operatorService, generator, settings("codeInterpreter"));
 
-            TokenStatsTracker tokenStatsTracker = new TokenStatsTracker(vertx, resourceService);
+            TokenStatsTracker tokenStatsTracker = new TokenStatsTracker(taskExecutor, resourceService);
 
             HeartbeatService heartbeatService = new HeartbeatService(
-                    vertx, settings("resources").getLong("heartbeatPeriod"));
+                    vertx, taskExecutor, settings("resources").getLong("heartbeatPeriod"));
 
             UpstreamCacheService upstreamCacheService = new UpstreamCacheService(redis, lockService, clock, storage.getPrefix());
-            UpstreamRouteProvider upstreamRouteProvider = new UpstreamRouteProvider(vertx, Random::new, upstreamCacheService);
+            UpstreamRouteProvider upstreamRouteProvider = new UpstreamRouteProvider(vertx, taskExecutor, Random::new, upstreamCacheService);
 
-            DeploymentService deploymentService = new DeploymentService(encryptionService, applicationService, accessService);
+            TimeProvider timeProvider = new TimeProvider();
+            TokenRefreshStrategyFactory tokenRefreshStrategyFactory = new TokenRefreshStrategyFactory(timeProvider);
+            ResourceAuthorizationClient resourceAuthorizationClient = new ResourceAuthorizationClient();
+            CredentialEncryptionService credentialEncryptionService = getCredentialEncryptionService();
+            ResourceCredentialsService resourceCredentialsService = getResourceCredentialsService(
+                    tokenRefreshStrategyFactory, resourceAuthorizationClient, credentialEncryptionService, timeProvider);
+            ResourceAuthSettingsService resourceAuthSettingsService = getResourceAuthSettingsService(
+                    resourceCredentialsService, tokenRefreshStrategyFactory, resourceAuthorizationClient);
+            AuthorizationHeaderProvider authorizationHeaderProvider = new AuthorizationHeaderProvider(resourceCredentialsService);
+            ResourceAuthSettingsEncryptionService resourceAuthSettingsEncryptionService = new ResourceAuthSettingsEncryptionService(
+                    credentialEncryptionService);
+
+            ToolSetService toolSetService = new ToolSetService(resourceService, resourceAuthSettingsService,
+                    resourceAuthSettingsEncryptionService);
+            PublicationService publicationService = new PublicationService(encryptionService, resourceService, accessService,
+                    ruleService, notificationService, applicationService, toolSetService, resourceOperationService, generator, clock);
+
+            DeploymentService deploymentService = new DeploymentService(encryptionService, applicationService, accessService,
+                    toolSetService, resourceService);
 
             ConsentService consentService = new ConsentService(deploymentService, resourceService);
 
-            HealthCheckController healthCheckController = new HealthCheckController(redis, vertx);
+            HealthCheckController healthCheckController = new HealthCheckController(redis, taskExecutor);
+
+            WellKnownResourceMetadataService wellKnownResourceMetadataService = new WellKnownResourceMetadataService(settings("toolsets"));
+            WellKnownResourceMetadataController resourceMetadataController = new WellKnownResourceMetadataController(wellKnownResourceMetadataService);
 
             proxy = new Proxy(vertx, clientOptions, client, configStore, logStore,
                     rateLimiter, upstreamRouteProvider, accessTokenValidator,
                     storage, encryptionService, apiKeyStore, tokenStatsTracker, resourceService, invitationService,
                     shareService, publicationService, accessService, lockService, resourceOperationService, ruleService,
                     notificationService, applicationService, codeInterpreterService, heartbeatService, upstreamCacheService,
-                    consentService, deploymentService, healthCheckController, version());
+                    consentService, deploymentService, healthCheckController, wellKnownResourceMetadataService, resourceMetadataController,
+                    toolSetService, applicationSchemaService, authorizationHeaderProvider, resourceAuthSettingsService, resourceCredentialsService,
+                    taskExecutor, version());
 
             server = vertx.createHttpServer(new HttpServerOptions(settings("server"))).requestHandler(proxy);
             open(server, HttpServer::listen);
@@ -178,6 +239,52 @@ public class AiDial {
             stop();
             throw e;
         }
+    }
+
+    private static ResourceRegistrationService getResourceRegistrationService(ResourceAuthorizationClient resourceAuthorizationClient) {
+        ProtectedResourceMetadataValidator protectedResourceMetadataValidator = new ProtectedResourceMetadataValidator();
+        HttpHeadersHandler httpHeadersHandler = new HttpHeadersHandler();
+        ProtectedResourceMetadataService protectedResourceMetadataService = new ProtectedResourceMetadataService(
+                resourceAuthorizationClient, protectedResourceMetadataValidator, httpHeadersHandler);
+
+        AuthorizationServerMetadataValidator authorizationServerMetadataValidator = new AuthorizationServerMetadataValidator();
+        AuthorizationServerMetadataService authorizationServerMetadataService = new AuthorizationServerMetadataService(
+                resourceAuthorizationClient, authorizationServerMetadataValidator);
+        return new ResourceRegistrationService(authorizationServerMetadataService, resourceAuthorizationClient, protectedResourceMetadataService);
+    }
+
+    private CredentialEncryptionService getCredentialEncryptionService() {
+        JsonObject toolsetSecurity = settings("toolsets").getJsonObject("security", new JsonObject());
+        KmsSettings kmsSettings = Json.decodeValue(toolsetSecurity
+                .getJsonObject("kms", new JsonObject()).toBuffer(), KmsSettings.class);
+        EncryptionSettings encryptionSettings = Json.decodeValue(toolsetSecurity
+                .getJsonObject("encryption", new JsonObject()).toBuffer(), EncryptionSettings.class);
+        ContentEncryptionKeyGenerator contentEncryptionKeyGenerator = new ContentEncryptionKeyGenerator(encryptionSettings);
+        KeyManagementService keyManagementService = KeyManagementServiceFactory.create(kmsSettings);
+        ContentEncryptionKeyManager contentEncryptionKeyManager = ContentEncryptionKeyManagerFactory.create(
+                resourceService, contentEncryptionKeyGenerator, keyManagementService, kmsSettings.getCache());
+        ContentEncryptionKeyService contentEncryptionKeyService = new ContentEncryptionKeyService(contentEncryptionKeyManager);
+        DataEncryptionService dataEncryptionService = new DataEncryptionService(encryptionSettings, new SecureRandom());
+        return new CredentialEncryptionService(contentEncryptionKeyService, dataEncryptionService);
+    }
+
+    private ResourceCredentialsService getResourceCredentialsService(TokenRefreshStrategyFactory tokenRefreshStrategyFactory,
+                                                                     ResourceAuthorizationClient resourceAuthorizationClient,
+                                                                     CredentialEncryptionService credentialEncryptionService,
+                                                                     TimeProvider timeProvider) {
+        TokenService tokenService = new TokenService(resourceAuthorizationClient);
+        ResourceCredentialsFactoryProvider resourceCredentialsFactoryProvider = new ResourceCredentialsFactoryProvider(tokenService);
+        return new ResourceCredentialsService(resourceService, credentialEncryptionService, resourceCredentialsFactoryProvider,
+                tokenService, tokenRefreshStrategyFactory, timeProvider);
+    }
+
+    private ResourceAuthSettingsService getResourceAuthSettingsService(ResourceCredentialsService resourceCredentialsService,
+                                                                       TokenRefreshStrategyFactory tokenRefreshStrategyFactory,
+                                                                       ResourceAuthorizationClient resourceAuthorizationClient) {
+        ResourceRegistrationService resourceRegistrationService = getResourceRegistrationService(resourceAuthorizationClient);
+        ResourceAuthSettingsValidator resourceAuthSettingsValidator = new ResourceAuthSettingsValidator();
+        return new ResourceAuthSettingsService(resourceRegistrationService, resourceAuthSettingsValidator,
+                resourceCredentialsService, tokenRefreshStrategyFactory);
     }
 
     @VisibleForTesting
@@ -232,6 +339,10 @@ public class AiDial {
             log.warn("Failed to load version", e);
         }
         return version;
+    }
+
+    public static String getVersion() {
+        return version();
     }
 
     private static JsonObject fileSettings() throws IOException {
@@ -374,5 +485,47 @@ public class AiDial {
             return val;
         }
         return System.getProperty(systemProperty);
+    }
+
+    private static void printSettings(Object settings) {
+        log.debug("AI DIAL Core settings");
+        log.debug("--------------- start --------------- ");
+        printSettings(settings, new StringBuilder());
+        log.debug("--------------- end --------------- ");
+    }
+
+    private static void printSettings(Object settings, StringBuilder path) {
+        if (settings instanceof JsonObject jsonObject) {
+            for (var entry : jsonObject.getMap().entrySet()) {
+                printSettings(entry.getKey(), entry.getValue(), path);
+            }
+        } else if (settings instanceof Map<?, ?> map) {
+            for (var entry : map.entrySet()) {
+                printSettings((String) entry.getKey(), entry.getValue(), path);
+            }
+        } else if (settings instanceof JsonArray array) {
+            for (int i = 0; i < array.size(); i++) {
+                printSettings("[" + i + "]", array.getValue(i), path);
+            }
+        } else if (settings instanceof List<?> list) {
+            for (int i = 0; i < list.size(); i++) {
+                printSettings("[" + i + "]", list.get(i), path);
+            }
+        } else {
+            log.debug("Core setting: key -> {}, value -> {}", path, settings);
+        }
+    }
+
+    private static void printSettings(String key, Object value, StringBuilder path) {
+        if (NON_PRINTABLE_SETTINGS.contains(key)) {
+            return;
+        }
+        int len = path.length();
+        if (!path.isEmpty()) {
+            path.append('.');
+        }
+        path.append(key);
+        printSettings(value, path);
+        path.setLength(len);
     }
 }

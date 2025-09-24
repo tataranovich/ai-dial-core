@@ -138,6 +138,19 @@ public class ControllerSelector {
                 default -> null;
             };
         });
+        get(RouteTemplate.TOOL_SET, (proxy, context, pathMatcher) -> {
+            ToolSetController controller = new ToolSetController(context);
+            String toolsetId = UrlUtil.decodePath(pathMatcher.group(1));
+            return () -> controller.getToolSet(toolsetId);
+        });
+        get(RouteTemplate.TOOL_SETS, (proxy, context, pathMatcher) -> {
+            ToolSetController controller = new ToolSetController(context);
+            return controller::getToolSets;
+        });
+        get(RouteTemplate.TOOL_SET_PROXY, ((proxy, context, pathMatcher) -> {
+            String toolSetId = UrlUtil.decodePath(pathMatcher.group(1));
+            return new ToolSetProxyController(proxy, context, toolSetId);
+        }));
 
         // POST routes
         post(RouteTemplate.POST_DEPLOYMENT, (proxy, context, pathMatcher) -> {
@@ -216,6 +229,17 @@ public class ControllerSelector {
                 default -> null;
             };
         });
+
+        post(RouteTemplate.TOOL_SET_CREDENTIALS, (proxy, context, pathMatcher) -> {
+            String operation = pathMatcher.group(1);
+            ToolSetCredentialsController controller = new ToolSetCredentialsController(proxy, context);
+
+            return switch (operation) {
+                case "signin" -> controller::signIn;
+                case "signout" -> controller::signOut;
+                default -> null;
+            };
+        });
         post(RouteTemplate.PUBLISHED_RESOURCES, (proxy, context, pathMatcher) -> {
             PublicationController controller = new PublicationController(proxy, context);
             return controller::listPublishedResources;
@@ -265,6 +289,10 @@ public class ControllerSelector {
             ConsentController controller = new ConsentController(context, proxy);
             return () -> controller.acceptConsent(deploymentId);
         });
+        post(RouteTemplate.TOOL_SET_PROXY, ((proxy, context, pathMatcher) -> {
+            String toolSetId = UrlUtil.decodePath(pathMatcher.group(1));
+            return new ToolSetProxyController(proxy, context, toolSetId);
+        }));
         // DELETE routes
         delete(RouteTemplate.FILES, (proxy, context, pathMatcher) -> {
             ResourceController controller = new ResourceController(proxy, context, false);
@@ -292,6 +320,7 @@ public class ControllerSelector {
             String path = context.getRequest().path();
             return () -> controller.handle(resourcePath(path));
         });
+
         // add deployment routes
         ControllerRoute.Initializer applicationRouteTemplate = ((proxy, context, pathMatcher) -> {
             String deploymentId = UrlUtil.decodePath(pathMatcher.group(1));

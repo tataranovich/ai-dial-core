@@ -60,15 +60,15 @@ public abstract class BaseRouteController implements Controller {
 
     protected Future<?> handleRoute(Route route) {
         if (route == null) {
-            log.warn("RouteController can't find a route to proceed the request: {}", getRequestUri());
             respond(HttpStatus.BAD_GATEWAY, "No route");
+            log.warn("RouteController can't find a route to proceed the request: {}", getRequestUri());
             return Future.succeededFuture();
         }
+        context.setRoute(route);
 
-        if (!route.hasAccess(context.getUserRoles())) {
-            log.warn("Forbidden route {}. Trace: {}. Span: {}. Project: {}. User sub: {}.",
-                    route.getName(), context.getTraceId(), context.getSpanId(), context.getProject(), context.getUserSub());
+        if (!hasAccessByUserRoles(route)) {
             respond(HttpStatus.FORBIDDEN, "Forbidden route");
+            log.warn("Forbidden route {}", route.getName());
             return Future.succeededFuture();
         }
 
@@ -107,10 +107,10 @@ public abstract class BaseRouteController implements Controller {
             setupProxyApiKeyData();
             context.getRequest().body()
                     .onFailure(this::handleRequestBodyError)
-                    .onSuccess(body -> proxy.getVertx().executeBlocking(() -> {
+                    .onSuccess(body -> proxy.getTaskExecutor().submit(() -> {
                         handleRequestBody(body);
                         return null;
-                    }, false));
+                    }));
         } else {
             context.getResponse().send(context.getResponseBody());
             proxy.getLogStore().save(context);
@@ -118,6 +118,10 @@ public abstract class BaseRouteController implements Controller {
     }
 
     protected abstract Future<Boolean> hasRequiredPermissions(Set<ResourceAccessType> permissions);
+
+    protected boolean hasAccessByUserRoles(Route route) {
+        return route.hasAccess(context.getUserRoles());
+    }
 
     String getRequestUri() {
         HttpServerRequest request = context.getRequest();
@@ -145,12 +149,13 @@ public abstract class BaseRouteController implements Controller {
 
     private void handleRequestBody(Buffer requestBody) {
         Deployment deployment = context.getDeployment();
-        log.info("Received body from client. Trace: {}. Span: {}. Project: {}. Deployment: {}. Length: {}",
-                context.getTraceId(), context.getSpanId(),
-                context.getProject(), deployment == null ? "N/A" : deployment.getName(), requestBody.length());
+        log.info("Received body from client. Deployment: {}. Length: {}",
+                deployment == null ? "N/A" : deployment.getName(), requestBody.length());
 
         context.setRequestBodyTimestamp(System.currentTimeMillis());
         context.setRequestBody(requestBody);
+
+        setupEnhancementFunctions();
 
         if (!enhancementFunctions.isEmpty()) {
             try (InputStream stream = new ByteBufInputStream(requestBody.getByteBuf())) {
@@ -164,8 +169,7 @@ public abstract class BaseRouteController implements Controller {
                 } else {
                     respond(HttpStatus.BAD_REQUEST);
                 }
-                log.warn("Can't process JSON request body. Trace: {}. Span: {}. Error:",
-                        context.getTraceId(), context.getSpanId(), e);
+                log.warn("Can't process JSON request body. Error:", e);
                 return;
             }
         }
@@ -173,6 +177,10 @@ public abstract class BaseRouteController implements Controller {
         proxy.getApiKeyStore().assignPerRequestApiKey(context.getProxyApiKeyData());
 
         sendRequest();
+    }
+
+    protected void setupEnhancementFunctions() {
+        // do nothing by default
     }
 
     private void setupProxyApiKeyData() {
@@ -235,8 +243,7 @@ public abstract class BaseRouteController implements Controller {
 
         if (responseStatusCode == 200) {
             context.getUpstreamRoute().succeed();
-            proxy.getRateLimiter().increase(context, context.getRoute()).onFailure(error -> log.warn("Failed to increase limit. Trace: {}. Span: {}",
-                    context.getTraceId(), context.getSpanId(), error));
+            proxy.getRateLimiter().increase(context, context.getRoute()).onFailure(error -> log.warn("Failed to increase limit", error));
         }
 
         BufferingReadStream proxyResponseStream = new BufferingReadStream(proxyResponse,
@@ -275,12 +282,15 @@ public abstract class BaseRouteController implements Controller {
         BufferingReadStream responseStream = context.getResponseStream();
         Buffer proxyResponseBody = responseStream.getContent();
         context.setResponseBody(proxyResponseBody);
-        handleProxyResponseBody(proxyResponseBody).onFailure(error -> log.warn("Failed to handle proxy response. Trace: {}. Span: {}",
-                context.getTraceId(), context.getSpanId(), error)).onSuccess(ignore -> {
-                    HttpServerResponse response = context.getResponse();
-                    proxy.getLogStore().save(context);
-                    responseStream.end(response);
-                });
+        handleProxyResponseBody(proxyResponseBody).onComplete(result -> {
+            if (result.failed()) {
+                log.warn("Failed to handle proxy response", result.cause());
+            }
+            HttpServerResponse response = context.getResponse();
+            responseStream.end(response);
+            proxy.getLogStore().save(context);
+            finalizeRequest();
+        });
     }
 
     protected abstract Future<Void> handleProxyResponseBody(Buffer responseBody);
@@ -290,10 +300,6 @@ public abstract class BaseRouteController implements Controller {
         rateLimitError.getError().setCode(String.valueOf(result.status().getCode()));
         rateLimitError.getError().setMessage(result.errorMessage());
         rateLimitError.getError().setDisplayMessage(result.displayErrorMessage());
-
-        log.warn("Rate limit error {}. Project: {}. User sub: {}. Route: {}. Trace: {}. Span: {}", result.errorMessage(),
-                context.getProject(), context.getUserSub(), context.getRoute().getName(), context.getTraceId(),
-                context.getSpanId());
 
         String errorMessage = ProxyUtil.convertToString(rateLimitError);
         HttpException httpException;
@@ -305,6 +311,8 @@ public abstract class BaseRouteController implements Controller {
         }
 
         respond(httpException);
+        
+        log.warn("Rate limit error {}. Route: {}", result.errorMessage(), context.getRoute().getName());
     }
 
     private void handleError(Throwable error) {
@@ -312,8 +320,8 @@ public abstract class BaseRouteController implements Controller {
             respond(httpException);
         } else {
             String errorMsg = "Error occurred on processing route request: %s".formatted(context.getRequest().path());
-            log.error(errorMsg, error);
             respond(HttpStatus.INTERNAL_SERVER_ERROR, errorMsg);
+            log.error(errorMsg, error);
         }
     }
 
@@ -321,8 +329,8 @@ public abstract class BaseRouteController implements Controller {
      * Called when proxy failed to receive request body from the client.
      */
     private void handleRequestBodyError(Throwable error) {
-        log.warn("Failed to receive client body: {}", error.getMessage());
         respond(HttpStatus.UNPROCESSABLE_ENTITY, "Failed to receive body");
+        log.warn("Failed to receive client body: {}", error.getMessage());
     }
 
     /**
@@ -383,7 +391,6 @@ public abstract class BaseRouteController implements Controller {
 
             for (Pattern pattern : route.getPaths()) {
                 if (pattern.matcher(path).matches()) {
-                    context.setRoute(route);
                     return route;
                 }
             }

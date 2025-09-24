@@ -1,6 +1,5 @@
 package com.epam.aidial.core.server.controller;
 
-import com.epam.aidial.core.config.Application;
 import com.epam.aidial.core.server.ProxyContext;
 import com.epam.aidial.core.server.data.codeinterpreter.CodeInterpreterExecuteRequest;
 import com.epam.aidial.core.server.data.codeinterpreter.CodeInterpreterFile;
@@ -10,11 +9,12 @@ import com.epam.aidial.core.server.data.codeinterpreter.CodeInterpreterSession;
 import com.epam.aidial.core.server.data.codeinterpreter.CodeInterpreterSessionId;
 import com.epam.aidial.core.server.security.AccessService;
 import com.epam.aidial.core.server.service.PermissionDeniedException;
-import com.epam.aidial.core.server.service.ResourceNotFoundException;
 import com.epam.aidial.core.server.service.codeinterpreter.CodeInterpreterService;
 import com.epam.aidial.core.server.util.ProxyUtil;
+import com.epam.aidial.core.server.vertx.AsyncTaskExecutor;
 import com.epam.aidial.core.server.vertx.stream.InputStreamAdapter;
 import com.epam.aidial.core.server.vertx.stream.InputStreamReader;
+import com.epam.aidial.core.storage.exception.ResourceNotFoundException;
 import com.epam.aidial.core.storage.http.HttpException;
 import com.epam.aidial.core.storage.http.HttpStatus;
 import io.vertx.core.Future;
@@ -36,12 +36,14 @@ class CodeInterpreterController {
     private final CodeInterpreterService service;
 
     private final AccessService accessService;
+    private final AsyncTaskExecutor taskExecutor;
 
     public CodeInterpreterController(ProxyContext context) {
         this.context = context;
         this.vertx = context.getProxy().getVertx();
         this.service = context.getProxy().getCodeInterpreterService();
         this.accessService = context.getProxy().getAccessService();
+        this.taskExecutor = context.getProxy().getTaskExecutor();
     }
 
     Future<?> openSession() {
@@ -50,7 +52,7 @@ class CodeInterpreterController {
                 .compose(body -> {
                     checkRunCodeInterpreter();
                     CodeInterpreterSessionId data = convertJson(body, CodeInterpreterSessionId.class);
-                    return vertx.executeBlocking(() -> service.openSession(context, data.getSessionId()), false);
+                    return taskExecutor.submit(() -> service.openSession(context, data.getSessionId()));
                 })
                 .onSuccess(this::respondJson)
                 .onFailure(this::respondError);
@@ -63,7 +65,7 @@ class CodeInterpreterController {
                 .body()
                 .compose(body -> {
                     CodeInterpreterSessionId data = convertJson(body, CodeInterpreterSessionId.class);
-                    return vertx.executeBlocking(() -> service.closeSession(context, data.getSessionId()), false);
+                    return taskExecutor.submit(() -> service.closeSession(context, data.getSessionId()));
                 })
                 .onSuccess(this::respondJson)
                 .onFailure(this::respondError);
@@ -76,7 +78,7 @@ class CodeInterpreterController {
                 .body()
                 .compose(body -> {
                     CodeInterpreterSessionId data = convertJson(body, CodeInterpreterSessionId.class);
-                    return vertx.executeBlocking(() -> service.getSession(context, data.getSessionId()), false);
+                    return taskExecutor.submit(() -> service.getSession(context, data.getSessionId()));
                 })
                 .onSuccess(this::respondJson)
                 .onFailure(this::respondError);
@@ -90,7 +92,7 @@ class CodeInterpreterController {
                 .compose(body -> {
                     checkRunCodeInterpreter();
                     CodeInterpreterExecuteRequest data = convertJson(body, CodeInterpreterExecuteRequest.class);
-                    return vertx.executeBlocking(() -> service.executeCode(context, data), false);
+                    return taskExecutor.submit(() -> service.executeCode(context, data));
                 })
                 .onSuccess(this::respondJson)
                 .onFailure(this::respondError);
@@ -104,7 +106,7 @@ class CodeInterpreterController {
                 .uploadHandler(upload -> {
                     // do not move inside execute blocking, otherwise you can miss the beginning of file
                     InputStreamAdapter stream = new InputStreamAdapter(upload);
-                    vertx.executeBlocking(() -> uploadFile(upload, stream), false)
+                    taskExecutor.submit(() -> uploadFile(upload, stream))
                             .onSuccess(this::respondJson)
                             .onComplete(e -> stream.close())
                             .onFailure(this::respondError);
@@ -131,7 +133,7 @@ class CodeInterpreterController {
 
     Future<?> downloadFile() {
         context.getRequest().body()
-                .compose(buffer -> vertx.executeBlocking(() -> downloadFile(buffer), false))
+                .compose(buffer -> taskExecutor.submit(() -> downloadFile(buffer)))
                 .onFailure(this::respondError);
 
         return Future.succeededFuture();
@@ -142,8 +144,13 @@ class CodeInterpreterController {
         HttpServerResponse response = context.getResponse();
 
         return service.downloadFile(context, data.getSessionId(), data.getPath(), (stream, size) -> {
-            response.putHeader(HttpHeaders.CONTENT_LENGTH, Long.toString(size));
-            return new InputStreamReader(vertx, stream)
+            if (size == null) {
+                response.setChunked(true);
+            } else {
+                response.putHeader(HttpHeaders.CONTENT_LENGTH, Long.toString(size));
+            }
+
+            return new InputStreamReader(vertx, taskExecutor, stream)
                     .pipe()
                     .endOnFailure(false)
                     .to(response);
@@ -155,7 +162,7 @@ class CodeInterpreterController {
                 .body()
                 .compose(body -> {
                     CodeInterpreterSessionId data = convertJson(body, CodeInterpreterSessionId.class);
-                    return vertx.executeBlocking(() -> service.listFiles(context, data.getSessionId()), false);
+                    return taskExecutor.submit(() -> service.listFiles(context, data.getSessionId()));
                 })
                 .onSuccess(this::respondJson)
                 .onFailure(this::respondError);
@@ -168,7 +175,7 @@ class CodeInterpreterController {
                 .body()
                 .compose(body -> {
                     CodeInterpreterInputFile data = convertJson(body, CodeInterpreterInputFile.class);
-                    return vertx.executeBlocking(() -> service.transferInputFile(context, data), false);
+                    return taskExecutor.submit(() -> service.transferInputFile(context, data));
                 })
                 .onSuccess(this::respondJson)
                 .onFailure(this::respondError);
@@ -181,7 +188,7 @@ class CodeInterpreterController {
                 .body()
                 .compose(body -> {
                     CodeInterpreterOutputFile data = convertJson(body, CodeInterpreterOutputFile.class);
-                    return vertx.executeBlocking(() -> service.transferOutputFile(context, data), false);
+                    return  taskExecutor.submit(() -> service.transferOutputFile(context, data));
                 })
                 .onSuccess(this::respondJson)
                 .onFailure(this::respondError);
@@ -193,6 +200,7 @@ class CodeInterpreterController {
         if (data instanceof CodeInterpreterSession session) {
             session.setDeploymentId(null);
             session.setDeploymentUrl(null);
+            session.setDeploymentType(null);
             session.setUsedAt(null);
         }
 

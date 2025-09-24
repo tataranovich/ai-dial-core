@@ -4,6 +4,7 @@ import com.epam.aidial.core.config.databind.JsonArrayToSchemaMapDeserializer;
 import com.epam.aidial.core.config.databind.MapToJsonArraySerializer;
 import com.epam.aidial.core.config.validation.ConformToMetaSchema;
 import com.epam.aidial.core.config.validation.CustomApplicationsConformToTypeSchemas;
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
@@ -27,7 +28,7 @@ public class Config {
     private Map<String, Model> models = Map.of();
     private Map<String, Addon> addons = Map.of();
     private Map<String, Application> applications = Map.of();
-    private Map<String, Application> toolsets = Map.of();
+    private Map<String, ToolSet> toolsets = Map.of();
     private Assistants assistant = new Assistants();
     @JsonProperty(access = JsonProperty.Access.WRITE_ONLY)
     private Map<String, Key> keys = new HashMap<>();
@@ -40,7 +41,7 @@ public class Config {
     @ConformToMetaSchema(message = "All custom application type schemas should conform to meta schema")
     private Map<String, String> applicationTypeSchemas = Map.of();
 
-
+    @JsonIgnore
     public Deployment selectDeployment(String deploymentId) {
         Application application = applications.get(deploymentId);
         if (application != null) {
@@ -52,11 +53,21 @@ public class Config {
             return model;
         }
 
+        ToolSet toolSet = toolsets.get(deploymentId);
+        if (toolSet != null) {
+            return toolSet;
+        }
+
+        Interceptor interceptor = interceptors.get(deploymentId);
+        if (interceptor != null) {
+            return interceptor;
+        }
+
         Assistants assistants = assistant;
         return assistants.getAssistants().get(deploymentId);
     }
 
-
+    @JsonIgnore
     public String getCustomApplicationSchema(URI schemaId) {
         if (schemaId == null) {
             return null;

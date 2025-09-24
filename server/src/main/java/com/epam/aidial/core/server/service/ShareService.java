@@ -1,12 +1,10 @@
 package com.epam.aidial.core.server.service;
 
 import com.epam.aidial.core.config.Application;
-import com.epam.aidial.core.config.Config;
 import com.epam.aidial.core.config.ResourceAccessType;
 import com.epam.aidial.core.config.Role;
 import com.epam.aidial.core.config.ShareResourceLimit;
 import com.epam.aidial.core.server.ProxyContext;
-import com.epam.aidial.core.server.config.ConfigStore;
 import com.epam.aidial.core.server.data.Invitation;
 import com.epam.aidial.core.server.data.InvitationLink;
 import com.epam.aidial.core.server.data.ListSharedResourcesRequest;
@@ -19,13 +17,13 @@ import com.epam.aidial.core.server.data.SharedResource;
 import com.epam.aidial.core.server.data.SharedResources;
 import com.epam.aidial.core.server.data.SharedResourcesResponse;
 import com.epam.aidial.core.server.security.EncryptionService;
-import com.epam.aidial.core.server.util.ApplicationTypeSchemaUtils;
 import com.epam.aidial.core.server.util.BucketBuilder;
 import com.epam.aidial.core.server.util.ProxyUtil;
 import com.epam.aidial.core.server.util.ResourceDescriptorFactory;
 import com.epam.aidial.core.storage.data.MetadataBase;
 import com.epam.aidial.core.storage.data.ResourceFolderMetadata;
 import com.epam.aidial.core.storage.data.ResourceItemMetadata;
+import com.epam.aidial.core.storage.data.ShareMetadata;
 import com.epam.aidial.core.storage.resource.ResourceDescriptor;
 import com.epam.aidial.core.storage.resource.ResourceType;
 import com.epam.aidial.core.storage.service.LockService;
@@ -34,11 +32,11 @@ import com.epam.aidial.core.storage.util.EtagHeader;
 import com.google.common.collect.Sets;
 import lombok.AllArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.mutable.MutableObject;
 import org.apache.commons.lang3.tuple.Pair;
 
 import java.util.ArrayList;
-import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -47,6 +45,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.function.LongSupplier;
 import java.util.stream.Collectors;
 
 
@@ -61,7 +60,8 @@ public class ShareService {
     private final EncryptionService encryptionService;
     private final ApplicationService applicationService;
     private final LockService lockService;
-    private final ConfigStore configStore;
+    private final ApplicationSchemaService applicationSchemaService;
+    private final LongSupplier clock;
 
     private static final Map<ResourceType, ShareResourceLimit> DEFAULT_LIMITS = Map.of(
             ResourceTypes.APPLICATION, new ShareResourceLimit(10, TimeUnit.HOURS.toSeconds(72)),
@@ -97,6 +97,12 @@ public class ShareService {
                             ? new ResourceFolderMetadata(sharedResourceDescriptor)
                             : new ResourceItemMetadata(sharedResourceDescriptor);
                     metadata.setPermissions(sharedResource.getPermissions());
+                    if (request.isIncludeUserInfo()) {
+                        if (metadata instanceof ResourceItemMetadata itemMetadata) {
+                            itemMetadata.setAuthor(sharedResource.getAuthor());
+                        }
+                        metadata.setSharedBy(sharedResource.getSharedBy());
+                    }
                     resultMetadata.add(metadata);
                 }
             }
@@ -127,8 +133,7 @@ public class ShareService {
             String sharedResource = resourceService.getResource(resource);
             SharedByMeDto resourceToUsers = ProxyUtil.convertToObject(sharedResource, SharedByMeDto.class);
             if (resourceToUsers != null) {
-                Map<String, Set<ResourceAccessType>> links = resourceToUsers.getAggregatedPermissions();
-                resultMetadata.addAll(linksToMetadata(links));
+                resultMetadata.addAll(toMetadata(resourceToUsers, request.isIncludeUserInfo()));
             }
         }
 
@@ -139,19 +144,18 @@ public class ShareService {
     private void addCustomApplicationRelatedFiles(String bucket, ShareResourcesRequest request) {
         List<String> filesFromRequest = request.getResources().stream()
                 .map(SharedResource::getUrl).toList();
-        Config config = configStore.get();
         Set<SharedResource> newSharedResources = new HashSet<>(request.getResources());
         for (SharedResource sharedResource : request.getResources()) {
             ResourceDescriptor resource = getResourceFromLink(sharedResource.getUrl());
             if (resource.getType() == ResourceTypes.APPLICATION) {
                 Application application = applicationService.getApplication(resource).getValue();
-                List<ResourceDescriptor> files = ApplicationTypeSchemaUtils.getFiles(config, application, encryptionService, resourceService);
+                List<ResourceDescriptor> files = applicationSchemaService.getFiles(application);
                 for (ResourceDescriptor file : files) {
                     if (file.isPublic() || !file.getBucketName().equals(bucket)) {
                         throw new IllegalArgumentException("All files in the application %s should belong to a requester".formatted(resource.getUrl()));
                     }
                     if (!filesFromRequest.contains(file.getUrl())) {
-                        newSharedResources.add(new SharedResource(file.getUrl(), sharedResource.getPermissions()));
+                        newSharedResources.add(new SharedResource(file.getUrl(), null, null, sharedResource.getPermissions()));
                     }
                 }
             }
@@ -189,23 +193,26 @@ public class ShareService {
             if (existingSharedResources == null) {
                 existingSharedResources = new SharedResources(new ArrayList<>());
             }
-            Set<String> resharedResourceUrls = new HashSet<>();
+            Map<String, SharedResource> reshareableResourceUrls = new HashMap<>();
             for (SharedResource sharedResource : existingSharedResources.getResources()) {
                 if (sharedResource.getPermissions().contains(ResourceAccessType.SHARE)) {
-                    resharedResourceUrls.add(sharedResource.getUrl());
+                    reshareableResourceUrls.put(sharedResource.getUrl(), sharedResource);
                 }
             }
             List<SharedResource> ownerResources = new ArrayList<>();
             for (SharedResource sharedResource : links) {
                 ResourceDescriptor resource = getResourceFromLink(sharedResource.getUrl());
-                canShare(sharedResource, bucket, resource, resharedResourceUrls);
+                canShare(sharedResource, bucket, resource, reshareableResourceUrls.keySet());
                 if (!uniqueLinks.add(resource.getUrl())) {
                     throw new IllegalArgumentException("Duplicated resource: %s".formatted(resource.getUrl()));
                 }
                 if (resource.getBucketName().equals(bucket)) {
                     ownerResources.add(sharedResource);
                 }
-                normalizedResourceLinks.add(sharedResource.withUrl(resource.getUrl()));
+                String author = reshareableResourceUrls.containsKey(resource.getUrl())
+                        ? reshareableResourceUrls.get(resource.getUrl()).getAuthor()
+                        : context.getUserDisplayName();
+                normalizedResourceLinks.add(sharedResource.withUrl(resource.getUrl()).withAuthor(author));
                 updateLimits(context, resourceType, limit, ownerResources);
             }
         }
@@ -260,7 +267,7 @@ public class ShareService {
         resourceService.computeResource(sharedByMe, state -> {
             SharedByMeDto dto = ProxyUtil.convertToObject(state, SharedByMeDto.class);
             if (dto == null) {
-                dto = new SharedByMeDto(new HashMap<>(), new HashMap<>(), new HashMap<>(), new HashMap<>());
+                dto = new SharedByMeDto(new HashMap<>(), new HashMap<>(), new HashMap<>(), new HashMap<>(), new HashMap<>());
             }
             for (SharedResource resource : resources) {
                 dto.updateLimit(resource.getUrl(), limit);
@@ -302,10 +309,12 @@ public class ShareService {
     public void acceptSharedResources(ProxyContext context, String invitationId) {
         String location = BucketBuilder.buildInitiatorBucket(context);
         String bucket = encryptionService.encrypt(location);
-        invitationService.acceptInvitation(invitationId, location, invitation -> acceptInvitation(bucket, location, invitation));
+        String userDisplayName = context.getUserDisplayName();
+        invitationService.acceptInvitation(
+                invitationId, location, invitation -> acceptInvitation(bucket, location, invitation, userDisplayName));
     }
 
-    private void acceptInvitation(String bucket, String location, Invitation invitation) {
+    private void acceptInvitation(String bucket, String location, Invitation invitation, String userDisplayName) {
         List<SharedResource> resourceLinks = invitation.getResources();
         String resourceOwnerLocation = null;
         for (SharedResource link : resourceLinks) {
@@ -333,7 +342,7 @@ public class ShareService {
                 String state = resourceService.getResource(sharedByMe);
                 SharedByMeDto dto = ProxyUtil.convertToObject(state, SharedByMeDto.class);
                 if (dto == null) {
-                    dto = new SharedByMeDto(new HashMap<>(), new HashMap<>(), new HashMap<>(), new HashMap<>());
+                    dto = new SharedByMeDto(new HashMap<>(), new HashMap<>(), new HashMap<>(), new HashMap<>(), new HashMap<>());
                 }
 
                 // add user location for each link
@@ -346,7 +355,7 @@ public class ShareService {
                     if (numOfAcceptedUsers >= limit.getMaxAcceptedUsers()) {
                         throw new IllegalArgumentException("Limit is exceeded on the number of accepted users for the resource: " + resource.getUrl());
                     }
-                    dto.addUserToResource(resource, location);
+                    dto.addUserToResource(resource, location, userDisplayName);
                 }
                 resourcesToBeUpdated.add(Pair.of(sharedByMe, dto));
             });
@@ -356,6 +365,7 @@ public class ShareService {
             return null;
         });
         lockService.underBucketLock(location, () -> {
+            long time = clock.getAsLong();
             resourceGroups.forEach((resourceType, links) -> {
                 ResourceDescriptor sharedWithMe = getShareResource(ResourceTypes.SHARED_WITH_ME, resourceType, bucket, location);
                 String state = resourceService.getResource(sharedWithMe);
@@ -365,7 +375,7 @@ public class ShareService {
                 }
 
                 // add all links to the user
-                sharedResources.addSharedResources(links);
+                sharedResources.addSharedResources(links, invitation.getAuthor(), time);
 
                 resourceService.putResource(sharedWithMe, ProxyUtil.convertToString(sharedResources), EtagHeader.ANY);
             });
@@ -539,11 +549,12 @@ public class ShareService {
         resourceService.computeResource(sharedByMeResource, state -> {
             SharedByMeDto dto = ProxyUtil.convertToObject(state, SharedByMeDto.class);
             if (dto == null) {
-                dto = new SharedByMeDto(new HashMap<>(), new HashMap<>(), new HashMap<>(), new HashMap<>());
+                dto = new SharedByMeDto(new HashMap<>(), new HashMap<>(), new HashMap<>(), new HashMap<>(), new HashMap<>());
             }
 
             // add shared access to the destination resource
-            dto.addUserPermissionsToResource(destinationResourceLink, userPermissions);
+            dto.addUserPermissionsToResource(
+                    destinationResourceLink, userPermissions, sharedByMeDto.getUserIdToDisplayName());
 
             return ProxyUtil.convertToString(dto);
         });
@@ -551,7 +562,8 @@ public class ShareService {
         // add each user shared access to the destination resource
         userPermissions.forEach((userLocation, permissions) -> {
             String userBucket = encryptionService.encrypt(userLocation);
-            addSharedResource(userBucket, userLocation, destinationResourceLink, destinationResourceType, permissions);
+            copySharedResource(
+                    userBucket, userLocation, source.getUrl(), source.getType(), destinationResourceLink, destinationResourceType);
         });
     }
 
@@ -574,6 +586,12 @@ public class ShareService {
                     SharedResource sharedResource = iterator.next();
                     if (sharedResource.getUrl().equals(link)) {
                         wasReshared.setValue(sharedResource.getPermissions().contains(ResourceAccessType.SHARE));
+                        if (sharedResource.getSharedBy() != null) {
+                            sharedResource.getSharedBy().forEach(
+                                    shareMetadata -> shareMetadata.getPermissions().removeAll(permissionsToRemove));
+                            sharedResource.getSharedBy().removeIf(
+                                    shareMetadata -> shareMetadata.getPermissions().isEmpty());
+                        }
                         sharedResource.getPermissions().removeAll(permissionsToRemove);
                         if (sharedResource.getPermissions().isEmpty()) {
                             iterator.remove();
@@ -590,30 +608,46 @@ public class ShareService {
         }
     }
 
-    private void addSharedResource(
+    private void copySharedResource(
             String bucket,
             String location,
-            String distLink,
-            ResourceType resourceType,
-            Set<ResourceAccessType> permissionsToAdd) {
-        ResourceDescriptor sharedByMeResource = getShareResource(ResourceTypes.SHARED_WITH_ME, resourceType, bucket, location);
-        resourceService.computeResource(sharedByMeResource, state -> {
+            String source,
+            ResourceType sourceType,
+            String destination,
+            ResourceType destinationType) {
+        SharedResources toCopy = sourceType != destinationType
+                ? getSharedResources(bucket, location, source, sourceType)
+                : null;
+        ResourceDescriptor destinationResource = getShareResource(ResourceTypes.SHARED_WITH_ME, destinationType, bucket, location);
+        resourceService.computeResource(destinationResource, state -> {
             SharedResources sharedWithMe = ProxyUtil.convertToObject(state, SharedResources.class);
             if (sharedWithMe == null) {
                 sharedWithMe = new SharedResources(new ArrayList<>());
             }
-            Set<ResourceAccessType> permissions = EnumSet.noneOf(ResourceAccessType.class);
-            permissions.addAll(sharedWithMe.findPermissions(distLink));
-            permissions.addAll(permissionsToAdd);
-            sharedWithMe.getResources().removeIf(resource -> distLink.equals(resource.getUrl()));
 
-            sharedWithMe.getResources().add(new SharedResource(distLink, permissions));
+            List<SharedResource> resources = (toCopy == null ? sharedWithMe : toCopy).getResources().stream()
+                    .filter(resource -> source.equals(resource.getUrl()))
+                    .map(resource -> resource.withUrl(destination))
+                    .toList();
+            sharedWithMe.getResources().addAll(resources);
 
             return ProxyUtil.convertToString(sharedWithMe);
         });
     }
 
-    private List<MetadataBase> linksToMetadata(Map<String, Set<ResourceAccessType>> links) {
+    private SharedResources getSharedResources(String bucket, String location, String link, ResourceType type) {
+        ResourceDescriptor descriptor = getShareResource(ResourceTypes.SHARED_WITH_ME, type, bucket, location);
+        SharedResources sharedResources = ProxyUtil.convertToObject(
+                resourceService.getResource(descriptor), SharedResources.class);
+        if (sharedResources == null) {
+            throw new IllegalArgumentException("No shared access found for the resource: " + link);
+        }
+
+        return sharedResources;
+    }
+
+    private List<MetadataBase> toMetadata(SharedByMeDto dto, boolean includeUserInfo) {
+        Map<String, Set<ResourceAccessType>> links = dto.getAggregatedPermissions();
         return links.entrySet().stream()
                 .map(entry -> {
                     String link = entry.getKey();
@@ -623,6 +657,20 @@ public class ShareService {
                             ? new ResourceFolderMetadata(resource)
                             : new ResourceItemMetadata(resource);
                     metadata.setPermissions(permissions);
+                    if (includeUserInfo) {
+                        List<ShareMetadata> perUserPermissions = new ArrayList<>();
+                        dto.getUserPermissions(link).forEach((user, access) -> {
+                            String userDisplayName = dto.getUserIdToDisplayName().get(user);
+                            if (StringUtils.isNotBlank(userDisplayName)) {
+                                ShareMetadata shareMetadata = new ShareMetadata();
+                                shareMetadata.setUser(userDisplayName);
+                                shareMetadata.setPermissions(access);
+                                perUserPermissions.add(shareMetadata);
+                            }
+                        });
+
+                        metadata.setSharedWith(perUserPermissions);
+                    }
                     return metadata;
                 }).toList();
     }

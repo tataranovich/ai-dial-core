@@ -24,16 +24,16 @@ public abstract class AccessControlBaseController {
 
         try {
             resource = ResourceDescriptorFactory.fromAnyUrl(resourceUrl, proxy.getEncryptionService());
-        } catch (IllegalArgumentException e) {
+        } catch (Exception e) {
             String errorMessage = e.getMessage() != null ? e.getMessage() : ("Invalid resource url provided: " + resourceUrl);
             return context.respond(HttpStatus.BAD_REQUEST, errorMessage);
         }
 
-        return proxy.getVertx()
-                .executeBlocking(() -> {
+        return proxy.getTaskExecutor()
+                .submit(() -> {
                     AccessService service = proxy.getAccessService();
                     return service.lookupPermissions(Set.of(resource), context).get(resource);
-                }, false)
+                })
                 .compose(permissions -> {
                     boolean hasAccess = permissions.contains(isWriteAccess
                             ? ResourceAccessType.WRITE : ResourceAccessType.READ);
@@ -51,13 +51,4 @@ public abstract class AccessControlBaseController {
      */
     protected abstract Future<?> handle(ResourceDescriptor resource, boolean hasWriteAccess);
 
-    protected boolean shouldHide(ResourceDescriptor resource) {
-        if (resource.isHidden() && resource.isPublic()) {
-            if (context.getApiKeyData().getPerRequestKey() != null) {
-                return false;
-            }
-            return !proxy.getAccessService().hasAdminAccess(context);
-        }
-        return false;
-    }
 }
