@@ -61,16 +61,34 @@
     "compressionMinSize": 256,
     "heartbeatPeriod": 60000
   },
+  "complexResource": {
+    "maxFiles": 100,
+    "maxTotalBytes": 16777216,
+    "maxFileSizeBytes": 1048576
+  },
+  "complexResourceSweep": {
+    "period": 10000,
+    "batch": 1000,
+    "activeBatches": 1,
+    "gracePeriod": 3600000
+  },
+  "mcpHttpClient": {
+    "connectTimeout": 10000
+  },
   "applications": {
     "includeCustomApps": true
   },
   "access": {
     "admin": {
       "rules": [{"source": "roles", "function": "EQUAL", "targets": ["admin"]}]
+    },
+    "securityAdmin": {
+      "rules": [{"source": "roles", "function": "EQUAL", "targets": ["security-admin"]}]
     }
   },
   "toolsets": {
     "security": {
+      "allowedRedirectUris": ["http://admin/callback", "http://chat/callback"],
       "authorizationServers": "https://example.com",
       "resourceHost": "localhost",
       "kms": {

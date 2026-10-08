@@ -1,11 +1,14 @@
 package com.epam.aidial.core.server.controller;
 
 import com.epam.aidial.core.config.ResourceAccessType;
+import com.epam.aidial.core.openapi.annotations.ApiOperation;
+import com.epam.aidial.core.openapi.annotations.ApiResponse;
+import com.epam.aidial.core.openapi.annotations.ApiSchema;
+import com.epam.aidial.core.openapi.annotations.OpenApiDescriptions;
 import com.epam.aidial.core.server.Proxy;
 import com.epam.aidial.core.server.ProxyContext;
 import com.epam.aidial.core.server.data.CopyResourcesRequest;
 import com.epam.aidial.core.server.data.MoveResourcesRequest;
-import com.epam.aidial.core.server.data.ResourceTypes;
 import com.epam.aidial.core.server.data.SubscribeResourcesRequest;
 import com.epam.aidial.core.server.security.AccessService;
 import com.epam.aidial.core.server.security.EncryptionService;
@@ -20,10 +23,10 @@ import com.epam.aidial.core.storage.http.HttpException;
 import com.epam.aidial.core.storage.http.HttpStatus;
 import com.epam.aidial.core.storage.resource.ResourceDescriptor;
 import com.epam.aidial.core.storage.resource.ResourceType;
+import com.epam.aidial.core.storage.resource.ResourceTypes;
 import com.epam.aidial.core.storage.service.LockService;
 import com.epam.aidial.core.storage.service.ResourceTopic;
 import io.vertx.core.Future;
-import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.HttpHeaders;
 import io.vertx.core.http.HttpServerResponse;
@@ -59,6 +62,19 @@ public class ResourceOperationController {
         this.heartbeatService = proxy.getHeartbeatService();
     }
 
+    @ApiOperation(
+            method = "POST",
+            path = "/v1/ops/resource/move",
+            operationId = "moveResource",
+            requestBody = @ApiSchema(implementation = MoveResourcesRequest.class),
+            tags = {"Files", "Conversations", "Prompts", "Applications", "Toolsets"},
+            responses = {
+                    @ApiResponse(code = 200, description = "Success"),
+                    @ApiResponse(code = 400),
+                    @ApiResponse(code = 403),
+                    @ApiResponse(code = 500)
+            }
+    )
     public Future<?> move() {
         context.getRequest()
                 .body()
@@ -97,16 +113,16 @@ public class ResourceOperationController {
                             accessService.lookupPermissions(resources, context);
 
                     if (!permissions.get(source).containsAll(ResourceAccessType.ALL)) {
-                        throw new PermissionDeniedException("no read and write access to source resource");
+                        throw new PermissionDeniedException("No read and write access to source resource");
                     }
 
                     if (!permissions.get(destination).contains(ResourceAccessType.WRITE)) {
-                        throw new PermissionDeniedException("no write access to destination resource");
+                        throw new PermissionDeniedException("No write access to destination resource");
                     }
 
                     List<String> buckets = List.of(source.getBucketLocation(), destination.getBucketLocation());
                     return taskExecutor.submit(() -> lockService.underBucketLocks(buckets, () -> {
-                        resourceOperationService.moveResource(source, destination, request.isOverwrite());
+                        resourceOperationService.moveResource(context, source, destination, request.isOverwrite());
                         return null;
                     }));
                 })
@@ -116,6 +132,19 @@ public class ResourceOperationController {
         return Future.succeededFuture();
     }
 
+    @ApiOperation(
+            method = "POST",
+            path = "/v1/ops/resource/copy",
+            operationId = "copyResource",
+            requestBody = @ApiSchema(implementation = CopyResourcesRequest.class),
+            tags = {"Files", "Conversations", "Prompts", "Applications", "Toolsets"},
+            responses = {
+                    @ApiResponse(code = 200, description = "Success"),
+                    @ApiResponse(code = 400),
+                    @ApiResponse(code = 403),
+                    @ApiResponse(code = 500)
+            }
+    )
     public Future<?> copy() {
         context.getRequest()
                 .body()
@@ -153,15 +182,21 @@ public class ResourceOperationController {
                             accessService.lookupPermissions(resources, context);
 
                     if (!permissions.get(source).contains(ResourceAccessType.READ)) {
-                        throw new PermissionDeniedException("no read access to source resource");
+                        throw new PermissionDeniedException("No read access to source resource");
                     }
 
                     if (!permissions.get(destination).contains(ResourceAccessType.WRITE)) {
-                        throw new PermissionDeniedException("no write access to destination resource");
+                        throw new PermissionDeniedException("No write access to destination resource");
+                    }
+
+                    if (source.getType() == ResourceTypes.APPLICATION || source.getType() == ResourceTypes.TOOL_SET) {
+                        if (!permissions.get(source).contains(ResourceAccessType.WRITE)) {
+                            throw new PermissionDeniedException("No write access to source resource");
+                        }
                     }
 
                     return taskExecutor.submit(() -> {
-                        resourceOperationService.copyResource(source, destination, request.isOverwrite());
+                        resourceOperationService.copyResource(context, source, destination, request.isOverwrite());
                         return null;
                     });
                 })
@@ -171,10 +206,25 @@ public class ResourceOperationController {
         return Future.succeededFuture();
     }
 
+    @ApiOperation(
+            method = "POST",
+            path = "/v1/ops/resource/subscribe",
+            operationId = "subscribeToResources",
+            requestBody = @ApiSchema(implementation = SubscribeResourcesRequest.class),
+            contentType = "text/event-stream",
+            tags = {"Notifications"},
+            responses = {
+                    @ApiResponse(code = 200, description = OpenApiDescriptions.RESPONSE_SUCCESS,
+                            body = @ApiSchema(implementation = ResourceEvent.class), contentTypes = {"text/event-stream"}),
+                    @ApiResponse(code = 400, description = OpenApiDescriptions.RESPONSE_BAD_REQUEST),
+                    @ApiResponse(code = 401, description = OpenApiDescriptions.RESPONSE_UNAUTHORIZED),
+                    @ApiResponse(code = 500, description = OpenApiDescriptions.RESPONSE_SERVER_ERROR)
+            }
+    )
     public Future<?> subscribe() {
         HttpServerResponse response = context.getResponse();
         Consumer<ResourceEvent> subscriber = this::sendSubscriptionEvent;
-        Runnable heartbeat = this::sendHeartbeat;
+        Runnable heartbeat = () -> sendHeartbeat(response);
 
         context.getRequest()
                 .body()
@@ -229,7 +279,7 @@ public class ResourceOperationController {
 
         accessService.lookupPermissions(resources, context).forEach((resource, permissions) -> {
             if (!permissions.contains(ResourceAccessType.READ)) {
-                throw new PermissionDeniedException("resource is not allowed: " + resource.getUrl());
+                throw new PermissionDeniedException("Resource is not allowed: " + resource.getUrl());
             }
         });
 
@@ -252,9 +302,7 @@ public class ResourceOperationController {
         }
     }
 
-    private void sendHeartbeat() {
-        HttpServerResponse response = context.getResponse();
-
+    private static void sendHeartbeat(HttpServerResponse response) {
         try {
             response.write(": heartbeat\n\n");
         } catch (Throwable e) {

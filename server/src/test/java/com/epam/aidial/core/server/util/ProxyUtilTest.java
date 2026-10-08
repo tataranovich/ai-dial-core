@@ -1,249 +1,100 @@
 package com.epam.aidial.core.server.util;
 
-import com.epam.aidial.core.config.ResourceAccessType;
-import com.epam.aidial.core.server.data.ApiKeyData;
-import com.epam.aidial.core.server.data.AutoSharedData;
+import com.epam.aidial.core.config.Model;
+import com.epam.aidial.core.server.Proxy;
 import com.epam.aidial.core.server.data.Conversation;
 import com.epam.aidial.core.server.data.Prompt;
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.vertx.core.MultiMap;
+import io.vertx.core.http.HttpConnection;
+import io.vertx.core.http.HttpServerRequest;
+import io.vertx.core.http.impl.headers.HeadersMultiMap;
+import io.vertx.core.net.SocketAddress;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
 
-import java.io.IOException;
-import java.util.HashSet;
-import java.util.Map;
+import java.util.List;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 public class ProxyUtilTest {
 
-    @Test
-    public void testCollectAttachedFiles_ChatRequest() throws IOException {
-        String content = """
-                {
-                  "modelId": "model",
-                  "messages": [
-                    {
-                      "content": "test",
-                      "role": "user",
-                      "custom_content": {
-                      }
-                    },
-                    {
-                      "content": "I'm sorry, but your message is unclear. Could you please provide more details or context?",
-                      "role": "assistant"
-                    },
-                    {
-                      "content": "what file is?",
-                      "role": "user",
-                      "custom_content": {
-                        "attachments": [
-                          {
-                            "type": "application/octet-stream",
-                            "title": "Dockerfile",
-                            "url": "files/7G9WZNcoY26Vy9D7bEgbv6zqbJGfyDp9KZyEbJR4XMZt/b1/Dockerfile"
-                          }
-                        ]
-                      }
-                    },
-                    {
-                      "content": null
-                    },
-                    {
-                      "content": "The file you provided is a Dockerfile.",
-                      "role": "assistant",
-                      "custom_content": {
-                        "attachments": [
-                          {
-                            "index": 0,
-                            "type": "text/markdown",
-                            "title": "[1] 'Dockerfile'",
-                            "data": "FROM gradle:8.2.0",
-                            "reference_url": "b1/Dockerfile"
-                          },
-                          {
-                            "index": 1,
-                            "type": "text/markdown",
-                            "title": "[2] 'Dockerfile'",
-                            "data": "* /app/config/ RUN mkdir /app/log && chown -R appuser:appuser /app",
-                            "reference_url": "b1/Dockerfile"
-                          },
-                          {
-                            "index": 2,
-                            "type": "text/markdown",
-                            "title": "[3] 'Dockerfile'",
-                            "data": "USER appuser",
-                            "reference_url": "b1/Dockerfile"
-                          }
-                        ]
-                      }
-                    },
-                    {
-                      "content": [
-                        {"type": "text", "text": "Compare these files?"},
-                        {"type": "image_url"},
-                        {"type": "image_url", "image_url": null},
-                        {"type": "image_url", "image_url": {}},
-                        {"type": "image_url", "image_url": {"url": null}},
-                        {"type": "image_url", "image_url": {"url": "files/7G9WZNcoY26Vy9D7bEgbv6zqbJGfyDp9KZyEbJR4XMZt/b1/README.md"}}
-                      ],
-                      "role": "user",
-                      "custom_content": {
-                        "attachments": [
-                          {
-                            "type": "application/octet-stream",
-                            "title": "LICENSE",
-                            "url": "files/7G9WZNcoY26Vy9D7bEgbv6zqbJGfyDp9KZyEbJR4XMZt/b1/LICENSE"
-                          },
-                          {
-                            "type": "binary/octet-stream",
-                            "title": "Dockerfile",
-                            "url": "files/7G9WZNcoY26Vy9D7bEgbv6zqbJGfyDp9KZyEbJR4XMZt/b1/Dockerfile"
-                          },
-                          {
-                            "type": "application/vnd.dial.metadata+json",
-                            "title": ".dockerignore",
-                            "url": "metadata/files/7G9WZNcoY26Vy9D7bEgbv6zqbJGfyDp9KZyEbJR4XMZt/b1/.dockerignore"
-                          }
-                        ],
-                        "stages": [
-                            {
-                                "index": 0,
-                                "name": "stage1",
-                                "status": "completed",
-                                "attachments": [
-                                    {
-                                        "type": "application/octet-stream",
-                                        "title": "LICENSE",
-                                        "url": "files/7G9WZNcoY26Vy9D7bEgbv6zqbJGfyDp9KZyEbJR4XMZt/b1/stage0_file0"
-                                    },
-                                    {
-                                        "type": "application/octet-stream",
-                                        "title": "LICENSE",
-                                        "url": "files/7G9WZNcoY26Vy9D7bEgbv6zqbJGfyDp9KZyEbJR4XMZt/b1/stage0_file1"
-                                    }
-                                ]
-                            }
-                        ]
-                      }
-                    }
-                  ],
-                  "id": "id"
-                }
-                """;
-        ObjectNode tree = (ObjectNode) ProxyUtil.MAPPER.readTree(content.getBytes());
-        ApiKeyData apiKeyData = new ApiKeyData();
-        ProxyUtil.collectAttachedFilesFromRequest(tree, link -> apiKeyData.getAttachedFiles().put(link, new AutoSharedData(ResourceAccessType.READ_ONLY)));
-
-        assertEquals(
-                Map.of(
-                        "files/7G9WZNcoY26Vy9D7bEgbv6zqbJGfyDp9KZyEbJR4XMZt/b1/Dockerfile", new AutoSharedData(ResourceAccessType.READ_ONLY),
-                        "files/7G9WZNcoY26Vy9D7bEgbv6zqbJGfyDp9KZyEbJR4XMZt/b1/LICENSE", new AutoSharedData(ResourceAccessType.READ_ONLY),
-                        "files/7G9WZNcoY26Vy9D7bEgbv6zqbJGfyDp9KZyEbJR4XMZt/b1/README.md", new AutoSharedData(ResourceAccessType.READ_ONLY),
-                        "files/7G9WZNcoY26Vy9D7bEgbv6zqbJGfyDp9KZyEbJR4XMZt/b1/.dockerignore", new AutoSharedData(ResourceAccessType.READ_ONLY),
-                        "files/7G9WZNcoY26Vy9D7bEgbv6zqbJGfyDp9KZyEbJR4XMZt/b1/stage0_file0", new AutoSharedData(ResourceAccessType.READ_ONLY),
-                        "files/7G9WZNcoY26Vy9D7bEgbv6zqbJGfyDp9KZyEbJR4XMZt/b1/stage0_file1", new AutoSharedData(ResourceAccessType.READ_ONLY)
-                ),
-                apiKeyData.getAttachedFiles()
-        );
+    @AfterEach
+    public void resetHopByHopHeaders() {
+        ProxyUtil.init(new ProxySettings(List.of()));
     }
 
     @Test
-    public void testCollectAttachedFiles_Fail() throws IOException {
-        String content = """
-                {
-                  "modelId": "model",
-                  "messages": [
-                    {
-                      "content": "test",
-                      "role": "user",
-                      "custom_content": {
-                        "attachments": [
-                          {
-                            "type": "application/vnd.dial.metadata+json",
-                            "title": ".dockerignore",
-                            "url": "metadatata/files/7G9WZNcoY26Vy9D7bEgbv6zqbJGfyDp9KZyEbJR4XMZt/b1/.dockerignore"
-                          }
-                        ]
-                      }
-                    }
-                  ],
-                  "id": "id"
-                }
-                """;
+    public void testCopyHeaders_DefaultHopByHopHeaders_AreStripped() {
+        MultiMap from = new HeadersMultiMap()
+                .add("Connection", "keep-alive")
+                .add("X-Custom-Header", "value");
+        MultiMap to = new HeadersMultiMap();
 
-        ObjectNode tree = (ObjectNode) ProxyUtil.MAPPER.readTree(content.getBytes());
-        ApiKeyData apiKeyData = new ApiKeyData();
+        ProxyUtil.copyHeaders(from, to);
 
-        IllegalArgumentException error = assertThrows(IllegalArgumentException.class,
-                () -> ProxyUtil.collectAttachedFilesFromRequest(tree, link -> apiKeyData.getAttachedFiles().put(link, new AutoSharedData(ResourceAccessType.READ_ONLY))));
-
-        assertEquals("Url of metadata attachment must start with metadata/: metadatata/files/7G9WZNcoY26Vy9D7bEgbv6zqbJGfyDp9KZyEbJR4XMZt/b1/.dockerignore", error.getMessage());
+        assertNull(to.get("Connection"));
+        assertEquals("value", to.get("X-Custom-Header"));
     }
 
     @Test
-    public void testCollectAttachedFiles_EmbeddingRequest_valid() throws IOException {
-        String content = """
-                {
-                  "input": "some input",
-                  "custom_input": [
-                    "test text 1",
-                    {
-                      "type": "image/png",
-                      "data": "data:image/png;base64,iVBORw0KGg"
-                    },
-                    {
-                      "type": "image/png",
-                      "url": "files/7G9WZNcoY26Vy9D7bEgbv6zqbJGfyDp9KZyEbJR4XMZt/b1/image.png"
-                    },
-                    [
-                      "test text 2",
-                      {
-                        "type": "image/png",
-                        "data": "data:image/png;base64,iVBORw0KGg"
-                      },
-                      {
-                        "type": "video/mp4",
-                        "url": "files/7G9WZNcoY26Vy9D7bEgbv6zqbJGfyDp9KZyEbJR4XMZt/b2/video.mp4"
-                      }
-                    ]
-                  ],
-                  "user": "user_id"
-                }
-                """;
-        ObjectNode tree = (ObjectNode) ProxyUtil.MAPPER.readTree(content.getBytes());
-        ApiKeyData apiKeyData = new ApiKeyData();
-        ProxyUtil.collectAttachedFilesFromRequest(tree, link -> apiKeyData.getAttachedFiles().put(link, new AutoSharedData(ResourceAccessType.READ_ONLY)));
+    public void testCopyHeaders_AdditionalHopByHopHeaders_AreStrippedAfterInit() {
+        ProxyUtil.init(new ProxySettings(List.of("x-custom-header")));
 
-        assertEquals(
-                Map.of(
-                        "files/7G9WZNcoY26Vy9D7bEgbv6zqbJGfyDp9KZyEbJR4XMZt/b1/image.png", new AutoSharedData(ResourceAccessType.READ_ONLY),
-                        "files/7G9WZNcoY26Vy9D7bEgbv6zqbJGfyDp9KZyEbJR4XMZt/b2/video.mp4", new AutoSharedData(ResourceAccessType.READ_ONLY)
-                ),
-                apiKeyData.getAttachedFiles()
-        );
+        MultiMap from = new HeadersMultiMap()
+                .add("Connection", "keep-alive")
+                .add("X-Custom-Header", "value")
+                .add("X-Other-Header", "other");
+        MultiMap to = new HeadersMultiMap();
+
+        ProxyUtil.copyHeaders(from, to);
+
+        assertNull(to.get("Connection"));
+        assertNull(to.get("X-Custom-Header"));
+        assertEquals("other", to.get("X-Other-Header"));
     }
 
     @Test
-    public void testCollectAttachedFiles_EmbeddingRequest_invalid() throws IOException {
-        String content = """
-                {
-                  "input": "some input",
-                  "custom_input": "invalid_custom_input",
-                  "user": "user_id"
-                }
-                """;
-        ObjectNode tree = (ObjectNode) ProxyUtil.MAPPER.readTree(content.getBytes());
-        ApiKeyData apiKeyData = new ApiKeyData();
-        ProxyUtil.collectAttachedFilesFromRequest(tree, link -> apiKeyData.getAttachedFiles().put(link, new AutoSharedData(ResourceAccessType.READ_ONLY)));
+    public void testInit_RebuildsHeaderSet_NotAppendsToPreviousOne() {
+        ProxyUtil.init(new ProxySettings(List.of("x-custom-header")));
+        ProxyUtil.init(new ProxySettings(List.of()));
 
-        assertTrue(apiKeyData.getAttachedFiles().isEmpty());
+        MultiMap from = new HeadersMultiMap()
+                .add("Connection", "keep-alive")
+                .add("X-Custom-Header", "value");
+        MultiMap to = new HeadersMultiMap();
+
+        ProxyUtil.copyHeaders(from, to);
+
+        assertNull(to.get("Connection"));
+        assertEquals("value", to.get("X-Custom-Header"));
     }
 
+    @Test
+    public void testProxySettings_From_SkipsBlankEntries() {
+        io.vertx.core.json.JsonObject json = new io.vertx.core.json.JsonObject()
+                .put("additionalHopByHopHeaders", new io.vertx.core.json.JsonArray()
+                        .add("x-custom-header")
+                        .add("  "));
+
+        ProxySettings settings = ProxySettings.from(json);
+
+        assertEquals(List.of("x-custom-header"), settings.additionalHopByHopHeaders());
+    }
+
+    @Test
+    public void testProxySettings_From_MissingKey_DefaultsToEmptyList() {
+        ProxySettings settings = ProxySettings.from(new io.vertx.core.json.JsonObject());
+
+        assertEquals(List.of(), settings.additionalHopByHopHeaders());
+    }
 
     @Test
     public void testPromptSchemaValidation() {
@@ -296,7 +147,6 @@ public class ProxyUtilTest {
                     {
                     "prompt": "sysPrompt",
                     "temperature": 5,
-                    "selectedAddons": ["A", "B", "C"],
                     "assistantModelId": "assistantId"
                     }
                   }
@@ -306,7 +156,6 @@ public class ProxyUtilTest {
                   "replayUserMessagesStack": [],
                   "activeReplayIndex": 0
                   },
-                "selectedAddons": ["R", "T", "G"],
                 "assistantModelId": "assistantId",
                 "lastActivityDate": 4848683153
                 }
@@ -332,7 +181,6 @@ public class ProxyUtilTest {
                     {
                     "prompt": "sysPrompt",
                     "temperature": 5,
-                    "selectedAddons": ["A", "B", "C"],
                     "assistantModelId": "assistantId"
                     }
                   }
@@ -342,7 +190,6 @@ public class ProxyUtilTest {
                   "replayUserMessagesStack": [],
                   "activeReplayIndex": 0
                   },
-                "selectedAddons": ["R", "T", "G"],
                 "assistantModelId": "assistantId",
                 "lastActivityDate": 4848683153
                 }
@@ -353,112 +200,6 @@ public class ProxyUtilTest {
 
         error = assertThrows(IllegalArgumentException.class, () -> ProxyUtil.convertToObject("12345", Conversation.class));
         assertEquals("Provided payload do not match required schema", error.getMessage());
-    }
-
-    @Test
-    public void testCollectAttachmentsFromResponse_ChatSingleResponse() throws JsonProcessingException {
-        String response = """
-                {
-                  "id": "chatcmpl-7VfMTgj3ljKdGKS2BEIwloII3IoO0",
-                  "object": "chat.completion",
-                  "created": 1687781517,
-                  "model": "gpt-35-turbo",
-                  "choices": [
-                    {
-                      "index": 0,
-                      "finish_reason": "stop",
-                      "message": {
-                        "role": "assistant",
-                        "content": "some text",
-                        "custom_content": {
-                           "attachments": [
-                              {
-                               "type": "application/octet-stream",
-                               "title": "LICENSE",
-                               "url": "files/7G9WZNcoY26Vy9D7bEgbv6zqbJGfyDp9KZyEbJR4XMZt/b1/file1.txt"
-                              },
-                              {
-                                "type": "application/octet-stream",
-                                "title": "LICENSE",
-                                "url": "files/7G9WZNcoY26Vy9D7bEgbv6zqbJGfyDp9KZyEbJR4XMZt/b1/file2.txt"
-                              }
-                           ]
-                        }
-                      }
-                    }
-                  ],
-                  "usage" : {
-                    "junk_string": "junk",
-                    "junk_integer" : 1,
-                    "junk_float" : 1.0,
-                    "junk_null" : null,
-                    "junk_true" : true,
-                    "junk_false" : false,
-                    "completion_tokens": 33,
-                    "prompt_tokens": 19,
-                    "total_tokens": 52
-                  }
-                }
-                """;
-        Set<String> files =  new HashSet<>();
-        ProxyUtil.collectAttachmentsFromResponse((ObjectNode) ProxyUtil.MAPPER.readTree(response), false, files::add);
-
-        assertEquals(Set.of("files/7G9WZNcoY26Vy9D7bEgbv6zqbJGfyDp9KZyEbJR4XMZt/b1/file1.txt",
-                "files/7G9WZNcoY26Vy9D7bEgbv6zqbJGfyDp9KZyEbJR4XMZt/b1/file2.txt"), files);
-
-    }
-
-    @Test
-    public void testCollectAttachmentsFromResponse_ChatStreamingResponse() throws JsonProcessingException {
-        String response = """
-                {
-                  "id": "chatcmpl-7VfMTgj3ljKdGKS2BEIwloII3IoO0",
-                  "object": "chat.completion",
-                  "created": 1687781517,
-                  "model": "gpt-35-turbo",
-                  "choices": [
-                    {
-                      "index": 0,
-                      "finish_reason": "stop",
-                      "delta": {
-                        "role": "assistant",
-                        "content": "some text",
-                        "custom_content": {
-                           "attachments": [
-                              {
-                               "type": "application/octet-stream",
-                               "title": "LICENSE",
-                               "url": "files/7G9WZNcoY26Vy9D7bEgbv6zqbJGfyDp9KZyEbJR4XMZt/b1/file1.txt"
-                              },
-                              {
-                                "type": "application/octet-stream",
-                                "title": "LICENSE",
-                                "url": "files/7G9WZNcoY26Vy9D7bEgbv6zqbJGfyDp9KZyEbJR4XMZt/b1/file2.txt"
-                              }
-                           ]
-                        }
-                      }
-                    }
-                  ],
-                  "usage" : {
-                    "junk_string": "junk",
-                    "junk_integer" : 1,
-                    "junk_float" : 1.0,
-                    "junk_null" : null,
-                    "junk_true" : true,
-                    "junk_false" : false,
-                    "completion_tokens": 33,
-                    "prompt_tokens": 19,
-                    "total_tokens": 52
-                  }
-                }
-                """;
-        Set<String> files =  new HashSet<>();
-        ProxyUtil.collectAttachmentsFromResponse((ObjectNode) ProxyUtil.MAPPER.readTree(response), true, files::add);
-
-        assertEquals(Set.of("files/7G9WZNcoY26Vy9D7bEgbv6zqbJGfyDp9KZyEbJR4XMZt/b1/file1.txt",
-                "files/7G9WZNcoY26Vy9D7bEgbv6zqbJGfyDp9KZyEbJR4XMZt/b1/file2.txt"), files);
-
     }
 
     @Test
@@ -483,7 +224,6 @@ public class ProxyUtilTest {
                     {
                     "prompt": "sysPrompt",
                     "temperature": 5,
-                    "selectedAddons": ["A", "B", "C"],
                     "assistantModelId": "assistantId"
                     }
                   }
@@ -493,7 +233,6 @@ public class ProxyUtilTest {
                   "replayUserMessagesStack": [],
                   "activeReplayIndex": 0
                   },
-                "selectedAddons": ["R", "T", "G"],
                 "assistantModelId": "assistantId",
                 "lastActivityDate": 4848683153,
                 "customViewState": {
@@ -507,5 +246,84 @@ public class ProxyUtilTest {
                 """;
 
         assertDoesNotThrow(() -> ProxyUtil.convertToObject(validConversationJson, Conversation.class));
+    }
+
+    @Test
+    public void testGetClientIpAddress() {
+        HttpServerRequest request = Mockito.mock(HttpServerRequest.class);
+        when(request.getHeader("X-Forwarded-For")).thenReturn("203.0.113.195, 2001:db8:85a3:8d3:1319:8a2e:370:7348");
+        assertEquals("203.0.113.195", ProxyUtil.getClientIpAddress(request, 2));
+
+        Mockito.reset(request);
+        when(request.getHeader("X-Forwarded-For")).thenReturn("203.0.113.195");
+        assertEquals("203.0.113.195", ProxyUtil.getClientIpAddress(request, 1));
+
+        Mockito.reset(request);
+        HttpConnection connection = mock(HttpConnection.class);
+        when(request.connection()).thenReturn(connection);
+        when(request.getHeader("X-Forwarded-For")).thenReturn("203.0.113.195");
+        assertNull(ProxyUtil.getClientIpAddress(request, 0));
+
+        Mockito.reset(request, connection);
+        when(request.connection()).thenReturn(connection);
+        Assertions.assertNull(ProxyUtil.getClientIpAddress(request, 0));
+
+        Mockito.reset(request, connection);
+        when(request.connection()).thenReturn(connection);
+        SocketAddress socketAddress = mock(SocketAddress.class);
+        when(connection.remoteAddress(true)).thenReturn(socketAddress);
+        when(socketAddress.isInetSocket()).thenReturn(false);
+        Assertions.assertNull(ProxyUtil.getClientIpAddress(request, 0));
+
+        Mockito.reset(request, connection, socketAddress);
+        connection = mock(HttpConnection.class);
+        when(request.connection()).thenReturn(connection);
+        socketAddress = mock(SocketAddress.class);
+        when(connection.remoteAddress(true)).thenReturn(socketAddress);
+        when(socketAddress.isInetSocket()).thenReturn(true);
+        when(socketAddress.host()).thenReturn("203.0.113.195");
+        assertEquals("203.0.113.195", ProxyUtil.getClientIpAddress(request, 0));
+
+        Mockito.reset(request, connection, socketAddress);
+        when(request.getHeader("X-Forwarded-For")).thenReturn("100.0.113.200, 2001:db8:85a3:8d3:1319:8a2e:370:7348");
+        connection = mock(HttpConnection.class);
+        when(request.connection()).thenReturn(connection);
+        socketAddress = mock(SocketAddress.class);
+        when(connection.remoteAddress(true)).thenReturn(socketAddress);
+        when(socketAddress.isInetSocket()).thenReturn(true);
+        when(socketAddress.host()).thenReturn("203.0.113.195");
+        assertEquals("203.0.113.195", ProxyUtil.getClientIpAddress(request, 3));
+    }
+
+    @Test
+    public void testSetOverrideNameHeader_NullDeployment_DoesNotThrowAndDoesNotSetHeader() {
+        MultiMap headers = new HeadersMultiMap();
+
+        assertDoesNotThrow(() -> ProxyUtil.setOverrideNameHeader(headers, null));
+
+        assertNull(headers.get(Proxy.HEADER_OVERRIDE_NAME));
+    }
+
+    @Test
+    public void testSetOverrideNameHeader_OverrideNameSet_SetsHeader() {
+        MultiMap headers = new HeadersMultiMap();
+        Model model = new Model();
+        model.setName("name");
+        model.setOverrideName("overrideName");
+
+        ProxyUtil.setOverrideNameHeader(headers, model);
+
+        assertEquals("overrideName", headers.get(Proxy.HEADER_OVERRIDE_NAME));
+    }
+
+    @Test
+    public void testSetOverrideNameHeader_OverrideNameNull_DoesNotSetHeader() {
+        MultiMap headers = new HeadersMultiMap();
+        Model model = new Model();
+        model.setName("name");
+
+        ProxyUtil.setOverrideNameHeader(headers, model);
+
+        assertNull(headers.get(Proxy.HEADER_OVERRIDE_NAME));
     }
 }

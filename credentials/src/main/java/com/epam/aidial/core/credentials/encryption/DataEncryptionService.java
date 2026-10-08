@@ -1,6 +1,7 @@
 package com.epam.aidial.core.credentials.encryption;
 
 import com.epam.aidial.core.credentials.data.configuration.EncryptionSettings;
+import com.epam.aidial.core.credentials.exception.EncryptionException;
 import lombok.extern.slf4j.Slf4j;
 
 import java.security.GeneralSecurityException;
@@ -70,7 +71,7 @@ public class DataEncryptionService {
             System.arraycopy(cipherText, 0, output, ivLengthBytes, cipherText.length);
             return output;
         } catch (GeneralSecurityException e) {
-            throw new RuntimeException("Encryption failed", e);
+            throw new EncryptionException("Encryption failed", e);
         }
     }
 
@@ -110,10 +111,20 @@ public class DataEncryptionService {
 
             return cipher.doFinal(cipherText);
         } catch (AEADBadTagException e) {
-            throw new SecurityException("Decryption failed: authentication tag mismatch (AAD, key, or ciphertext wrong)", e);
+            throw new EncryptionException("Decryption failed: authentication tag mismatch (AAD, key, or ciphertext wrong)", e);
         } catch (GeneralSecurityException e) {
-            throw new RuntimeException("Decryption failed", e);
+            throw new EncryptionException("Decryption failed", e);
         }
+    }
+
+    /**
+     * Minimum length, in bytes, of a payload produced by {@link #encrypt}: the prepended IV plus the GCM
+     * authentication tag. Any shorter byte sequence cannot be a ciphertext from this service.
+     *
+     * @return {@code ivLengthBytes + gcmTagLengthBits / 8}
+     */
+    public int minEncryptedLength() {
+        return ivLengthBytes + (gcmTagLengthBits / 8);
     }
 
     private static void validateKey(byte[] key) {

@@ -1,6 +1,7 @@
 package com.epam.aidial.core.credentials.service.registration;
 
 import com.epam.aidial.core.config.ResourceAuthSettings;
+import com.epam.aidial.core.credentials.data.credentials.TokenEndpointAuthMethod;
 import com.epam.aidial.core.credentials.data.registration.AuthorizationServerMetadata;
 import com.epam.aidial.core.credentials.data.registration.AuthorizationServerProtectedResourceMetadata;
 import com.epam.aidial.core.credentials.data.registration.ClientRegistration;
@@ -13,6 +14,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.hc.core5.http.ContentType;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 
@@ -40,6 +42,7 @@ public class DynamicResourceRegistrationStrategy implements ResourceRegistration
     private final AuthorizationServerMetadataService authorizationServerMetadataService;
     private final ResourceAuthorizationClient resourceAuthorizationClient;
     private final ProtectedResourceMetadataService protectedResourceMetadataService;
+    private final List<String> allowedRedirectUris;
 
     /**
      * Registers a protected resource dynamically using the authorization server's dynamic client registration
@@ -72,7 +75,7 @@ public class DynamicResourceRegistrationStrategy implements ResourceRegistration
 
         ClientRegistrationRequest clientRegistrationRequest = ClientRegistrationRequest.builder()
                 .clientName(resourceId)
-                .redirectUris(List.of(resourceAuthSettings.getRedirectUri()))
+                .redirectUris(collectRedirectUris(resourceAuthSettings))
                 .build();
 
         ClientRegistrationResponse clientRegistrationResponse = resourceAuthorizationClient.executePost(
@@ -80,6 +83,15 @@ public class DynamicResourceRegistrationStrategy implements ResourceRegistration
                 clientRegistrationRequest,
                 ContentType.APPLICATION_JSON.toString(),
                 ClientRegistrationResponse.class);
+
+        // Reject methods DIAL can't honor (e.g. private_key_jwt) at registration time so the
+        // operator gets a clear error before any end-user sign-in attempt. Honor the method the AS
+        // advertises; when it omits it, infer from the issued client type — a client registered
+        // without a secret is public (none), otherwise client_secret_basic (RFC 7591 §2). The
+        // persisted value always reflects what DIAL will use.
+        String tokenEndpointAuthMethod = TokenEndpointAuthMethod.resolve(
+                clientRegistrationResponse.getTokenEndpointAuthMethod(),
+                clientRegistrationResponse.getClientSecret()).value();
 
         ClientRegistration clientRegistration = ClientRegistration.builder()
                 .resourceId(clientRegistrationResponse.getClientName())
@@ -89,6 +101,7 @@ public class DynamicResourceRegistrationStrategy implements ResourceRegistration
                 .authorizationEndpoint(authServerMetadata.getAuthorizationEndpoint())
                 .tokenEndpoint(authServerMetadata.getTokenEndpoint())
                 .scopesSupported(supportedScopes)
+                .tokenEndpointAuthMethod(tokenEndpointAuthMethod)
                 .build();
 
         Optional<String> codeChallengeMethod = getCodeChallengeMethod(authServerMetadata);
@@ -96,5 +109,14 @@ public class DynamicResourceRegistrationStrategy implements ResourceRegistration
 
         log.info("Finished dynamic registration for Resource: {}", resourceId);
         return clientRegistration;
+    }
+
+    private List<String> collectRedirectUris(ResourceAuthSettings resourceAuthSettings) {
+        List<String> uris = new ArrayList<>(allowedRedirectUris);
+        String resourceRedirectUri = resourceAuthSettings.getRedirectUri();
+        if (resourceRedirectUri != null && !uris.contains(resourceRedirectUri)) {
+            uris.add(resourceRedirectUri);
+        }
+        return uris;
     }
 }

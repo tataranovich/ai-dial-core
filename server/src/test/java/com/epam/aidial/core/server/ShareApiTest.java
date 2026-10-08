@@ -508,6 +508,218 @@ public class ShareApiTest extends ResourceBaseTest {
     }
 
     @Test
+    void testToolSetRevokeSharedAccess() {
+        // check no toolsets or credentials shared with me
+        Response response = operationRequest("/v1/ops/resource/share/list", """
+                {
+                  "resourceTypes": ["TOOL_SET", "CREDENTIALS"],
+                  "with": "me"
+                }
+                """);
+        verifyJson(response, 200, """
+                {
+                  "resources": []
+                }
+                """);
+
+        // check no toolsets or credentials shared by me
+        response = operationRequest("/v1/ops/resource/share/list", """
+                {
+                  "resourceTypes": ["TOOL_SET", "CREDENTIALS"],
+                  "with": "others"
+                }
+                """);
+        verifyJson(response, 200, """
+                {
+                  "resources": []
+                }
+                """);
+
+        // create ToolSet
+        response = send(HttpMethod.PUT, "/v1/toolsets/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/toolset@", null, TOOLSET_CREATE_REQEUST_BODY);
+        verifyNotExact(response, 200, "\"url\":\"toolsets/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/toolset@\"");
+
+
+        response = send(HttpMethod.POST, "/v1/ops/toolset/signin", null, """
+                {
+                    "url": "toolsets/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/toolset@",
+                    "credentialsLevel": "GLOBAL",
+                    "authenticationType": "API_KEY",
+                    "api_key": "Bearer api_key"
+                }
+                """);
+        verify(response, 200, "true");
+
+
+        // initialize share request
+        response = operationRequest("/v1/ops/resource/share/create", """
+                {
+                  "invitationType": "link",
+                  "resources": [
+                    {
+                      "url": "toolsets/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/toolset@",
+                      "shareCredentials": "true"
+                    }
+                  ]
+                }
+                """);
+        verify(response, 200);
+        InvitationLink invitationLink = ProxyUtil.convertToObject(response.body(), InvitationLink.class);
+        assertNotNull(invitationLink);
+
+        response = send(HttpMethod.GET, "/v1/invitations");
+        verifyNotExact(response, 200, "\"url\":\"toolsets/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/toolset@\"");
+        verifyNotExact(response, 200, "\"url\":\"credentials/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/toolsets/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/toolset@\"");
+        verifyNotExact(response, 200, "\"permissions\":[\"READ\"]");
+
+        // verify user2 do not have access to the toolset
+        response = send(HttpMethod.GET, "/v1/toolsets/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/toolset@", null, null,  "Api-key", "proxyKey2");
+        verify(response, 403);
+
+        // accept invitation
+        response = send(HttpMethod.GET, invitationLink.invitationLink(), "accept=true", null, "Api-key", "proxyKey2");
+        verify(response, 200);
+
+        // verify user2 has access to the toolset
+        response = send(HttpMethod.GET, "/v1/toolsets/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/toolset@", null, null,  "Api-key", "proxyKey2");
+        verify(response, 200);
+
+        // revoke share access
+        response = operationRequest("/v1/ops/resource/share/revoke", """
+                {
+                  "resources": [
+                    {
+                      "url": "toolsets/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/toolset%40"
+                    }
+                  ]
+                }
+                """);
+        verify(response, 200);
+
+        response = send(HttpMethod.GET, "/v1/invitations");
+        verifyJson(response, 200, """
+                {
+                  "invitations" : [ ]
+                }
+                """);
+
+        // verify user2 do not have access to the toolset
+        response = send(HttpMethod.GET, "/v1/toolsets/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/toolset@", null, null,  "Api-key", "proxyKey2");
+        verify(response, 403);
+
+        // verify user1 has no shared_with_me resources
+        response = operationRequest("/v1/ops/resource/share/list", """
+                {
+                  "resourceTypes": ["TOOL_SET", "CREDENTIALS"],
+                  "with": "me"
+                }
+                """);
+        verifyJson(response, 200, """
+                {
+                  "resources": []
+                }
+                """);
+
+        // verify user2 has no shared_with_me resource
+        response = operationRequest("/v1/ops/resource/share/list", """
+                {
+                  "resourceTypes": ["TOOL_SET", "CREDENTIALS"],
+                  "with": "me"
+                }
+                """, "Api-key", "proxyKey2");
+        verifyJson(response, 200, """
+                {
+                  "resources" : []
+                }
+                """);
+
+        // verify user1 has no shared_by_me resource
+        response = operationRequest("/v1/ops/resource/share/list", """
+                {
+                  "resourceTypes": ["TOOL_SET", "CREDENTIALS"],
+                  "with": "others"
+                }
+                """);
+        verifyJson(response, 200, """
+                {
+                  "resources" : []
+                }
+                """);
+
+        // verify user2 has no shared_by_me resources
+        response = operationRequest("/v1/ops/resource/share/list", """
+                {
+                  "resourceTypes": ["TOOL_SET", "CREDENTIALS"],
+                  "with": "others"
+                }
+                """, "Api-key", "proxyKey2");
+        verifyJson(response, 200, """
+                {
+                  "resources": []
+                }
+                """);
+    }
+
+    @Test
+    void testToolSetShareWithUserCredentials() {
+        // check no toolsets or credentials shared with me
+        Response response = operationRequest("/v1/ops/resource/share/list", """
+                {
+                  "resourceTypes": ["TOOL_SET", "CREDENTIALS"],
+                  "with": "me"
+                }
+                """);
+        verifyJson(response, 200, """
+                {
+                  "resources": []
+                }
+                """);
+
+        // check no toolsets or credentials shared by me
+        response = operationRequest("/v1/ops/resource/share/list", """
+                {
+                  "resourceTypes": ["TOOL_SET", "CREDENTIALS"],
+                  "with": "others"
+                }
+                """);
+        verifyJson(response, 200, """
+                {
+                  "resources": []
+                }
+                """);
+
+        // create ToolSet
+        response = send(HttpMethod.PUT, "/v1/toolsets/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/toolset@", null,  TOOLSET_CREATE_REQEUST_BODY);
+        verifyNotExact(response, 200, "\"url\":\"toolsets/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/toolset@\"");
+
+
+        response = send(HttpMethod.POST, "/v1/ops/toolset/signin", null, """
+                {
+                    "url": "toolsets/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/toolset@",
+                    "credentialsLevel": "USER",
+                    "authenticationType": "API_KEY",
+                    "api_key": "Bearer api_key"
+                }
+                """);
+        verify(response, 200, "true");
+
+
+        // initialize share request with personal credentials
+        response = operationRequest("/v1/ops/resource/share/create", """
+                {
+                  "invitationType": "link",
+                  "resources": [
+                    {
+                      "url": "toolsets/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/toolset@",
+                      "shareCredentials": "true"
+                    }
+                  ]
+                }
+                """);
+        verify(response, 400);
+    }
+
+    @Test
     public void testPartiallyRevokeSharedAccess() {
         // check no conversations shared with me
         Response response = operationRequest("/v1/ops/resource/share/list", """
@@ -1982,7 +2194,7 @@ public class ShareApiTest extends ResourceBaseTest {
 
     @Test
     void testPerRequestKeyCannotBeUsed() {
-        ApiKeyData originalKey = apiKeyStore.getApiKeyData("proxyKey1").result();
+        ApiKeyData originalKey = apiKeyStore.getApiKeyData("proxyKey1", null).result();
         ApiKeyData perRequestKey = new ApiKeyData();
         perRequestKey.setOriginalKey(originalKey.getOriginalKey());
         apiKeyStore.assignPerRequestApiKey(perRequestKey);
@@ -2308,5 +2520,89 @@ public class ShareApiTest extends ResourceBaseTest {
                   } ]
                 }
                 """);
+    }
+
+    @Test
+    @DialConfigLocation("dial-config/share-limit-config.json")
+    void testShareFileLimitEnforced() {
+        // upload a file with a percent-encoded special character in the path
+        Response response = upload(HttpMethod.PUT, "/v1/files/%s/folder%%40name/test.txt".formatted(bucket), null, "test content");
+        Assertions.assertEquals(200, response.status());
+
+        // initialize share request using the percent-encoded URL
+        response = operationRequest("/v1/ops/resource/share/create", """
+                {
+                  "invitationType": "link",
+                  "resources": [
+                    {
+                      "url": "files/%s/folder%%40name/test.txt"
+                    }
+                  ]
+                }
+                """.formatted(bucket));
+        verify(response, 200);
+        InvitationLink invitationLink = ProxyUtil.convertToObject(response.body(), InvitationLink.class);
+        assertNotNull(invitationLink);
+
+        // user2 accepts invitation - should succeed (0 < 1)
+        response = send(HttpMethod.GET, invitationLink.invitationLink(), "accept=true", null, "Api-key", "proxyKey2");
+        verify(response, 200);
+
+        // create another invitation for the same file
+        response = operationRequest("/v1/ops/resource/share/create", """
+                {
+                  "invitationType": "link",
+                  "resources": [
+                    {
+                      "url": "files/%s/folder%%40name/test.txt"
+                    }
+                  ]
+                }
+                """.formatted(bucket));
+        verify(response, 200);
+        invitationLink = ProxyUtil.convertToObject(response.body(), InvitationLink.class);
+        assertNotNull(invitationLink);
+
+        // user3 accepts invitation - should fail (1 >= 1, limit exceeded)
+        response = send(HttpMethod.GET, invitationLink.invitationLink(), "accept=true", null, "Api-key", "proxyKey3");
+        verify(response, 400);
+    }
+
+    @Test
+    @DialConfigLocation("dial-config/share-limit-config.json")
+    void testShareFileLimitEnforcedForFolder() {
+        // upload files in a folder
+        Response response = upload(HttpMethod.PUT, "/v1/files/%s/shared-folder/file1.txt".formatted(bucket), null, "content1");
+        Assertions.assertEquals(200, response.status());
+
+        // create conversation referencing files
+        response = resourceRequest(HttpMethod.PUT, "/test-conversation", CONVERSATION_BODY_1);
+        verifyNotExact(response, 200, "\"url\":");
+
+        // share both conversation and folder
+        response = operationRequest("/v1/ops/resource/share/create", """
+                {
+                  "invitationType": "link",
+                  "resources": [
+                    {
+                      "url": "conversations/%s/test-conversation"
+                    },
+                    {
+                      "url": "metadata/files/%s/shared-folder/"
+                    }
+                  ]
+                }
+                """.formatted(bucket, bucket));
+        verify(response, 200);
+        InvitationLink invitationLink = ProxyUtil.convertToObject(response.body(), InvitationLink.class);
+        assertNotNull(invitationLink);
+
+        // user2 accepts - should succeed (file limit: 0 < 1)
+        response = send(HttpMethod.GET, invitationLink.invitationLink(), "accept=true", null, "Api-key", "proxyKey2");
+        verify(response, 200);
+
+        // user3 accepts - should fail (file limit exceeded: 1 >= 1)
+        response = send(HttpMethod.GET, invitationLink.invitationLink(), "accept=true", null, "Api-key", "proxyKey3");
+        verify(response, 400);
     }
 }

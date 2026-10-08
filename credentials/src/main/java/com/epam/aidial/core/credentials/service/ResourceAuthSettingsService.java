@@ -4,12 +4,16 @@ import com.epam.aidial.core.config.AuthenticationType;
 import com.epam.aidial.core.config.CredentialsLevel;
 import com.epam.aidial.core.config.ResourceAuthSettings;
 import com.epam.aidial.core.config.ResourceAuthStatus;
+import com.epam.aidial.core.config.SecuredResource;
+import com.epam.aidial.core.credentials.data.credentials.CredentialsDescriptor;
 import com.epam.aidial.core.credentials.data.credentials.CredentialsLocator;
 import com.epam.aidial.core.credentials.data.credentials.ResourceCredentials;
 import com.epam.aidial.core.credentials.data.registration.ClientRegistration;
 import com.epam.aidial.core.credentials.service.registration.ResourceRegistrationService;
 import com.epam.aidial.core.credentials.service.token.TokenRefreshStrategyFactory;
-import com.epam.aidial.core.credentials.validation.ResourceAuthSettingsValidator;
+import com.epam.aidial.core.credentials.validation.AuthSettingsValidator;
+import com.epam.aidial.core.credentials.validation.AuthSettingsValidatorFactory;
+import com.epam.aidial.core.credentials.validation.ClientSecretValidation;
 import com.nimbusds.oauth2.sdk.pkce.CodeChallenge;
 import com.nimbusds.oauth2.sdk.pkce.CodeChallengeMethod;
 import com.nimbusds.oauth2.sdk.pkce.CodeVerifier;
@@ -24,26 +28,128 @@ import java.util.Optional;
 public class ResourceAuthSettingsService {
 
     private final ResourceRegistrationService resourceRegistrationService;
-    private final ResourceAuthSettingsValidator resourceAuthSettingsValidator;
     private final ResourceCredentialsService resourceCredentialsService;
     private final TokenRefreshStrategyFactory tokenRefreshStrategyFactory;
+    private final AuthSettingsValidatorFactory validatorFactory;
 
-    public void enrichResourceAuthSettings(String resourceId,
-                                           String resourceEndpoint,
-                                           ResourceAuthSettings resourceAuthSettings) {
+    /**
+     * Processes the resource authentication settings for a given `SecuredResource`.
+     *
+     * <p>This method validates the new `SecuredResource` authentication settings, optionally registers
+     * clients dynamically or statically, and ensures proper handling of fields like `clientSecret`,
+     * `codeChallenge`, and `codeVerifier` during updates.</p>
+     *
+     * @param updatedResource The new `SecuredResource` configuration being saved
+     * @param existingResource The existing `SecuredResource` configuration, or null if creating a new `SecuredResource`
+     * @throws IllegalArgumentException if `ResourceAuthSettings` is not defined
+     */
+    public void processResourceAuthSettings(SecuredResource updatedResource,
+                                            SecuredResource existingResource) {
+        ResourceAuthSettings resourceAuthSettings = updatedResource.getAuthSettings();
+
         if (resourceAuthSettings == null) {
-            throw new IllegalArgumentException("ResourceAuthSettings is not defined for Resource: " + resourceId);
+            throw new IllegalArgumentException("ResourceAuthSettings is not defined for Resource: " + updatedResource.getName());
         }
 
-        resourceAuthSettingsValidator.validate(resourceAuthSettings);
+        // Statuses and the secret hint are computed per read; a client echoing them back must not persist them.
+        resourceAuthSettings.clearComputedFields();
 
-        if (resourceAuthSettings.getAuthenticationType() != AuthenticationType.OAUTH) {
-            // do nothing
-            return;
+        if (updatedResource.isForwardPerRequestKey() && resourceAuthSettings.getAuthenticationType() == AuthenticationType.API_KEY) {
+            throw new IllegalArgumentException("Forward per request API key can't be along with authentication type %s"
+                    .formatted(AuthenticationType.API_KEY.name()));
         }
 
+        boolean requiresClientRegistration = requiresClientRegistration(updatedResource, existingResource);
+        boolean requiresDynamicClientRegistration = requiresDynamicClientRegistration(resourceAuthSettings);
+
+        ResourceAuthSettingsChangeMode resourceAuthSettingsChangeMode = getResourceAuthSettingsChangeMode(
+                requiresClientRegistration, requiresDynamicClientRegistration);
+        validateResourceAuthSettings(resourceAuthSettings, resourceAuthSettingsChangeMode,
+                existingResource == null || existingResource.getAuthSettings() == null
+                        ? null : existingResource.getAuthSettings().getClientSecret());
+
+        if (resourceAuthSettingsChangeMode == ResourceAuthSettingsChangeMode.CREATE_DYNAMIC_CLIENT
+                || resourceAuthSettingsChangeMode == ResourceAuthSettingsChangeMode.CREATE_STATIC_CLIENT) {
+            enrichResourceAuthSettings(updatedResource.getName(), updatedResource.getEndpoint(), resourceAuthSettings, requiresDynamicClientRegistration);
+            resourceAuthSettings.setDynamicallyRegistered(requiresDynamicClientRegistration);
+        } else if (AuthenticationType.OAUTH.equals(resourceAuthSettings.getAuthenticationType())
+                && existingResource != null
+                && existingResource.getAuthSettings() != null) {
+            ResourceAuthSettings existingResourceAuthSettings = existingResource.getAuthSettings();
+
+            // Capture before clientSecret is filled in from existing: only a PUT that explicitly
+            // supplies both clientId and clientSecret signals intentional DCR→static conversion.
+            // GET never returns clientSecret, so an update without it must preserve the flag.
+            boolean explicitlyConvertingToStatic = resourceAuthSettings.getClientId() != null
+                    && resourceAuthSettings.getClientSecret() != null;
+
+            // do not re-write clientSecret with null values
+            if (resourceAuthSettings.getClientSecret() == null) {
+                resourceAuthSettings.setClientSecret(existingResourceAuthSettings.getClientSecret());
+            }
+
+            // preserve tokenEndpointAuthMethod on updates that omit it
+            if (resourceAuthSettings.getTokenEndpointAuthMethod() == null) {
+                resourceAuthSettings.setTokenEndpointAuthMethod(existingResourceAuthSettings.getTokenEndpointAuthMethod());
+            }
+
+            resolveCodeChallengeSettings(resourceAuthSettings, existingResourceAuthSettings);
+
+            if (explicitlyConvertingToStatic && Boolean.TRUE.equals(existingResourceAuthSettings.getDynamicallyRegistered())) {
+                resourceAuthSettings.setDynamicallyRegistered(false);
+            } else {
+                resourceAuthSettings.setDynamicallyRegistered(existingResourceAuthSettings.getDynamicallyRegistered());
+            }
+        }
+    }
+
+    /**
+     * Preserves existing auto-generated codeChallenge/codeVerifier when codeChallengeMethod is unchanged (or omitted),
+     * otherwise regenerates the pair under the new method.
+     */
+    private void resolveCodeChallengeSettings(ResourceAuthSettings resourceAuthSettings,
+                                              ResourceAuthSettings existingResourceAuthSettings) {
+        String newCodeChallengeMethod = resourceAuthSettings.getCodeChallengeMethod();
+        String existingCodeChallengeMethod = existingResourceAuthSettings.getCodeChallengeMethod();
+        if (newCodeChallengeMethod == null || newCodeChallengeMethod.equals(existingCodeChallengeMethod)) {
+            resourceAuthSettings.setCodeChallengeMethod(existingCodeChallengeMethod);
+            resourceAuthSettings.setCodeChallenge(existingResourceAuthSettings.getCodeChallenge());
+            resourceAuthSettings.setCodeVerifier(existingResourceAuthSettings.getCodeVerifier());
+        } else {
+            setCodeChallengeProperties(resourceAuthSettings, newCodeChallengeMethod);
+        }
+    }
+
+    /**
+     * Validates the resource authentication settings using the appropriate validator.
+     *
+     * @param resourceAuthSettings The `ResourceAuthSettings` to validate
+     * @param resourceAuthSettingsChangeMode The mode of authentication changes (e.g., CREATE_DYNAMIC_CLIENT)
+     */
+    private void validateResourceAuthSettings(ResourceAuthSettings resourceAuthSettings,
+                                              ResourceAuthSettingsChangeMode resourceAuthSettingsChangeMode,
+                                              String storedClientSecret) {
+        AuthSettingsValidator authSettingsValidator = validatorFactory.getValidator(resourceAuthSettings.getAuthenticationType());
+        authSettingsValidator.validate(resourceAuthSettings, resourceAuthSettingsChangeMode);
+        // Runs before enrichResourceAuthSettings, so a secret a dynamic registration is about to return is
+        // never checked — only the caller's own.
+        ClientSecretValidation.validate(resourceAuthSettings.getClientSecret(), storedClientSecret);
+    }
+
+    /**
+     * Enriches the resource authentication settings with metadata by registering clients dynamically or statically.
+     *
+     * @param resourceId The resource name
+     * @param resourceEndpoint The resource endpoint (URL)
+     * @param resourceAuthSettings The `ResourceAuthSettings` being enriched
+     * @param oauthDynamicClientRegistrationRequired Whether dynamic client registration is needed
+     */
+    private void enrichResourceAuthSettings(String resourceId,
+                                            String resourceEndpoint,
+                                            ResourceAuthSettings resourceAuthSettings,
+                                            boolean oauthDynamicClientRegistrationRequired) {
         ClientRegistration clientRegistration = resourceRegistrationService.register(
-                resourceId, resourceEndpoint, resourceAuthSettings);
+                resourceId, resourceEndpoint, resourceAuthSettings, oauthDynamicClientRegistrationRequired);
 
         resourceAuthSettings.setClientId(clientRegistration.getClientId());
         resourceAuthSettings.setClientSecret(clientRegistration.getClientSecret());
@@ -51,25 +157,69 @@ public class ResourceAuthSettingsService {
         resourceAuthSettings.setTokenEndpoint(clientRegistration.getTokenEndpoint());
         resourceAuthSettings.setRedirectUri(clientRegistration.getRedirectUri());
         resourceAuthSettings.setScopesSupported(clientRegistration.getScopesSupported());
+        resourceAuthSettings.setTokenEndpointAuthMethod(clientRegistration.getTokenEndpointAuthMethod());
         setCodeChallengeProperties(resourceAuthSettings, clientRegistration.getCodeChallengeMethod());
     }
 
     public void setResourceAuthStatuses(CredentialsLocator credentialsLocator,
                                         ResourceAuthSettings resourceAuthSettings,
-                                        String userSub) {
+                                        String userId) {
         List<ResourceCredentials> allResourceCredentials = resourceCredentialsService.getAllResourceCredentials(credentialsLocator);
-        setUserAuthStatus(resourceAuthSettings, allResourceCredentials, userSub);
+        setUserAuthStatus(resourceAuthSettings, allResourceCredentials, userId);
         setGlobalAuthStatus(resourceAuthSettings, allResourceCredentials);
+    }
+
+    /**
+     * Enriches external-service auth settings with USER- and APPLICATION-level statuses
+     * (external services use USER/APPLICATION levels, unlike toolsets which use USER/GLOBAL).
+     */
+    public void setExternalServiceAuthStatuses(CredentialsLocator credentialsLocator,
+                                               ResourceAuthSettings resourceAuthSettings,
+                                               String userId) {
+        List<ResourceCredentials> all = resourceCredentialsService.getAllResourceCredentials(credentialsLocator);
+
+        boolean userSignedIn = hasUnexpiredUserCredentials(all, userId);
+        resourceAuthSettings.setUserLevelAuthStatus(userSignedIn ? ResourceAuthStatus.SIGNED_IN : ResourceAuthStatus.SIGNED_OUT);
+
+        boolean appSignedIn = hasUnexpiredApplicationCredentials(all);
+        resourceAuthSettings.setAppLevelAuthStatus(appSignedIn ? ResourceAuthStatus.SIGNED_IN : ResourceAuthStatus.SIGNED_OUT);
+    }
+
+    // USER-level credentials are scoped to a single signed-in user, so they are filtered by userId.
+    private boolean hasUnexpiredUserCredentials(List<ResourceCredentials> all, String userId) {
+        return all.stream().anyMatch(c -> c.getCredentialsLevel() == CredentialsLevel.USER
+                && userId.equals(c.getUserId())
+                && hasUnexpiredToken(c));
+    }
+
+    // APPLICATION-level credentials are shared by the app and not bound to any user, so no userId filter applies.
+    private boolean hasUnexpiredApplicationCredentials(List<ResourceCredentials> all) {
+        return all.stream().anyMatch(c -> c.getCredentialsLevel() == CredentialsLevel.APPLICATION
+                && hasUnexpiredToken(c));
+    }
+
+    /**
+     * Whether a single credentials record exists and is still usable. An expired access token counts as usable when
+     * a refresh token is present, which is the normal state of a long-lived offline credential.
+     */
+    public boolean hasUnexpiredCredentials(CredentialsDescriptor credentialsDescriptor) {
+        ResourceCredentials credentials = resourceCredentialsService.getResourceCredentials(credentialsDescriptor);
+        return credentials != null && hasUnexpiredToken(credentials);
+    }
+
+    private boolean hasUnexpiredToken(ResourceCredentials credentials) {
+        return tokenRefreshStrategyFactory.getTokenValidatorStrategy(credentials.getAuthenticationType())
+                .hasUnexpiredToken(credentials);
     }
 
     private void setUserAuthStatus(ResourceAuthSettings resourceAuthSettings,
                                    List<ResourceCredentials> resourceCredentialsList,
-                                   String userSub) {
+                                   String userId) {
         Optional<ResourceCredentials> userResourceCredentials = resourceCredentialsList.stream()
                 .filter(resourceCredentials -> resourceCredentials.getCredentialsLevel().equals(CredentialsLevel.USER)
                     && tokenRefreshStrategyFactory.getTokenValidatorStrategy(resourceCredentials.getAuthenticationType())
                         .hasUnexpiredToken(resourceCredentials)
-                        && userSub.equals(resourceCredentials.getUserSub()))
+                        && userId.equals(resourceCredentials.getUserId()))
                 .findFirst();
         if (userResourceCredentials.isPresent()) {
             resourceAuthSettings.setUserLevelAuthStatus(ResourceAuthStatus.SIGNED_IN);
@@ -92,6 +242,21 @@ public class ResourceAuthSettingsService {
         }
     }
 
+    /**
+     * Applies a {@link ClientRegistration} result to {@code authSettings} in-place,
+     * including regenerating the PKCE code-challenge pair. Used by the repair path after DCR.
+     */
+    public void applyRegistration(ResourceAuthSettings authSettings, ClientRegistration registration) {
+        authSettings.setClientId(registration.getClientId());
+        authSettings.setClientSecret(registration.getClientSecret());
+        authSettings.setAuthorizationEndpoint(registration.getAuthorizationEndpoint());
+        authSettings.setTokenEndpoint(registration.getTokenEndpoint());
+        authSettings.setRedirectUri(registration.getRedirectUri());
+        authSettings.setScopesSupported(registration.getScopesSupported());
+        authSettings.setTokenEndpointAuthMethod(registration.getTokenEndpointAuthMethod());
+        setCodeChallengeProperties(authSettings, registration.getCodeChallengeMethod());
+    }
+
     private void setCodeChallengeProperties(ResourceAuthSettings resourceAuthSettings,
                                             String codeChallengeMethod) {
         if (codeChallengeMethod != null) {
@@ -103,5 +268,67 @@ public class ResourceAuthSettingsService {
             resourceAuthSettings.setCodeVerifier(codeVerifier.getValue());
             resourceAuthSettings.setCodeChallengeMethod(parsedCodeChallengeMethod.getValue());
         }
+    }
+
+    /**
+     * Determines whether client registration is required for the given SecuredResource.
+     *
+     * <p>Client registration is required in the following cases:
+     * <ul>
+     *     <li>If the authentication type is `OAUTH` and no SecuredResource exists</li>
+     *     <li>If the authentication type changes from non-OAUTH to OAUTH</li>
+     * </ul>
+     *
+     * @param securedResource The new `SecuredResource` configuration being saved
+     * @param existing The existing `SecuredResource` configuration, or null if creating a new SecuredResource
+     * @return true if client registration is required, false otherwise
+     */
+    private boolean requiresClientRegistration(SecuredResource securedResource, SecuredResource existing) {
+        ResourceAuthSettings newResourceAuthSettings = securedResource.getAuthSettings();
+
+        // Do not register client for non-OAUTH auth types
+        if (!AuthenticationType.OAUTH.equals(newResourceAuthSettings.getAuthenticationType())) {
+            return false;
+        }
+
+        // Always register client when creating a new SecuredResource with OAUTH auth type
+        if (existing == null) {
+            return true;
+        }
+
+        ResourceAuthSettings existingResourceAuthSettings = existing.getAuthSettings();
+
+        // Ensure client registration applies only if the auth type was changed to OAUTH
+        return !AuthenticationType.OAUTH.equals(existingResourceAuthSettings.getAuthenticationType());
+    }
+
+    /**
+     * Determines whether dynamic client registration is required for the given resource authentication settings.
+     * Dynamic registration is required when the settings include OAUTH authentication and do not specify `clientId` or `clientSecret`.
+     *
+     * @param resourceAuthSettings The `ResourceAuthSettings` to validate
+     * @return true if dynamic client registration is required, false otherwise
+     */
+    private boolean requiresDynamicClientRegistration(ResourceAuthSettings resourceAuthSettings) {
+        return AuthenticationType.OAUTH.equals(resourceAuthSettings.getAuthenticationType())
+                && resourceAuthSettings.getClientId() == null
+                && resourceAuthSettings.getClientSecret() == null;
+    }
+
+    /**
+     * Determines the change mode for resource authentication settings.
+     *
+     * @param requiresClientRegistration Whether client registration is required
+     * @param requiresDynamicClientRegistration Whether dynamic client registration is required
+     * @return The `ResourceAuthSettingsChangeMode` describing the type of required action
+     */
+    private ResourceAuthSettingsChangeMode getResourceAuthSettingsChangeMode(boolean requiresClientRegistration,
+                                                                             boolean requiresDynamicClientRegistration) {
+        if (!requiresClientRegistration) {
+            return ResourceAuthSettingsChangeMode.NO_CLIENT_CHANGES;
+        }
+        return requiresDynamicClientRegistration
+                ? ResourceAuthSettingsChangeMode.CREATE_DYNAMIC_CLIENT
+                : ResourceAuthSettingsChangeMode.CREATE_STATIC_CLIENT;
     }
 }

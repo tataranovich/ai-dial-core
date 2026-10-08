@@ -2,91 +2,85 @@ package com.epam.aidial.core.server.function.enhancement;
 
 import com.epam.aidial.core.config.Deployment;
 import com.epam.aidial.core.config.Interceptor;
+import com.epam.aidial.core.config.InterfaceType;
 import com.epam.aidial.core.server.Proxy;
 import com.epam.aidial.core.server.ProxyContext;
 import com.epam.aidial.core.server.data.ApiKeyData;
 import com.epam.aidial.core.server.function.BaseRequestFunction;
-import com.epam.aidial.core.server.util.ProxyUtil;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.epam.aidial.core.server.function.request.RequestObject;
+import io.vertx.core.MultiMap;
 import lombok.extern.slf4j.Slf4j;
 
 import java.util.Map;
 
 @Slf4j
-public class ApplyDefaultDeploymentSettingsFn extends BaseRequestFunction<ObjectNode> {
+public class ApplyDefaultDeploymentSettingsFn extends BaseRequestFunction<RequestObject> {
 
-    public ApplyDefaultDeploymentSettingsFn(Proxy proxy, ProxyContext context) {
+    /**
+     * The interface the client called. Every deployment this hop applies settings for resolves them under
+     * it - the interceptor it calls as much as the deployment the chain fronts - whatever interface the
+     * hop is routed on.
+     */
+    private final InterfaceType interfaceType;
+
+    public ApplyDefaultDeploymentSettingsFn(Proxy proxy, ProxyContext context, InterfaceType interfaceType) {
         super(proxy, context);
+        this.interfaceType = interfaceType;
     }
 
     @Override
-    public Boolean apply(ObjectNode tree) {
-        applyInterceptorDefaults(tree);
-        applyDeploymentDefaults(tree);
+    public Boolean apply(RequestObject request) {
+        applyInterceptorDefaults(request);
+        applyDeploymentDefaults(request);
         return true;
     }
 
-    private void applyInterceptorDefaults(ObjectNode tree) {
-        ObjectNode customFields = (ObjectNode) tree.get("custom_fields");
-        if (customFields != null) {
-            customFields.remove("interceptor_configuration");
-        }
+    private void applyInterceptorDefaults(RequestObject request) {
+        request.clearInterceptorSettings();
         Deployment deployment = context.getDeployment();
         if (deployment instanceof Interceptor) {
-            applyDefaults(tree, deployment);
+            applyDefaults(request, deployment);
         }
     }
 
-    private void applyDeploymentDefaults(ObjectNode tree) {
+    private void applyDeploymentDefaults(RequestObject request) {
         if (shouldApply(context)) {
             Deployment deployment = context.getDeployment();
             if (deployment instanceof Interceptor) {
                 String deploymentId = context.getInitialDeployment();
                 deployment = proxy.getDeploymentService().findDeployment(context, deploymentId);
             }
-            applyDefaults(tree, deployment);
-        }
-    }
-
-    private void applyDefaults(ObjectNode tree, Deployment deployment) {
-        for (Map.Entry<String, Object> e : deployment.getDefaults().entrySet()) {
-            String key = e.getKey();
-            JsonNode update = ProxyUtil.MAPPER.convertValue(e.getValue(), JsonNode.class);
-            tree.set(key, copy(tree.get(key), update));
+            applyDefaults(request, deployment);
         }
     }
 
     /**
-     * Copies default values to the target node from the source.
-     * The default value is copied from the source to the target if it's missed in the target node.
-     *
-     * <p>
-     *     Note. Arrays are not copied.
-     * </p>
+     * Default body params and default headers land together, and neither replaces a value the request
+     * already carries. At the first interceptor that means the interceptor's own settings, applied first,
+     * take precedence over the ones of the deployment it fronts.
      */
-    private static JsonNode copy(JsonNode target, JsonNode source) {
-        if (target == null || target.isNull()) {
-            return source;
-        }
-        if (source == null || source.isNull()) {
-            return target;
-        }
-        if (target.getNodeType() != source.getNodeType()) {
-            return source;
-        }
-        if (source.isObject()) {
-            return copyObjects((ObjectNode) target, (ObjectNode) source);
-        }
-        return target;
+    private void applyDefaults(RequestObject request, Deployment deployment) {
+        request.applyDefaults(deployment.resolveDefaults(interfaceType));
+        applyDefaultHeaders(deployment);
     }
 
-    private static ObjectNode copyObjects(ObjectNode target, ObjectNode source) {
-        for (Map.Entry<String, JsonNode> entry : source.properties()) {
-            String name = entry.getKey();
-            target.set(name, copy(target.get(name), entry.getValue()));
+    /**
+     * Adds the deployment's default headers to the inbound request under every name it does not already
+     * carry. They land on the inbound request, not on the outgoing one, so that they behave exactly as if
+     * the client had sent them: the core's own header reads see them, and they reach the deployment
+     * through the same copy - and the same exclusions - as client headers.
+     */
+    private void applyDefaultHeaders(Deployment deployment) {
+        Map<String, String> defaultHeaders = deployment.resolveDefaultHeaders(interfaceType);
+        if (defaultHeaders.isEmpty()) {
+            return;
         }
-        return target;
+        MultiMap headers = context.getRequest().headers();
+        defaultHeaders.forEach((name, value) -> {
+            if (!headers.contains(name)) {
+                headers.set(name, value);
+            }
+        });
     }
 
     /**

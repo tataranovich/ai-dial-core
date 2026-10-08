@@ -1,16 +1,19 @@
 package com.epam.aidial.core.config;
 
-import com.epam.aidial.core.config.databind.DoubleStringDeserializer;
-import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
 import lombok.Data;
 
 @Data
 public class Pricing {
     private String unit;
 
-    @JsonDeserialize(using = DoubleStringDeserializer.class)
-    private String prompt;
+    // Generated OpenAPI schema documents these as PricingRate's own object shape only; the
+    // generator has no field-level oneOf hook, so the flat-rate-string alternative doesn't
+    // render here even though the deserializer accepts it (PricingRateDeserializer).
+    private PricingRate prompt;
 
-    @JsonDeserialize(using = DoubleStringDeserializer.class)
-    private String completion;
+    private PricingRate completion;
+
+    private PricingRate cacheRead;
+
+    private PricingRate cacheWrite;
 }

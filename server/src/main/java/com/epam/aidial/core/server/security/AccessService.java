@@ -5,8 +5,8 @@ import com.epam.aidial.core.config.ResourceAccessType;
 import com.epam.aidial.core.server.ProxyContext;
 import com.epam.aidial.core.server.data.ApiKeyData;
 import com.epam.aidial.core.server.data.AutoSharedData;
-import com.epam.aidial.core.server.data.ResourceTypes;
 import com.epam.aidial.core.server.data.Rule;
+import com.epam.aidial.core.server.data.permission.PerRequestSharedData;
 import com.epam.aidial.core.server.service.ApplicationSchemaService;
 import com.epam.aidial.core.server.service.ApplicationService;
 import com.epam.aidial.core.server.service.PublicationService;
@@ -18,6 +18,9 @@ import com.epam.aidial.core.server.util.ResourceDescriptorFactory;
 import com.epam.aidial.core.storage.data.MetadataBase;
 import com.epam.aidial.core.storage.data.ResourceFolderMetadata;
 import com.epam.aidial.core.storage.resource.ResourceDescriptor;
+import com.epam.aidial.core.storage.resource.ResourceType;
+import com.epam.aidial.core.storage.resource.ResourceTypes;
+import com.epam.aidial.core.storage.resource.ResourceUtil;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Sets;
 import io.vertx.core.json.JsonArray;
@@ -34,6 +37,7 @@ import java.util.Set;
 import java.util.function.BiFunction;
 import java.util.function.Function;
 import java.util.stream.Collectors;
+import javax.annotation.Nullable;
 
 
 @Slf4j
@@ -43,15 +47,22 @@ public class AccessService {
     private final ShareService shareService;
     private final RuleService ruleService;
     private final List<Rule> adminRules;
+    private final List<Rule> globalReaderRules;
+    private final boolean adminRulesConfigured;
+    private final boolean globalReaderRulesConfigured;
 
     private final List<String> createCodeAppRoles;
 
     private final ApplicationSchemaService applicationSchemaService;
 
+    private static final Set<ResourceType> DEPLOYMENT_TYPES = Set.of(ResourceTypes.APPLICATION, ResourceTypes.TOOL_SET);
+
     private final List<PermissionRule> permissionRules = List.of(
             AccessService::getOwnResourcesAccess,
             this::getAdminAccess,
+            this::getGlobalReaderAccess,
             AccessService::getAutoSharedAccess,
+            AccessService::getPerRequestPermissions,
             AccessService::getAppResourceAccess,
             this::getReviewAccess,
             this::getPublicAccess,
@@ -69,6 +80,9 @@ public class AccessService {
         this.ruleService = ruleService;
         this.applicationSchemaService = applicationSchemaService;
         this.adminRules = adminRules(settings);
+        this.globalReaderRules = globalReaderRules(settings);
+        this.adminRulesConfigured = !this.adminRules.isEmpty();
+        this.globalReaderRulesConfigured = !this.globalReaderRules.isEmpty();
         this.createCodeAppRoles = getCreateCodeAppRoles(settings);
     }
 
@@ -182,6 +196,17 @@ public class AccessService {
         return Map.of();
     }
 
+    @VisibleForTesting
+    Map<ResourceDescriptor, Set<ResourceAccessType>> getGlobalReaderAccess(
+            Set<ResourceDescriptor> resources, ProxyContext context) {
+        if (hasGlobalReaderAccess(context)) {
+            return resources.stream()
+                    .collect(Collectors.toUnmodifiableMap(Function.identity(), resource -> ResourceAccessType.READ_ONLY));
+        }
+
+        return Map.of();
+    }
+
     /**
      * Returns USER permissions to the provided public resources.
      *
@@ -208,7 +233,22 @@ public class AccessService {
                 result.put(resource, autoSharedData.accessTypes());
                 continue;
             }
-            autoSharedData = apiKeyData.getAttachedToolSets().get(resourceUrl);
+            autoSharedData = apiKeyData.getAttachedPrompts().get(resourceUrl);
+            if (autoSharedData != null) {
+                result.put(resource, autoSharedData.accessTypes());
+                continue;
+            }
+            autoSharedData = apiKeyData.getAttachedSkills().get(resourceUrl);
+            if (autoSharedData != null) {
+                result.put(resource, autoSharedData.accessTypes());
+                continue;
+            }
+            autoSharedData = apiKeyData.getAttachedDeployments().get(resourceUrl);
+            if (autoSharedData != null) {
+                result.put(resource, autoSharedData.accessTypes());
+                continue;
+            }
+            autoSharedData = apiKeyData.getAttachedResourceCredentials().get(resourceUrl);
             if (autoSharedData != null) {
                 result.put(resource, autoSharedData.accessTypes());
                 continue;
@@ -227,6 +267,37 @@ public class AccessService {
         return result;
     }
 
+    private static Map<ResourceDescriptor, Set<ResourceAccessType>> getPerRequestPermissions(Set<ResourceDescriptor> resources,
+                                                                                             ProxyContext context) {
+        Map<String, PerRequestSharedData> perRequestSharedResources = context.getApiKeyData().getPerRequestSharedResources();
+        Map<ResourceDescriptor, Set<ResourceAccessType>> result = new HashMap<>();
+        for (ResourceDescriptor resource : resources) {
+            String resourceUrl = resource.getUrl();
+            PerRequestSharedData data = perRequestSharedResources.get(resourceUrl);
+            if (data != null) {
+                result.put(resource, data.permissions());
+                continue;
+            }
+            Set<ResourceAccessType> folderPermissions = findFolderPermissions(perRequestSharedResources, resourceUrl);
+            if (folderPermissions != null) {
+                result.put(resource, folderPermissions);
+            }
+        }
+        return result;
+    }
+
+    @Nullable
+    private static Set<ResourceAccessType> findFolderPermissions(Map<String, PerRequestSharedData> perRequestSharedResources,
+                                                                 String resourceUrl) {
+        for (Map.Entry<String, PerRequestSharedData> entry : perRequestSharedResources.entrySet()) {
+            String permittedUrl = entry.getKey();
+            if (ResourceUtil.isFolder(permittedUrl) && resourceUrl.startsWith(permittedUrl)) {
+                return entry.getValue().permissions();
+            }
+        }
+        return null;
+    }
+
     private static Map<ResourceDescriptor, Set<ResourceAccessType>> getOwnResourcesAccess(
             Set<ResourceDescriptor> resources, ProxyContext context) {
         String location = BucketBuilder.buildUserBucket(context);
@@ -242,19 +313,39 @@ public class AccessService {
 
     public Map<ResourceDescriptor, Set<ResourceAccessType>> getOwnResourcesAccessForChainedSchemaRichApplication(
             Set<ResourceDescriptor> resources, ProxyContext context) {
-        if (context.getDeployment() instanceof Application application && application.hasApplicationTypeSchemaId()) {
-            List<ResourceDescriptor> applicationFiles = applicationSchemaService.getFiles(application);
-            String location = BucketBuilder.buildInitiatorBucket(context);
-            Map<ResourceDescriptor, Set<ResourceAccessType>> result = new HashMap<>();
-            for (ResourceDescriptor resource : resources) {
-                if (resource.getBucketLocation().equals(location) && applicationFiles.contains(resource)) {
-                    result.put(resource, ResourceAccessType.READ_ONLY);
-                }
-            }
-            return result;
-        } else {
+        if (!(context.getDeployment() instanceof Application application) || !application.hasApplicationTypeSchemaId()) {
             return Map.of();
         }
+        String location = BucketBuilder.buildInitiatorBucket(context);
+        Set<ResourceDescriptor> ownResources = resources.stream()
+                .filter(resource -> resource.getBucketLocation().equals(location))
+                .collect(Collectors.toSet());
+        if (ownResources.isEmpty()) {
+            return Map.of();
+        }
+
+        // Collecting declared resources re-validates the application against its schema, so ask only for the kinds actually requested.
+        Set<ResourceDescriptor> declaredResources = new HashSet<>();
+        if (ownResources.stream().anyMatch(resource -> resource.getType() == ResourceTypes.FILE)) {
+            declaredResources.addAll(applicationSchemaService.getFiles(application));
+        }
+        if (ownResources.stream().anyMatch(resource -> DEPLOYMENT_TYPES.contains(resource.getType()))) {
+            declaredResources.addAll(applicationSchemaService.getDeployments(application));
+        }
+        if (ownResources.stream().anyMatch(resource -> resource.getType() == ResourceTypes.PROMPT)) {
+            declaredResources.addAll(applicationSchemaService.getPrompts(application));
+        }
+        if (ownResources.stream().anyMatch(resource -> resource.getType() == ResourceTypes.SKILL)) {
+            declaredResources.addAll(applicationSchemaService.getSkills(application));
+        }
+
+        Map<ResourceDescriptor, Set<ResourceAccessType>> result = new HashMap<>();
+        for (ResourceDescriptor resource : ownResources) {
+            if (declaredResources.contains(resource)) {
+                result.put(resource, ResourceAccessType.READ_ONLY);
+            }
+        }
+        return result;
     }
 
     public static Map<ResourceDescriptor, Set<ResourceAccessType>> getAppResourceAccess(
@@ -334,8 +425,38 @@ public class AccessService {
                 && RuleMatcher.match(context, adminRules);
     }
 
+    public boolean hasGlobalReaderAccess(ProxyContext context) {
+        return globalReaderRulesConfigured
+                && context.getApiKeyData().getPerRequestKey() == null // not application
+                && RuleMatcher.match(context, globalReaderRules);
+    }
+
+    /**
+     * Fail-closed admin check for the Configuration/Admin API surface. Unlike {@link #hasAdminAccess}
+     * — whose empty rule set is treated by {@link RuleMatcher} as allow-all — this returns
+     * {@code false} when {@code access.admin.rules} is unconfigured or empty, so an operator who
+     * never configured admin rules denies all config/admin access rather than granting it to everyone.
+     */
+    public boolean hasExplicitAdminAccess(ProxyContext context) {
+        return adminRulesConfigured && hasAdminAccess(context);
+    }
+
+    /**
+     * Returns {@code true} when {@code bucket} equals the caller's encrypted initiator bucket.
+     * Returns {@code false} (does not throw) when no initiator can be resolved — that case is
+     * treated as "not the owner" so the surrounding authz dispatch produces 403 rather than 500.
+     */
+    public boolean isOwnerOf(ProxyContext context, String bucket) {
+        try {
+            return encryptionService.encrypt(BucketBuilder.buildInitiatorBucket(context)).equals(bucket);
+        } catch (IllegalArgumentException ignored) {
+            return false;
+        }
+    }
+
     public void filterForbidden(ProxyContext context, ResourceDescriptor descriptor, MetadataBase metadata) {
-        if (descriptor.isPublic() && descriptor.isFolder() && !hasAdminAccess(context)) {
+        if (descriptor.isPublic() && descriptor.isFolder()
+                && !hasAdminAccess(context) && !hasGlobalReaderAccess(context)) {
             ResourceFolderMetadata folder = (ResourceFolderMetadata) metadata;
             ruleService.filterForbidden(context, descriptor, folder);
         }
@@ -366,8 +487,28 @@ public class AccessService {
     }
 
     private static List<Rule> adminRules(JsonObject settings) {
-        String rules = settings.getJsonObject("admin").getJsonArray("rules").toString();
-        List<Rule> list = ProxyUtil.convertToObject(rules, Rule.LIST_TYPE);
+        JsonObject admin = settings.getJsonObject("admin");
+        if (admin == null) {
+            return List.of();
+        }
+        JsonArray rules = admin.getJsonArray("rules");
+        if (rules == null) {
+            return List.of();
+        }
+        List<Rule> list = ProxyUtil.convertToObject(rules.toString(), Rule.LIST_TYPE);
+        return (list == null) ? List.of() : list;
+    }
+
+    private static List<Rule> globalReaderRules(JsonObject settings) {
+        JsonObject globalReader = settings.getJsonObject("globalReader");
+        if (globalReader == null) {
+            return List.of();
+        }
+        JsonArray rules = globalReader.getJsonArray("rules");
+        if (rules == null) {
+            return List.of();
+        }
+        List<Rule> list = ProxyUtil.convertToObject(rules.toString(), Rule.LIST_TYPE);
         return (list == null) ? List.of() : list;
     }
 

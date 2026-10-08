@@ -1,6 +1,6 @@
 # Dynamic Setting for Applications
 
-In dynamic settings you can include applications and their parameters you wish to enable in DIAL.
+In dynamic settings, you can include applications and their parameters you wish to enable in DIAL.
 
 > Refer to [DIAL Admin](https://docs.dialx.ai/tutorials/admin/entities-applications) to learn how to manage apps in DIAL Admin UI.
 
@@ -23,26 +23,35 @@ A list of deployed applications and their [parameters](#applicationsapplication_
 
 An object containing parameters for each [application](#applications).
 
-* `endpoint`: DIAL Application API for chat completions. **Note**. It should be unset if `applicationTypeSchemaId` is set.
-* `iconUrl`: A string with the URL with the icon location to display for the app on UI.
-* `description`: A string with a brief app description.
-* `displayName`: A string with the app's name. Display name is shown in all DIAL client UI dropdowns, tables, and logs so operators can quickly identify the app.
+> **Effective Parameter Rule**: When `applicationTypeSchemaId` and `applicationProperties` are specified, parameters defined in the corresponding schema will take precedence and will override the corresponding parameters specified in the `application` object.
+
+* `applications.<application_name>.applicationTypeSchemaId`: The identifier of a JSON schema that application is based upon. The shema ID must exist in the DIAL Core config property `applicationTypeSchemas`. Refer to [DIAL Documentation](https://docs.dialx.ai/platform/core/apps#application-types) to learn more about schema-rich apps.
+* `applications.<application_name>.applicationProperties`: Properties of a schema-rich application. Specified properties must conform to the JSON schema referenced by `applicationTypeSchemaId`. Refer to [DIAL Documentation](https://docs.dialx.ai/platform/core/apps#application-types) to learn more about schema-rich apps.
+* `endpoint`: The application's API endpoint for chat completion requests.
+* `baseUrl`: The root URL shared by every `interfaces` entry that declares no `base_url` of its own.
+* `interfaces`: A typed alternative to the flat `endpoint`/`responsesEndpoint` fields for declaring routing targets, keyed by interface type. Refer to [applications.<application_name>.interfaces](#applicationsapplication_nameinterfaces).
+* `overrideName`: If set, the application is called under this name: the outgoing chat completion request body's `model` field (and the `X-DIAL-OVERRIDE-NAME` header) are rewritten to this value before the request reaches the application's endpoint. Doesn't change routing — only the value the endpoint receives.
+* `iconUrl`: A string with URL of the icon to display for the app in the UI.
+* `description`: A string with a brief description of the application.
+* `intro`: A string with a short introductory/onboarding text for the application, shown to end users separately from `description`.
+* `displayName`: A string with the app's name. Display name is shown in all DIAL client UI dropdowns, tables, and logs for identification purposes.
+* `displayVersion`: A string with the app's version.
 * `inputAttachmentTypes`: A list of allowed [MIME types](https://developer.mozilla.org/en-US/docs/Web/HTTP/Basics_of_HTTP/MIME_types/Common_types) for the input attachments.
-* `maxInputAttachments`: Maximum number of input attachments (default is zero when `inputAttachmentTypes` is unset, otherwise, infinity).
-* `forwardAuthToken`: A boolean parameter to determine whether the Auth Token should be forwarded from the caller's session to the upstream API call. This enables multi-tenant scenarios or pass-through authentication for downstream services. If flag is set to `true` forward Http header with authorization token to chat completion endpoint of the application.
-* `userRoles`: A specific claim value provided by a specific IDP. Refer to [IDP Configuration](https://docs.dialx.ai/tutorials/devops/auth-and-access-control/configure-idps/overview) to view examples.
-* `descriptionKeywords`: A list of keywords describes the application, e.g. `code-gen`, `text2image`.
+* `maxInputAttachments`: Maximum number of input attachments. If `inputAttachmentTypes` is not set, this value is zero. Otherwise, if not specified, the default is unlimited.
+* `forwardAuthToken`: A boolean parameter to determine whether the Auth Token should be forwarded from the caller's session to the upstream API call. This enables multi-tenant scenarios or pass-through authentication for downstream services. If this flag is set to `true`, the Http header with authorization token is forwarded to the chat completion endpoint of the application.
+* `userRoles`: A specific `claim` value provided by a specific IDP in JWT or an [API key role](./keys.md). If not defined, the application is available to all users. Refer to [IDP Configuration](https://docs.dialx.ai/tutorials/devops/auth-and-access-control/configure-idps/overview) to view examples.
+* `descriptionKeywords`: A list of keywords describing the application, e.g. `code-gen`, `text2image`.
 * `maxRetryAttempts`: The number of times DIAL Core will [retry](https://docs.dialx.ai/platform/core/load-balancer#fallbacks) a connection in case of upstream errors.
 * `author`: The application's developer.
 * `createdAt`: The date of the application creation.
 * `updatedAt`: The date of the last application update. 
-* `dependencies`: A list of dependent deployments which the application may use.
-* `viewerUrl`: An optional field with a URL of the application's custom UI. A custom UI, if enabled, will override the standard DIAL Chat UI. Refer to [DIAL Documentation](https://docs.dialx.ai/platform/core/apps#application-types) to learn more about schema-rich apps.
-* `editoUrl`: An optional field with a URL of the application's custom builder UI. Application builder allows end-users to create instances of apps using a [UI wizard](https://docs.dialx.ai/tutorials/user-guide#application-builder). Refer to [DIAL Documentation](https://docs.dialx.ai/platform/core/apps#application-types) to learn more about schema-rich apps. 
-* `defaults`: Default parameters are applied if a request doesn't contain them in OpenAI `chat/completions` API call.         
-* `interceptors`: A list of interceptors to be triggered for the given application. Refer to [Interceptors](https://github.com/epam/ai-dial/blob/main/docs/platform/3.core/6.interceptors.md) to learn more.
-* `applications.<application_name>.applicationTypeSchemaId`: A schema ID of a schema-rich app.  The ID must exist in the config property `applicationTypeSchemas`.
-* `applications.<application_name>.applicationProperties`: Schema properties of a schema-rich app. The properties must conform to the application rich schema referenced by `applicationTypeSchemaId`.
+* `dependencies`: A list of dependent deployments (applications, AI models) which the application may use. Refer to [Managing Authorization in Complex Application Ecosystems](https://docs.dialx.ai/tutorials/developers/apps-development/auth-matrix) to learn more about dependencies.
+* `viewerUrl`: A string with URL of the application's [custom viewer UI](https://github.com/epam/ai-dial-chat/tree/development/docs). A custom UI, if enabled, will override the standard DIAL Chat UI.
+* `editorUrl`: A string with URL of the application's custom builder UI. Application builder allows DIAL Chat end-users to create instances of apps using a [UI wizards](https://docs.dialx.ai/tutorials/user-guide#application-builder).
+* `defaults`: Default parameters are applied if a request doesn't contain them in OpenAI `chat/completions` API call. Used only where the interface entry declares no `defaults` of its own. Refer to [applications.<application_name>.interfaces](#applicationsapplication_nameinterfaces).
+* `defaultHeaders`: HTTP headers DIAL Core adds to a request that doesn't already carry them. Refer to [applications.<application_name>.defaultHeaders](#applicationsapplication_namedefaultheaders).
+* `interceptors`: A list of local interceptors to be triggered for the given application. Refer to [Interceptors](./interceptors.md) to learn more.
+* `mcp`: MCP configuration. Refer to [MCP](#applicationsapplication_namemcp) to learn more.
 * `features`: A list of features supported by the application. Refer to [Features](#applicationsapplication_namefeatures) for more details.
 * `routes`: A list of registered routes in the application. Refer to [applications.<application_name>.routes](#applicationsapplication_nameroutes) for more details.
 
@@ -54,7 +63,8 @@ An object containing parameters for each [application](#applications).
             "endpoint": "http://localhost:7001/openai/deployments/10k/chat/completions",
             "displayName": "Forecast",
             "iconUrl": "https://host/app.svg",
-            "description": "Addon that provides forecast",
+            "description": "Application that provides forecast",
+            "intro": "Get a quick forecast for your data",
             "descriptionKeywords": ["code-gen"],
             "userRoles": [
                 "Forecast"
@@ -82,6 +92,13 @@ An object containing parameters for each [application](#applications).
                 "paramFloat": 0.25
             },
             "interceptors": ["interceptor1", "interceptor2", "interceptor3"],
+            "mcp": {
+                "endpoint": "http://host/mcp",
+                "transport": "http",
+                "allowedTools": ["tool1", "tolol2"],
+                "configDelivery": "meta",
+                "forwardPerRequestKey": true
+            },
             "routes": {
                 "vector_store_query": {
                     "paths": ["/v1/vector_store(/[^/]+)*$"],
@@ -124,14 +141,77 @@ An object containing parameters for each [application](#applications).
     },
 ```
 
+#### applications.<application_name>.interfaces
+
+An optional, typed alternative to the flat `endpoint` field. Both shapes are first-class — choose whichever you prefer per application; there is no migration between them.
+
+Unlike `endpoint`, which is forwarded **verbatim**, an `interfaces` entry declares a `base_url` and DIAL Core forwards each request to `base_url` + **the exact ingress path it was received on**. A trailing slash on `base_url` is normalized. If both `interfaces` and `endpoint` are declared for the chat completions interface, `interfaces` takes precedence.
+
+Applications serve the following interface types:
+
+* `openaiChatCompletions`: the Azure OpenAI ChatCompletions API. Peer of `endpoint`.
+* `openaiResponses`: the OpenAI Responses API. Peer of `responsesEndpoint`.
+* `anthropicMessages`: the Anthropic Messages API.
+
+`interfaces` is the whitelist of what the application serves: an interface it declares with no base URL — and that no legacy field serves — is answered with `503`.
+
+Each value is an object with the following fields:
+
+* `base_url`: The root URL that the matching ingress path is appended to. Optional — the application-level `baseUrl` serves an entry that omits it.
+* `features`: Non-null fields override application-level `features` for this interface only; all other fields inherit, then Core defaults apply. Explicit `false` and empty arrays override inherited values. See [Features per interface](models.md#features-per-interface).
+* `defaultHeaders`: Headers applied to requests for this interface only, laid over the application-level `defaultHeaders`. Refer to [applications.<application_name>.defaultHeaders](#applicationsapplication_namedefaultheaders).
+* `defaults`: Body parameters applied to requests for this interface only. Unlike `defaultHeaders`, the two levels are **not** merged: an entry declaring `defaults` states the whole set and **replaces** the application-level `defaults`, so a key it does not name is not defaulted at all. The application-level `defaults` applies only where the entry declares none. Whatever the source, a default is only a fallback — a parameter the request body already carries is never replaced.
+* `overridePaths`: Per-operation upstream paths that replace the default "base URL + ingress path" routing, working exactly as they do for models. See [Override paths per interface](models.md#override-paths-per-interface).
+
+**Example**
+
+```json
+"applications": {
+    "app-via-interfaces": {
+        "interfaces": {
+            "openaiChatCompletions": { "base_url": "http://localhost:7005" },
+            "openaiResponses": { "base_url": "http://localhost:7005" }
+        }
+    }
+}
+```
+
+#### applications.<application_name>.defaultHeaders
+
+An object of HTTP header names and values DIAL Core adds to a request that does not already carry a header of that name. A header sent by the client always wins, and so does one DIAL Core sets itself (`Api-Key`, `X-DIAL-DEPLOYMENT-ID`, ...). Names are matched case-insensitively.
+
+A default header behaves exactly as if the client had sent it: DIAL Core reads it as part of the incoming request and forwards it to the application under the same rules as a client header. That cuts both ways: a name DIAL Core strips on the way to the application — a hop-by-hop header, `Api-Key`/`x-api-key`, `traceparent`/`tracestate`, or `Authorization` unless `forwardAuthToken` is set — is stripped when it comes from `defaultHeaders` too, even though DIAL Core itself still sees it on the incoming request.
+
+The application-level `defaultHeaders` apply to every interface the application serves. `interfaces.openaiChatCompletions.defaultHeaders` is laid over them for that interface only: a name it repeats is overridden, a new name is added, and every other application-level header still applies.
+
+They are applied once per request, when it enters the application: with `interceptors` configured that is the hop to the first interceptor, from where they travel down the chain. An interceptor's own `defaultHeaders` are applied on the hop that calls it and take precedence over the application's.
+
+**Example**
+
+```json
+"applications": {
+    "app-with-default-headers": {
+        "endpoint": "http://localhost:7001/openai/deployments/10k/chat/completions",
+        "defaultHeaders": {
+            "x-dial-cache-policy": "cache-priority",
+            "x-dial-custom-header": "foo-bar"
+        }
+    }
+}
+```
+
 #### applications.<application_name>.features
 
-Use `features` to specify optional capabilities of the application. Refer to [DIAL Admin](https://docs.dialx.ai/tutorials/admin/entities-applications#features) to learn more about features and the difference between model and app features. The following features are supported:
+> **Effective Parameter Rule**: When `applicationTypeSchemaId` and `applicationProperties` are specified, parameters defined in the corresponding schema will take precedence and will override the corresponding parameters specified in the `application` object.
 
-* `rateEndpoint`: A URL to call a custom rate-estimation API. Use this to compute cost or quota usage based on your own logic (e.g. grouping by tenant, complex billing rules). Exposed by DIAL Core as `<deployment name>/rate`.
-* `tokenizeEndpoint`: A URL to call a custom tokenization service. When you need precise, app-wide token counting (for mixed-model or multi-step prompts) that the model adapter can’t provide. Exposed by DIAL Core as `<deployment name>/tokenize`.
+Use `features` to specify additional capabilities of the application. Refer to [DIAL Admin](https://docs.dialx.ai/tutorials/admin/entities-applications#features) to learn more about features and the difference between model and app features. 
+
+The following features are supported:
+
+* `rateEndpoint`: A URL of a custom rate-estimation API to compute cost or quota usage based on your custom logic (e.g. grouping by tenant, complex billing rules). Exposed by DIAL Core as `<deployment name>/rate`.
+* `tokenizeEndpoint`: A URL to call a custom tokenization service. Can be used if you require precise, app-wide token counting (for mixed-model or multi-step prompts) that the model adapter can’t provide. Exposed by DIAL Core as `<deployment name>/tokenize`.
 * `truncatePromptEndpoint`: A URL to call your own prompt-truncation API. Handy if you implement advanced context-window management (e.g. dynamic summarization) before the actual app call. Exposed by DIAL Core as `<deployment name>/truncate_prompt`.
-* `configurationEndpoint`: A URL to fetch dynamic app-specific settings (e.g. per-tenant max tokens, allowed parameters). Use this to drive runtime overrides from a remote config store. Use to request application configuration parameters as JSON schema. Exposed by DIAL Core as `<deployment name>/configuration`.
+* `configurationEndpoint`: A URL to fetch JSON Schema describing settings of the application. DIAL Core exposes this endpoint to DIAL clients as `GET v1/deployments/<deployment name>/configuration`. DIAL client must provide a JSON value corresponding to the configuration JSON Schema in a chat completion request in the `custom_fields.configuration` field.
 * `systemPromptSupported`: A boolean parameter that enables/disables an initial "system" message injection. Useful for orchestrating multi-step agents where you need to enforce a global policy at the application level. Default is `true`.
 * `toolsSupported`: A boolean parameter that enables/disables tools/functions payloads in API calls. Switch on if your application makes external function calls (e.g. calendar lookup, database fetch). Default is `false`.
 * `seedSupported`: A boolean parameter that enables/disables the `seed` parameter for reproducible results. Great for testing or deterministic pipelines. Disable to ensure randomized creativity. Default is `false`.
@@ -139,7 +219,9 @@ Use `features` to specify optional capabilities of the application. Refer to [DI
 * `folderAttachmentsSupported`: A boolean parameter that enables/disables attachments of folders (batching multiple files). Default is `false`.
 * `accessibleByPerRequestKey`: A boolean parameter that indicates whether the deployment is accessible using a per-request API key. Default is `true`.
 * `contentPartsSupported`: A boolean parameter that indicates whether the deployment supports requests with content parts or not.Default is `false`.
-* `consentRequired`: A boolean parameter that indicates whether the application requires user consent before use.     
+* `consentRequired`: A boolean parameter that indicates whether the application requires user consent before use.
+* `supportCommentInRateResponse`: A boolean parameters that indicates whether the application supports the field `comment` in rate response payload.
+* `reasoningEfforts`: A list of supported `effort` values for chat completions requests (e.g., `low`, `medium`, `high`). An empty list means the deployment does not support the `effort` parameter. Default is `[]`.
 
 **Example**:
 
@@ -159,9 +241,36 @@ Use `features` to specify optional capabilities of the application. Refer to [DI
     },
 ```
 
+#### applications.<application_name>.mcp
+
+Use `mcp` to specify configuration parameters for Model Context Protocol (MCP) interface for the application.
+
+Supported configuration parameters: 
+
+* `endpoint`: The application's MCP endpoint DIAL Core will use to communicate with application.
+* `transport`: Transport used by MCP server for transmitting MCP messages between client and server. `http` by default.
+* `allowedTools`: A list of available tools in the MCP server.
+* `configDelivery`: Determines how application properties are sent to the MCP server. Choose `Header` to deliver application properties in Http header. Choose `Meta` to include application properties in `_meta` field within the MCP message payload.
+* `forwardPerRequestKey`: Set this flag to `true` if you want a per request API key to be forwarded to the MCP Server endpoint allowing it to access files in the DIAL storage.
+
+**Example**:
+
+```json
+"mcp": 
+{
+    "endpoint": "http://host/mcp",
+    "transport": "http",
+    "allowedTools": ["tool1", "tool2"],
+    "configDelivery": "meta",
+    "forwardPerRequestKey": true
+}
+```
+
 #### applications.<application_name>.routes
 
-A list of registered routes in the application. A route is used to proxy requests through DIAL Core to an upstream server. DIAL Core provides capabilities such as rate limiting, role-based authorization, request balancing, and access to DIAL Core resources (LLMs, applications, file storage).
+> **Effective Parameter Rule**: When `applicationTypeSchemaId` and `applicationProperties` are specified, parameters defined in the corresponding schema will take precedence and will override the corresponding parameters specified in the `application` object.
+
+A list of registered routes in the application. Refer to [Routes](./routes.md) for more information.
 
 * `applications.<application_name>.routes.<route_name>.userRoles`: Route is accessible by user roles from this list. If not defined, `userRoles` are inherited from the parent application. If defined, they override the `userRoles` of the parent application.
 * `applications.<application_name>.routes.<route_name>.response`: A pre-configured route's response. If the `response` is set, DIAL Core returns the response immediately. Available values:  

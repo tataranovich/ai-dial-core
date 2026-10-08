@@ -1,27 +1,47 @@
 package com.epam.aidial.core.server.data;
 
+import com.epam.aidial.core.config.LocalizedValue;
+import com.epam.aidial.core.openapi.annotations.ApiSubType;
+import com.epam.aidial.core.openapi.annotations.ApiSubTypes;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.databind.PropertyNamingStrategies;
 import com.fasterxml.jackson.databind.annotation.JsonNaming;
 import lombok.Data;
 
+import java.net.URI;
 import java.util.List;
 import java.util.Map;
 
 @Data
 @JsonInclude(JsonInclude.Include.NON_NULL)
 @JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)
+@ApiSubTypes(
+        discriminatorProperty = "object",
+        value = {
+            @ApiSubType(
+                discriminatorValue = "model",
+                type = ModelData.class
+                ),
+            @ApiSubType(
+                discriminatorValue = "application",
+                type = ApplicationData.class
+                ),
+            @ApiSubType(
+                discriminatorValue = "toolset",
+                type = ToolSetData.class
+                )
+        }
+)
 public class DeploymentData {
     private String id;
     private String model;
-    private String addon;
-    private String assistant;
     private String application;
     private String toolset;
-    private String displayName;
+    private LocalizedValue displayName;
     private String displayVersion;
     private String iconUrl;
-    private String description;
+    private LocalizedValue description;
+    private LocalizedValue intro;
     private String reference;
     private String owner = "organization-owner";
     private String object = "deployment";
@@ -33,6 +53,12 @@ public class DeploymentData {
     private List<String> inputAttachmentTypes;
     private Integer maxInputAttachments;
     private Map<String, Object> defaults;
+    private Map<String, Object> responsesDefaults;
     private List<String> descriptionKeywords;
     private int maxRetryAttempts;
+    private List<String> interfaces;
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    private Map<String, InterfaceConfigData> interfaceConfigs;
+    private URI catalogSchemaId;
+    private Map<String, Object> catalogProperties;
 }

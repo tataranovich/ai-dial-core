@@ -29,4 +29,11 @@ public class ResourceSignInRequest {
 
     @JsonAlias({"apiKey", "api_key"})
     private String apiKey;
+
+    @JsonAlias({"redirectUri", "redirect_uri"})
+    private String redirectUri;
+
+    // Owner opts in to offline (on-behalf-of) use of the stored credential. Required for the OBO retrieval path.
+    @JsonAlias({"offlineUsageConsent", "offline_usage_consent"})
+    private boolean offlineUsageConsent;
 }

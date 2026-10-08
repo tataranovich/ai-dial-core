@@ -3,82 +3,137 @@ package com.epam.aidial.core.server.controller;
 import com.epam.aidial.core.config.Application;
 import com.epam.aidial.core.config.Deployment;
 import com.epam.aidial.core.config.Features;
-import com.epam.aidial.core.config.Interceptor;
+import com.epam.aidial.core.config.InterfaceType;
 import com.epam.aidial.core.config.Model;
-import com.epam.aidial.core.config.Pricing;
-import com.epam.aidial.core.config.Upstream;
+import com.epam.aidial.core.openapi.annotations.ApiOperation;
+import com.epam.aidial.core.openapi.annotations.ApiParameter;
+import com.epam.aidial.core.openapi.annotations.ApiResponse;
+import com.epam.aidial.core.openapi.annotations.ApiSchema;
+import com.epam.aidial.core.openapi.annotations.OpenApiDescriptions;
+import com.epam.aidial.core.openapi.annotations.ParameterIn;
 import com.epam.aidial.core.server.Proxy;
 import com.epam.aidial.core.server.ProxyContext;
 import com.epam.aidial.core.server.data.ApiKeyData;
 import com.epam.aidial.core.server.data.ErrorData;
-import com.epam.aidial.core.server.function.BaseRequestFunction;
-import com.epam.aidial.core.server.function.BuildUpstreamCacheFn;
-import com.epam.aidial.core.server.function.CollectRequestApplicationFilesFn;
-import com.epam.aidial.core.server.function.CollectRequestChatCompletionAttachmentsFn;
-import com.epam.aidial.core.server.function.CollectRequestDataFn;
-import com.epam.aidial.core.server.function.CollectToolSetsFn;
-import com.epam.aidial.core.server.function.enhancement.ApplyDefaultDeploymentSettingsFn;
-import com.epam.aidial.core.server.function.enhancement.EnhanceAssistantRequestFn;
-import com.epam.aidial.core.server.function.enhancement.EnhanceModelRequestFn;
+import com.epam.aidial.core.server.function.request.ChatCompletionRequest;
+import com.epam.aidial.core.server.function.request.RequestObject;
 import com.epam.aidial.core.server.limiter.RateLimitResult;
 import com.epam.aidial.core.server.service.PermissionDeniedException;
-import com.epam.aidial.core.server.token.TokenUsage;
-import com.epam.aidial.core.server.token.TokenUsageParser;
-import com.epam.aidial.core.server.upstream.UpstreamRoute;
+import com.epam.aidial.core.server.tracing.GenAiTraceAttributes;
+import com.epam.aidial.core.server.util.DeploymentEndpointUtil;
 import com.epam.aidial.core.server.util.ProxyUtil;
-import com.epam.aidial.core.server.vertx.stream.BufferingReadStream;
 import com.epam.aidial.core.storage.exception.ResourceNotFoundException;
 import com.epam.aidial.core.storage.http.HttpException;
 import com.epam.aidial.core.storage.http.HttpStatus;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.common.annotations.VisibleForTesting;
-import io.netty.buffer.ByteBufInputStream;
 import io.vertx.core.Future;
-import io.vertx.core.MultiMap;
 import io.vertx.core.buffer.Buffer;
-import io.vertx.core.http.HttpClientRequest;
-import io.vertx.core.http.HttpClientResponse;
 import io.vertx.core.http.HttpHeaders;
-import io.vertx.core.http.HttpServerRequest;
-import io.vertx.core.http.HttpServerResponse;
-import io.vertx.core.http.RequestOptions;
-import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.Strings;
 
-import java.io.InputStream;
 import java.util.List;
-import java.util.Map;
-import java.util.Objects;
-import java.util.Set;
 
-import static com.epam.aidial.core.server.Proxy.HEADER_APPLICATION_ID;
-import static com.epam.aidial.core.server.Proxy.HEADER_APPLICATION_PROPERTIES;
+import static com.epam.aidial.core.server.Proxy.HEADER_CACHE_POLICY;
+import static com.epam.aidial.core.server.Proxy.HEADER_UPSTREAM_ID;
 
 @Slf4j
-public class DeploymentPostController extends BaseDeploymentPostController {
-
-    private static final Set<Integer> DEFAULT_RETRIABLE_HTTP_CODES = Set.of(HttpStatus.TOO_MANY_REQUESTS.getCode(),
-            HttpStatus.BAD_GATEWAY.getCode(), HttpStatus.GATEWAY_TIMEOUT.getCode(),
-            HttpStatus.SERVICE_UNAVAILABLE.getCode());
-
-    private final List<BaseRequestFunction<ObjectNode>> enhancementFunctions;
+public class DeploymentPostController extends BaseChatCompletionController {
 
     public DeploymentPostController(Proxy proxy, ProxyContext context) {
         super(proxy, context);
-        this.enhancementFunctions = List.of(new CollectRequestChatCompletionAttachmentsFn(proxy, context),
-                new CollectRequestDataFn(proxy, context),
-                new ApplyDefaultDeploymentSettingsFn(proxy, context),
-                new EnhanceAssistantRequestFn(proxy, context),
-                new EnhanceModelRequestFn(proxy, context),
-                new CollectRequestApplicationFilesFn(proxy, context),
-                new BuildUpstreamCacheFn(proxy, context),
-                new CollectToolSetsFn(proxy, context));
     }
 
-    public Future<?> handle(String deploymentId, String deploymentApi) {
+    @ApiOperation(
+            method = "POST",
+            path = "/openai/deployments/{deployment_name}/completions",
+            operationId = "createCompletion",
+            tags = {"LLM"},
+            parameters = {
+                    @ApiParameter(name = "deployment_name", in = ParameterIn.PATH, required = true,
+                            description = OpenApiDescriptions.DEPLOYMENT_NAME),
+                    @ApiParameter(name = "api-version", in = ParameterIn.QUERY, required = true,
+                            description = OpenApiDescriptions.API_VERSION, example = "2024-10-21"),
+                    @ApiParameter(name = "Content-Type", in = ParameterIn.HEADER, required = true,
+                            description = "Must be application/json", schema = String.class),
+                    @ApiParameter(name = HEADER_CACHE_POLICY, in = ParameterIn.HEADER,
+                            description = OpenApiDescriptions.CACHE_POLICY,
+                            allowableValues = {"availability-priority", "cache-priority"}),
+                    @ApiParameter(name = HEADER_UPSTREAM_ID, in = ParameterIn.HEADER,
+                            description = OpenApiDescriptions.UPSTREAM_ID)
+            },
+            responses = {
+                    @ApiResponse(code = 200, description = "Success", body = @ApiSchema(schemaRef = "CreateChatCompletionResponse"), contentTypes = {"application/json"}),
+                    @ApiResponse(code = 200, description = "Success", body = @ApiSchema(schemaRef = "CreateChatCompletionStreamResponse"), contentTypes = {"text/event-stream"}),
+                    @ApiResponse(code = 400),
+                    @ApiResponse(code = 403),
+                    @ApiResponse(code = 404),
+                    @ApiResponse(code = 415),
+                    @ApiResponse(code = 429, description = "Rate limit exceeded", body = @ApiSchema(implementation = ErrorData.class)),
+                    @ApiResponse(code = 500),
+                    @ApiResponse(code = 502, description = "Bad Gateway - failed to connect to upstream server", body = @ApiSchema(implementation = ErrorData.class)),
+                    @ApiResponse(code = 503)
+            })
+    @ApiOperation(
+            method = "POST",
+            path = "/openai/deployments/{deployment_name}/chat/completions",
+            operationId = "sendChatCompletionRequest",
+            tags = {"LLM"},
+            requestBody = @ApiSchema(schemaRef = "ChatCompletionRequest"),
+            parameters = {
+                    @ApiParameter(name = "deployment_name", in = ParameterIn.PATH, required = true,
+                            description = OpenApiDescriptions.DEPLOYMENT_NAME),
+                    @ApiParameter(name = "api-version", in = ParameterIn.QUERY, required = true,
+                            description = OpenApiDescriptions.API_VERSION, example = "2024-10-21"),
+                    @ApiParameter(name = "Content-Type", in = ParameterIn.HEADER, required = true,
+                            description = "Must be application/json"),
+                    @ApiParameter(name = HEADER_CACHE_POLICY, in = ParameterIn.HEADER,
+                            description = OpenApiDescriptions.CACHE_POLICY,
+                            allowableValues = {"availability-priority", "cache-priority"}),
+                    @ApiParameter(name = HEADER_UPSTREAM_ID, in = ParameterIn.HEADER,
+                            description = OpenApiDescriptions.UPSTREAM_ID)
+            },
+            responses = {
+                    @ApiResponse(code = 200, description = "Success", body = @ApiSchema(schemaRef = "CreateChatCompletionResponse")),
+                    @ApiResponse(code = 200, description = "Success", body = @ApiSchema(schemaRef = "CreateChatCompletionStreamResponse"), contentTypes = {"text/event-stream"}),
+                    @ApiResponse(code = 400),
+                    @ApiResponse(code = 403),
+                    @ApiResponse(code = 404),
+                    @ApiResponse(code = 415),
+                    @ApiResponse(code = 429, description = "Rate limit exceeded", body = @ApiSchema(implementation = ErrorData.class)),
+                    @ApiResponse(code = 500),
+                    @ApiResponse(code = 502, description = "Bad Gateway - failed to connect to upstream server", body = @ApiSchema(implementation = ErrorData.class)),
+                    @ApiResponse(code = 503)
+            })
+    @ApiOperation(
+            method = "POST",
+            path = "/openai/deployments/{deployment_name}/embeddings",
+            operationId = "createEmbedding",
+            tags = {"LLM"},
+            requestBody = @ApiSchema(schemaRef = "EmbeddingsRequest"),
+            parameters = {
+                    @ApiParameter(name = "deployment_name", in = ParameterIn.PATH, required = true,
+                            description = OpenApiDescriptions.DEPLOYMENT_NAME),
+                    @ApiParameter(name = "api-version", in = ParameterIn.QUERY, required = true,
+                            description = OpenApiDescriptions.API_VERSION, example = "2023-12-01-preview"),
+                    @ApiParameter(name = "Content-Type", in = ParameterIn.HEADER, required = true,
+                            description = "Must be application/json")
+            },
+            responses = {
+                    @ApiResponse(code = 200, description = "Success", body = @ApiSchema(schemaRef = "EmbeddingResponse")),
+                    @ApiResponse(code = 400),
+                    @ApiResponse(code = 403),
+                    @ApiResponse(code = 404),
+                    @ApiResponse(code = 415),
+                    @ApiResponse(code = 429, description = "Rate limit exceeded", body = @ApiSchema(implementation = ErrorData.class)),
+                    @ApiResponse(code = 500),
+                    @ApiResponse(code = 502, description = "Bad Gateway - failed to connect to upstream server", body = @ApiSchema(implementation = ErrorData.class)),
+                    @ApiResponse(code = 503)
+            })
+    public Future<?> handle(String deploymentId) {
         String contentType = context.getRequest().getHeader(HttpHeaders.CONTENT_TYPE);
-        if (!StringUtils.containsIgnoreCase(contentType, Proxy.HEADER_CONTENT_TYPE_APPLICATION_JSON)) {
+        if (!Strings.CI.contains(contentType, Proxy.HEADER_CONTENT_TYPE_APPLICATION_JSON)) {
             return respond(HttpStatus.UNSUPPORTED_MEDIA_TYPE, "Only application/json is supported");
         }
         // handle a special deployment `interceptor`
@@ -87,17 +142,17 @@ public class DeploymentPostController extends BaseDeploymentPostController {
             int nextIndex = context.getApiKeyData().getInterceptorIndex() + 1;
             return handleInterceptor(nextIndex);
         }
-        return handleDeployment(deploymentId, deploymentApi);
+        return handleDeployment(deploymentId);
     }
 
-    private Future<?> handleDeployment(String deploymentId, String deploymentApi) {
+    private Future<?> handleDeployment(String deploymentId) {
         return proxy.getTaskExecutor().submit(() -> proxy.getDeploymentService().findDeployment(context, deploymentId))
                 .compose(dep -> proxy.getTaskExecutor().submit(() -> {
-                    proxy.getConsentService().verifyUserConsent(context, dep);
+                    proxy.getConsentService().verifyUserConsent(context, dep, requestedInterface());
                     return dep;
                 }))
                 .map(dep -> {
-                    Features features = dep.getFeatures();
+                    Features features = dep.resolveFeatures(requestedInterface());
                     boolean isPerRequestKey = context.getApiKeyData().getPerRequestKey() != null;
                     if (features != null && Boolean.FALSE.equals(features.getAccessibleByPerRequestKey()) && isPerRequestKey) {
                         throw new PermissionDeniedException(String.format("Deployment %s is not accessible by %s", deploymentId, context.getApiKeyData().getSourceDeployment()));
@@ -107,17 +162,20 @@ public class DeploymentPostController extends BaseDeploymentPostController {
                         dep = proxy.getApplicationSchemaService().modifyEndpointsForCustomApplication(app);
                     }
 
-                    if (dep.getEndpoint() == null) {
+                    if (DeploymentEndpointUtil.resolveServingEndpoint(dep, requestedInterface(),
+                            context.getConfig().getTranslators()) == null) {
                         throw new HttpException(HttpStatus.SERVICE_UNAVAILABLE, "");
                     }
 
                     context.setTraceOperation("Send request to %s deployment".formatted(dep.getName()));
                     context.setDeployment(dep);
+                    List<String> interceptors = proxy.getDeploymentService().getInterceptors(context, dep);
+                    context.setInterceptors(interceptors);
                     return dep;
                 })
                 .compose(dep -> {
                     if (dep instanceof Model && !context.hasNextInterceptor()) {
-                        return proxy.getRateLimiter().limit(context, dep);
+                        return checkLimits(dep);
                     } else {
                         return Future.succeededFuture(RateLimitResult.SUCCESS);
                     }
@@ -127,8 +185,6 @@ public class DeploymentPostController extends BaseDeploymentPostController {
                     if (rateLimitResult.status() == HttpStatus.OK) {
                         if (context.hasNextInterceptor()) {
                             context.setInitialDeployment(deploymentId);
-                            context.setInitialDeploymentApi(deploymentApi);
-                            context.setInterceptors(context.getDeployment().getInterceptors());
                             future = handleInterceptor(0);
                         } else {
                             future = handleRateLimitSuccess();
@@ -146,28 +202,11 @@ public class DeploymentPostController extends BaseDeploymentPostController {
     }
 
     private Future<?> handleInterceptor(int interceptorIndex) {
-        ApiKeyData apiKeyData = context.getApiKeyData();
         List<String> interceptors = context.getInterceptors();
         if (interceptorIndex < interceptors.size()) {
-            String interceptorName = interceptors.get(interceptorIndex);
-            Interceptor interceptor = context.getConfig().getInterceptors().get(interceptorName);
-            if (interceptor == null) {
-                log.warn("Interceptor is not found for the given name: {}", interceptorName);
-                return respond(HttpStatus.NOT_FOUND, "Interceptor is not found");
-            }
-            context.setTraceOperation("Send request to %s interceptor".formatted(interceptorName));
-            context.setDeployment(interceptor);
-            ApiKeyData proxyApiKeyData = new ApiKeyData();
-            proxyApiKeyData.setInterceptorIndex(interceptorIndex);
-            proxyApiKeyData.setInterceptors(interceptors);
-            proxyApiKeyData.setInitialDeployment(context.getInitialDeployment());
-            proxyApiKeyData.setInitialDeploymentApi(context.getInitialDeploymentApi());
-            setupProxyApiKeyData(proxyApiKeyData);
-
-            InterceptorController controller = new InterceptorController(proxy, context);
-            return controller.handle();
+            return new ChatCompletionInterceptorController(proxy, context, interceptorIndex, requestedInterface()).handle();
         } else { // all interceptors are completed we should call the initial deployment
-            return handleDeployment(apiKeyData.getInitialDeployment(), apiKeyData.getInitialDeploymentApi());
+            return handleDeployment(context.getApiKeyData().getInitialDeployment());
         }
     }
 
@@ -210,44 +249,24 @@ public class DeploymentPostController extends BaseDeploymentPostController {
     }
 
     private void handleRateLimitHit(String deploymentId, RateLimitResult result) {
-        // Returning an error similar to the Azure format.
-        ErrorData rateLimitError = new ErrorData();
-        rateLimitError.getError().setCode(String.valueOf(result.status().getCode()));
-        rateLimitError.getError().setMessage(result.errorMessage());
-        rateLimitError.getError().setDisplayMessage(result.displayErrorMessage());
-
-        String errorMessage = ProxyUtil.convertToString(rateLimitError);
-        HttpException httpException;
-        if (result.replyAfterSeconds() >= 0) {
-            Map<String, String> headers = Map.of(HttpHeaders.RETRY_AFTER.toString(), Long.toString(result.replyAfterSeconds()));
-            httpException = new HttpException(result.status(), errorMessage, headers);
-        } else {
-            httpException = new HttpException(result.status(), errorMessage);
+        try {
+            result.throwIfError();
+        } catch (HttpException e) {
+            respond(e);
+            log.warn("Rate limit error {}. Deployment: {}", result.errorMessage(), deploymentId);
         }
-
-        respond(httpException);
-        log.warn("Rate limit error {}. Deployment: {}", result.errorMessage(), deploymentId);
     }
 
-    @SneakyThrows
-    private void sendRequest() {
-        UpstreamRoute route = context.getUpstreamRoute();
-        HttpServerRequest request = context.getRequest();
-
-        Upstream upstream = route.get();
-        Objects.requireNonNull(upstream);
-
-        String uri = buildUri(context);
-        RequestOptions options = new RequestOptions()
-                .setAbsoluteURI(uri)
-                .setMethod(request.method())
-                .setTraceOperation(context.getTraceOperation())
-                .setConnectTimeout(context.getProxy().getClientOptions().getConnectTimeout())
-                .setIdleTimeout(context.getProxy().getClientOptions().getIdleTimeout());
-
-        proxy.getClient().request(options)
-                .onSuccess(this::handleProxyRequest)
-                .onFailure(this::handleProxyConnectionError);
+    /**
+     * The interface the request path targets. Read from the path rather than from a named group in
+     * {@code RouteTemplate.POST_DEPLOYMENT}: named groups become placeholders in the server span name,
+     * which would stop telling the three actions apart.
+     */
+    @Override
+    protected InterfaceType requestedInterface() {
+        return context.getRequest().path().endsWith("/embeddings")
+                ? InterfaceType.OPENAI_EMBEDDINGS
+                : InterfaceType.OPENAI_CHAT_COMPLETIONS;
     }
 
     @VisibleForTesting
@@ -259,12 +278,11 @@ public class DeploymentPostController extends BaseDeploymentPostController {
         context.setRequestBody(requestBody);
         context.setRequestBodyTimestamp(System.currentTimeMillis());
 
-        try (InputStream stream = new ByteBufInputStream(requestBody.getByteBuf())) {
-            ObjectNode tree = (ObjectNode) ProxyUtil.MAPPER.readTree(stream);
-            if (ProxyUtil.processChain(tree, enhancementFunctions)) {
-                context.setRequestBody(Buffer.buffer(ProxyUtil.MAPPER.writeValueAsBytes(tree)));
-            }
-            proxy.getApiKeyStore().assignPerRequestApiKey(context.getProxyApiKeyData());
+        try {
+            ObjectNode requestTree = ProxyUtil.parseObject(requestBody);
+            RequestObject request = new ChatCompletionRequest(requestTree);
+            GenAiTraceAttributes.setRequestAttributes(context, requestedInterface(), requestTree);
+            processChatCompletionsRequestBody(request);
         } catch (Throwable e) {
             if (e instanceof HttpException httpException) {
                 respond(httpException.getStatus(), httpException.getMessage());
@@ -272,268 +290,18 @@ public class DeploymentPostController extends BaseDeploymentPostController {
                 respond(HttpStatus.BAD_REQUEST);
             }
             log.warn("Can't process JSON request body. Error:", e);
-            return;
-        }
-
-        UpstreamRoute upstreamRoute = proxy.getUpstreamRouteProvider().get(deployment, context.getCacheBreakpointContext());
-        if (!canRetry(upstreamRoute)) {
-            return;
-        }
-        context.setUpstreamRoute(upstreamRoute);
-
-        sendRequest();
-    }
-
-    /**
-     * Called when proxy connected to the origin.
-     */
-    @VisibleForTesting
-    void handleProxyRequest(HttpClientRequest proxyRequest) {
-        log.info("Connected to origin. Deployment: {}. Address: {}",
-                context.getDeployment().getName(),
-                proxyRequest.connection().remoteAddress());
-
-        HttpServerRequest request = context.getRequest();
-        context.setProxyRequest(proxyRequest);
-        context.setProxyConnectTimestamp(System.currentTimeMillis());
-
-        Deployment deployment = context.getDeployment();
-        MultiMap excludeHeaders = MultiMap.caseInsensitiveMultiMap();
-        if (!deployment.isForwardAuthToken()) {
-            excludeHeaders.add(HttpHeaders.AUTHORIZATION, "whatever");
-        }
-        excludeHeaders.add(HEADER_APPLICATION_PROPERTIES, "whatever");
-        excludeHeaders.add(HEADER_APPLICATION_ID, "whatever");
-
-        ProxyUtil.copyHeaders(request.headers(), proxyRequest.headers(), excludeHeaders);
-
-        ApiKeyData proxyApiKeyData = context.getProxyApiKeyData();
-        proxyRequest.headers().add(Proxy.HEADER_API_KEY, proxyApiKeyData.getPerRequestKey());
-
-        if (context.getDeployment() instanceof Model model && !model.getUpstreams().isEmpty()) {
-            Upstream upstream = Objects.requireNonNull(context.getUpstreamRoute().get());
-            proxyRequest.putHeader(Proxy.HEADER_UPSTREAM_ENDPOINT, upstream.getEndpoint());
-            proxyRequest.putHeader(Proxy.HEADER_UPSTREAM_KEY, upstream.getKey());
-            proxyRequest.putHeader(Proxy.HEADER_UPSTREAM_EXTRA_DATA, upstream.getExtraData());
-            proxyRequest.putHeader(Proxy.HEADER_CACHE_BREAKPOINT_PATH, context.getUpstreamRoute().getBreakpointPath());
-            proxyRequest.putHeader(Proxy.HEADER_CACHE_EXTRA_METADATA, context.getUpstreamRoute().getExtraMetadata());
-        }
-
-        if ((deployment instanceof Application application && application.hasApplicationTypeSchemaId())) {
-            proxyRequest.putHeader(HEADER_APPLICATION_ID, deployment.getName());
-
-            proxy.getApplicationSchemaService().consumeMetadataProperties(application, (properties, appendApplicationPropertiesHeader) -> {
-                if (appendApplicationPropertiesHeader) {
-                    String propsString = ProxyUtil.MAPPER.writeValueAsString(properties);
-                    proxyRequest.putHeader(HEADER_APPLICATION_PROPERTIES, propsString);
-                }
-            });
-        }
-
-        Buffer requestBody = context.getRequestBody();
-        proxyRequest.putHeader(HttpHeaders.CONTENT_LENGTH, Integer.toString(requestBody.length()));
-        context.getRequestHeaders().forEach(proxyRequest::putHeader);
-
-        proxyRequest.send(requestBody)
-                .onSuccess(this::handleProxyResponse)
-                .onFailure(this::handleProxyResponseError);
-    }
-
-    /**
-     * Called when proxy received the response headers from the origin.
-     */
-    private void handleProxyResponse(HttpClientResponse proxyResponse) {
-        UpstreamRoute upstreamRoute = context.getUpstreamRoute();
-        Upstream currentUpstream = upstreamRoute.get();
-        log.info("Received header from origin. Deployment: {}. Endpoint: {}. Upstream: {}. Status: {}. Headers: {}. Upstream.extraData: {}",
-                context.getDeployment().getName(),
-                context.getDeployment().getEndpoint(), currentUpstream == null ? "N/A" : currentUpstream.getEndpoint(),
-                proxyResponse.statusCode(), proxyResponse.headers().size(), currentUpstream == null ? "N/A" : currentUpstream.getExtraData());
-
-        int responseStatusCode = proxyResponse.statusCode();
-        if (isRetriableError(responseStatusCode)) {
-            upstreamRoute.fail(proxyResponse);
-            // get next upstream
-            if (canRetry(upstreamRoute)) {
-                sendRequest(); // try next
-            }
-            return;
-        }
-
-        if (responseStatusCode == 200) {
-            upstreamRoute.succeed(proxyResponse, context.getDeployment());
-        } else if (!HttpStatus.fromStatusCode(responseStatusCode).is4xx()) {
-            // mark the upstream as failed
-            // and the next time we will select another one
-            upstreamRoute.fail(proxyResponse);
-        }
-
-        BufferingReadStream responseStream = createResponseStream(proxyResponse);
-
-        context.setProxyResponse(proxyResponse);
-        context.setProxyResponseTimestamp(System.currentTimeMillis());
-        context.setResponseStream(responseStream);
-
-        HttpServerResponse response = context.getResponse();
-
-        response.setChunked(true);
-        response.setStatusCode(proxyResponse.statusCode());
-
-        ProxyUtil.copyHeaders(proxyResponse.headers(), response.headers());
-        response.putHeader(Proxy.HEADER_UPSTREAM_ATTEMPTS, Integer.toString(upstreamRoute.getAttemptCount()));
-
-        responseStream.pipe()
-                .endOnFailure(false)
-                .endOnSuccess(false)
-                .to(response)
-                .onSuccess(ignored -> handleResponse(responseStream))
-                .onFailure(error -> handleResponseError(error, responseStream));
-    }
-
-    private boolean isRetriableError(int statusCode) {
-        return DEFAULT_RETRIABLE_HTTP_CODES.contains(statusCode) || context.getConfig().getRetriableErrorCodes().contains(statusCode);
-    }
-
-    /**
-     * Called when proxy sent response from the origin to the client.
-     */
-    @VisibleForTesting
-    void handleResponse(BufferingReadStream responseStream) {
-        Buffer responseBody = context.getResponseStream().getContent();
-        context.setResponseBody(responseBody);
-        context.setResponseBodyTimestamp(System.currentTimeMillis());
-        Future<TokenUsage> tokenUsageFuture = collectTokenUsage(responseBody);
-
-        Future<Void> handleResponseFuture = tokenUsageFuture.transform(result -> {
-            if (result.failed()) {
-                log.warn("Failed to collect token usage", result.cause());
-            }
-            return collectResponseAttachments(responseBody);
-        });
-
-        handleResponseFuture.onComplete(result -> {
-            if (result.failed()) {
-                log.warn("Failed to collect attachments from response", result.cause());
-            }
-            completeProxyResponse(responseStream);
-        });
-    }
-
-    private Future<TokenUsage> collectTokenUsage(Buffer responseBody) {
-        Future<TokenUsage> tokenUsageFuture = Future.succeededFuture();
-        if (context.getDeployment() instanceof Model model) {
-            if (context.getResponse().getStatusCode() == HttpStatus.OK.getCode()) {
-                TokenUsage tokenUsage = TokenUsageParser.parse(responseBody);
-                if (tokenUsage == null) {
-                    Pricing pricing = model.getPricing();
-                    if (pricing == null || "token".equals(pricing.getUnit())) {
-                        Upstream currentUpstream = context.getUpstreamRoute().get();
-                        log.warn("Can't find token usage. Deployment: {}. Endpoint: {}. Upstream: {}. Length: {}. Upstream.extraData: {}",
-                                context.getDeployment().getName(),
-                                context.getDeployment().getEndpoint(),
-                                currentUpstream == null ? "N/A" : currentUpstream.getEndpoint(),
-                                context.getResponseBody().length(),
-                                currentUpstream == null ? "N/A" : currentUpstream.getExtraData());
-                    }
-                    tokenUsage = new TokenUsage();
-                }
-                context.setTokenUsage(tokenUsage);
-                tokenUsageFuture = proxy.getRateLimiter().increase(context, context.getDeployment())
-                    .transform(result -> {
-                        if (result.failed()) {
-                            log.warn("Failed to increase limit", result.cause());
-                        }
-                        return proxy.getTokenStatsTracker().updateModelStats(context);
-                    });
-            }
-        } else {
-            tokenUsageFuture = proxy.getTokenStatsTracker().getTokenStats(context).andThen(result -> context.setTokenUsage(result.result()));
-        }
-        return tokenUsageFuture;
-    }
-
-    private void completeProxyResponse(BufferingReadStream responseStream) {
-        HttpServerResponse response = context.getResponse();
-        responseStream.end(response);
-
-        proxy.getLogStore().save(context);
-        Upstream currentUpstream = context.getUpstreamRoute().get();
-        log.info("Sent response to client. Deployment: {}. Endpoint: {}. Upstream: {}. Length: {}."
-                        + " Timing: {} (body={}, connect={}, header={}, body={}). Tokens: {}. Upstream.extraData: {}",
-                context.getDeployment().getName(),
-                context.getDeployment().getEndpoint(),
-                currentUpstream == null ? "N/A" : currentUpstream.getEndpoint(),
-                context.getResponseBody().length(),
-                context.getResponseBodyTimestamp() - context.getRequestTimestamp(),
-                context.getRequestBodyTimestamp() - context.getRequestTimestamp(),
-                context.getProxyConnectTimestamp() - context.getRequestBodyTimestamp(),
-                context.getProxyResponseTimestamp() - context.getProxyConnectTimestamp(),
-                context.getResponseBodyTimestamp() - context.getProxyResponseTimestamp(),
-                context.getTokenUsage() == null ? "N/A" : context.getTokenUsage(),
-                currentUpstream == null ? "N/A" : currentUpstream.getExtraData());
-
-        finalizeRequest();
-    }
-
-    /**
-     * Called when proxy failed to receive response header from origin.
-     */
-    private void handleProxyResponseError(Throwable error) {
-        UpstreamRoute upstreamRoute = context.getUpstreamRoute();
-        // for 5xx errors we use exponential backoff strategy, so passing retryAfterSeconds parameter makes no sense
-        upstreamRoute.fail(HttpStatus.BAD_GATEWAY);
-        log.warn("Proxy failed to receive response header from origin. Deployment: {}. Address: {}. Error:",
-                context.getDeployment().getName(),
-                context.getProxyRequest().connection().remoteAddress(),
-                error);
-        if (canRetry(upstreamRoute)) {
-            sendRequest(); // try next
         }
     }
 
     /**
-     * Called when proxy failed to send response to the client.
+     * Whether the current request/response is on the chat-completions shape, as opposed to
+     * {@code /completions} or {@code /embeddings} which this controller also serves.
      */
-    private void handleResponseError(Throwable error, BufferingReadStream responseStream) {
-        context.getResponse().reset();     // drop connection, so that partial client response won't seem complete
-        log.warn("Can't send response to client. Error:", error);
-        Deployment deployment = context.getDeployment();
-        if (deployment instanceof Model) {
-            // make sure we collect token usage in case if client accidentally closed the connection
-            responseStream.endStreamFuture()
-                    .onFailure(ignore -> {
-                        context.getProxyRequest().reset(); // drop connection to stop origin response
-                    })
-                    .compose(ignore -> {
-                        Buffer responseBody = context.getResponseStream().getContent();
-                        context.setResponseBody(responseBody);
-                        context.setResponseBodyTimestamp(System.currentTimeMillis());
-                        return collectTokenUsage(responseBody);
-                    })
-                    .onSuccess(ignored -> proxy.getLogStore().save(context))
-                    .onComplete(ignored -> finalizeRequest());
-        } else {
-            // drop connection to stop application responding
-            context.getProxyRequest().reset();
-        }
-    }
-
-    private static String buildUri(ProxyContext context) {
-        HttpServerRequest request = context.getRequest();
-        Deployment deployment = context.getDeployment();
-        String endpoint = deployment.getEndpoint();
-        String query = request.query();
-        return endpoint + (query == null ? "" : "?" + query);
-    }
-
-    private boolean canRetry(UpstreamRoute route) {
-        try {
-            route.next();
-        } catch (HttpException e) {
-            respond(e);
-            log.warn("No route. Deployment: {}", context.getDeployment().getName());
-            return false;
-        }
-        return true;
+    @Override
+    protected boolean isChatCompletionsPath() {
+        String uri = context.getRequest().uri();
+        int queryIndex = uri.indexOf('?');
+        String path = queryIndex < 0 ? uri : uri.substring(0, queryIndex);
+        return path.endsWith("/chat/completions");
     }
 }

@@ -5,11 +5,17 @@ import com.epam.aidial.core.server.util.ProxyUtil;
 import com.epam.aidial.core.server.util.ResourceDescriptorFactory;
 import com.epam.aidial.core.storage.resource.ResourceDescriptor;
 import com.epam.aidial.core.storage.util.EtagHeader;
+import com.epam.aidial.core.storage.util.UrlUtil;
 import io.vertx.core.http.HttpMethod;
+import io.vertx.core.json.JsonObject;
 import lombok.extern.slf4j.Slf4j;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 
@@ -19,6 +25,64 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @Slf4j
 class ResourceApiTest extends ResourceBaseTest {
+
+    @Test
+    void testEncodedDecodedNextToken() {
+        int total = 100;
+        Set<String> expected = new HashSet<>();
+        for (int i = 0; i < total; i++) {
+            Response response = resourceRequest(HttpMethod.PUT, "/folder/conversation%20" + i, CONVERSATION_BODY_1);
+            assertEquals(response.status(), 200);
+            expected.add("conversation " + i);
+        }
+
+        String path = "/v1/metadata/conversations/" + bucket + "/folder/";
+        Set<String> actual = new HashSet<>();
+        String token = null;
+        do {
+            String queryParams = token == null ? "limit=10" : "limit=10&token=" + token;
+            Response response = send(HttpMethod.GET, path, queryParams, "");
+            verify(response, 200);
+
+            JsonObject body = new JsonObject(response.body());
+            for (Object item : body.getJsonArray("items")) {
+                actual.add(((JsonObject) item).getString("name"));
+            }
+            // nextToken is an opaque value - the caller must percent-encode it like any other query parameter
+            String nextToken = body.getString("nextToken");
+            token = nextToken == null ? null : URLEncoder.encode(nextToken, StandardCharsets.UTF_8);
+        } while (token != null);
+
+        assertEquals(expected, actual);
+    }
+
+    @Test
+    void testEncodedDecodedNextToken2() {
+        // "+" is a legal path character, so path encoding leaves it as is,
+        // but the query parser rewrites it into a space when the token comes back
+        verifySecondPage("plus", "a+1", "a+2");
+        // "%" is escaped by path encoding, so decoding the token twice (as a query param and as a path) loses it
+        verifySecondPage("percent", "b%2520x", "b%2520y");
+    }
+
+    private void verifySecondPage(String folder, String first, String second) {
+        verify(resourceRequest(HttpMethod.PUT, "/" + folder + "/" + first, CONVERSATION_BODY_1), 200);
+        verify(resourceRequest(HttpMethod.PUT, "/" + folder + "/" + second, CONVERSATION_BODY_1), 200);
+
+        String path = "/v1/metadata/conversations/" + bucket + "/" + folder + "/";
+        Response page1 = send(HttpMethod.GET, path, "limit=1", "");
+        verify(page1, 200);
+
+        String token = new JsonObject(page1.body()).getString("nextToken");
+        assertNotNull(token);
+
+        // the client sends the token back exactly as it was given, as an opaque value
+        Response page2 = send(HttpMethod.GET, path, "limit=1&token=" + token, "");
+        verify(page2, 200);
+
+        JsonObject item = new JsonObject(page2.body()).getJsonArray("items").getJsonObject(0);
+        assertEquals(UrlUtil.decodePath(second), item.getString("name"));
+    }
 
     @Test
     void testWorkflow() {
@@ -85,7 +149,8 @@ class ResourceApiTest extends ResourceBaseTest {
                   "url" : "conversations/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/folder/conversation",
                   "action" : "CREATE",
                   "timestamp" : "@ignore",
-                  "etag" : "\\"70edd26b3686de5efcdae93fcc87c2bb\\""
+                  "etag" : "\\"7c2fb99c2a57e8f50360f659f9f8a163\\"",
+                  "senderPodId" : "@ignore"
                 }
                 """, events.take());
 
@@ -94,7 +159,8 @@ class ResourceApiTest extends ResourceBaseTest {
                   "url" : "conversations/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/folder/conversation",
                   "action" : "UPDATE",
                   "timestamp" : "@ignore",
-                  "etag" : "\\"82833ed7a10a4f99253fccdef4091ad9\\""
+                  "etag" : "\\"9295391fd4aab5bd32f63749b228b3f5\\"",
+                  "senderPodId" : "@ignore"
                 }
                 """, events.take());
 
@@ -102,7 +168,8 @@ class ResourceApiTest extends ResourceBaseTest {
                 {
                   "url" : "conversations/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/folder/conversation",
                   "action" : "DELETE",
-                  "timestamp" : "@ignore"
+                  "timestamp" : "@ignore",
+                  "senderPodId" : "@ignore"
                 }
                 """, events.take());
 
@@ -115,34 +182,168 @@ class ResourceApiTest extends ResourceBaseTest {
         verify(response, 404, "Not found: conversations/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/folder/conversation");
 
         response = resourceRequest(HttpMethod.PUT, "/folder/conversation", CONVERSATION_BODY_1);
-        verifyNotExact(response, 200, "\"etag\":\"\\\"70edd26b3686de5efcdae93fcc87c2bb\\\"\"");
-        assertEquals("\"70edd26b3686de5efcdae93fcc87c2bb\"", response.headers().get("etag"));
+        verifyNotExact(response, 200, "\"etag\":\"\\\"7c2fb99c2a57e8f50360f659f9f8a163\\\"\"");
+        assertEquals("\"7c2fb99c2a57e8f50360f659f9f8a163\"", response.headers().get("etag"));
         assertEquals("etag", response.headers().get("access-control-expose-headers"));
 
         response = resourceRequest(HttpMethod.GET, "/folder/conversation", CONVERSATION_BODY_1);
         verify(response, 200);
-        assertEquals("\"70edd26b3686de5efcdae93fcc87c2bb\"", response.headers().get("etag"));
+        assertEquals("\"7c2fb99c2a57e8f50360f659f9f8a163\"", response.headers().get("etag"));
         assertEquals("etag", response.headers().get("access-control-expose-headers"));
 
         response = metadata("/folder/conversation");
-        verifyNotExact(response, 200, "\"etag\":\"\\\"70edd26b3686de5efcdae93fcc87c2bb\\\"\"");
+        verifyNotExact(response, 200, "\"etag\":\"\\\"7c2fb99c2a57e8f50360f659f9f8a163\\\"\"");
 
         response = resourceRequest(HttpMethod.PUT, "/folder/conversation", CONVERSATION_BODY_2, "if-match", "123");
         verifyNotExact(response, 412, "If-match condition is failed for etag");
 
-        response = resourceRequest(HttpMethod.PUT, "/folder/conversation", CONVERSATION_BODY_2, "if-match", "\"70edd26b3686de5efcdae93fcc87c2bb\"");
-        verifyNotExact(response, 200, "\"etag\":\"\\\"82833ed7a10a4f99253fccdef4091ad9\\\"\"");
-        assertEquals("\"82833ed7a10a4f99253fccdef4091ad9\"", response.headers().get("etag"));
+        response = resourceRequest(HttpMethod.PUT, "/folder/conversation", CONVERSATION_BODY_2, "if-match", "\"7c2fb99c2a57e8f50360f659f9f8a163\"");
+        verifyNotExact(response, 200, "\"etag\":\"\\\"9295391fd4aab5bd32f63749b228b3f5\\\"\"");
+        assertEquals("\"9295391fd4aab5bd32f63749b228b3f5\"", response.headers().get("etag"));
         assertEquals("etag", response.headers().get("access-control-expose-headers"));
 
         response = metadata("/folder/conversation");
-        verifyNotExact(response, 200, "\"etag\":\"\\\"82833ed7a10a4f99253fccdef4091ad9\\\"\"");
+        verifyNotExact(response, 200, "\"etag\":\"\\\"9295391fd4aab5bd32f63749b228b3f5\\\"\"");
 
         response = resourceRequest(HttpMethod.DELETE, "/folder/conversation", "", "if-match", "123");
         verifyNotExact(response, 412, "If-match condition is failed for etag");
 
-        response = resourceRequest(HttpMethod.DELETE, "/folder/conversation", "", "if-match", "\"82833ed7a10a4f99253fccdef4091ad9\"");
+        response = resourceRequest(HttpMethod.DELETE, "/folder/conversation", "", "if-match", "\"9295391fd4aab5bd32f63749b228b3f5\"");
         verify(response, 200, "");
+    }
+
+    @Test
+    void testEtagIfMatchSpecCompliant() {
+
+        // region resource does not exists
+        Response response = resourceRequest(HttpMethod.GET, "/resource", "", "if-match", "some");
+        verify(response, 412);
+
+        response = resourceRequest(HttpMethod.GET, "/resource", "", "if-match", "*");
+        verify(response, 412);
+
+        response = resourceRequest(HttpMethod.PUT, "/resource", "", "if-match", "some");
+        verify(response, 412);
+
+        response = resourceRequest(HttpMethod.PUT, "/resource", "", "if-match", "*");
+        verify(response, 412);
+
+        response = resourceRequest(HttpMethod.DELETE, "/resource", "", "if-match", "some");
+        verify(response, 412);
+
+        response = resourceRequest(HttpMethod.DELETE, "/resource", "", "if-match", "*");
+        verify(response, 412);
+        // endregion
+
+        // region resource does exist
+        response = resourceRequest(HttpMethod.PUT, "/resource", "");
+        verify(response, 200);
+        String etag = response.headers().get("etag");
+        Assertions.assertNotNull(etag);
+
+        response = resourceRequest(HttpMethod.GET, "/resource", "", "if-match", etag);
+        verify(response, 200);
+
+        response = resourceRequest(HttpMethod.GET, "/resource", "", "if-match", "some");
+        verify(response, 412);
+
+        response = resourceRequest(HttpMethod.GET, "/resource", "", "if-match", "*");
+        verify(response, 200);
+
+        response = resourceRequest(HttpMethod.PUT, "/resource", "", "if-match", etag);
+        verify(response, 200);
+        etag = response.headers().get("etag");
+        Assertions.assertNotNull(etag);
+
+        response = resourceRequest(HttpMethod.PUT, "/resource", "", "if-match", "some");
+        verify(response, 412);
+
+        response = resourceRequest(HttpMethod.PUT, "/resource", "", "if-match", "*");
+        verify(response, 200);
+        etag = response.headers().get("etag");
+        Assertions.assertNotNull(etag);
+
+        response = resourceRequest(HttpMethod.DELETE, "/resource", "", "if-match", "some");
+        verify(response, 412);
+
+        response = resourceRequest(HttpMethod.DELETE, "/resource", "", "if-match", etag);
+        verify(response, 200);
+
+        response = resourceRequest(HttpMethod.PUT, "/resource", "", "if-match", "*");
+        verify(response, 412);
+
+        response = resourceRequest(HttpMethod.DELETE, "/resource", "", "if-match", "some");
+        verify(response, 412);
+
+        response = resourceRequest(HttpMethod.DELETE, "/resource", "", "if-match", "*");
+        verify(response, 412);
+        // endregion
+    }
+
+    @Test
+    void testEtagIfNoneMatchSpecCompliant() {
+
+        // region resource does not exists
+        Response response = resourceRequest(HttpMethod.GET, "/resource", "", "if-none-match", "some");
+        verify(response, 404);
+
+        response = resourceRequest(HttpMethod.GET, "/resource", "", "if-none-match", "*");
+        verify(response, 404);
+
+        response = resourceRequest(HttpMethod.PUT, "/resource", "", "if-none-match", "some");
+        verify(response, 200);
+
+        response = resourceRequest(HttpMethod.PUT, "/resource", "", "if-none-match", "*");
+        verify(response, 412);
+
+        response = resourceRequest(HttpMethod.DELETE, "/resource", "", "if-none-match", "some");
+        verify(response, 200);
+
+        response = resourceRequest(HttpMethod.DELETE, "/resource", "", "if-none-match", "*");
+        verify(response, 404);
+        // endregion
+
+        // region resource does exist
+        response = resourceRequest(HttpMethod.PUT, "/resource", "");
+        verify(response, 200);
+        String etag = response.headers().get("etag");
+        Assertions.assertNotNull(etag);
+
+        response = resourceRequest(HttpMethod.GET, "/resource", "", "if-none-match", etag);
+        verify(response, 304);
+
+        response = resourceRequest(HttpMethod.GET, "/resource", "", "if-none-match", "some");
+        verify(response, 200);
+
+        response = resourceRequest(HttpMethod.GET, "/resource", "", "if-none-match", "*");
+        verify(response, 304);
+
+        response = resourceRequest(HttpMethod.PUT, "/resource", "", "if-none-match", etag);
+        verify(response, 412);
+
+        response = resourceRequest(HttpMethod.PUT, "/resource", "", "if-none-match", "some");
+        verify(response, 200);
+        etag = response.headers().get("etag");
+        Assertions.assertNotNull(etag);
+
+        response = resourceRequest(HttpMethod.PUT, "/resource", "", "if-none-match", "*");
+        verify(response, 412);
+
+        response = resourceRequest(HttpMethod.DELETE, "/resource", "", "if-none-match", etag);
+        verify(response, 412);
+
+        response = resourceRequest(HttpMethod.DELETE, "/resource", "", "if-none-match", "some");
+        verify(response, 200);
+
+        response = resourceRequest(HttpMethod.PUT, "/resource", "", "if-none-match", "*");
+        verify(response, 200);
+
+        response = resourceRequest(HttpMethod.DELETE, "/resource", "", "if-none-match", "some");
+        verify(response, 200);
+
+        response = resourceRequest(HttpMethod.DELETE, "/resource", "", "if-none-match", "*");
+        verify(response, 404);
+        // endregion
     }
 
     @Test
@@ -183,7 +384,6 @@ class ResourceApiTest extends ResourceBaseTest {
                   "temperature": 1,
                   "folderId": "folder1",
                   "messages": [],
-                  "selectedAddons": ["R", "T", "G"],
                   "assistantModelId": "assistantId",
                   "lastActivityDate": 4848683153
                  }
@@ -218,11 +418,11 @@ class ResourceApiTest extends ResourceBaseTest {
         response = resourceRequest(HttpMethod.GET, "/folder/big", CONVERSATION_BODY_1, "if-none-match", "unsupported");
         verifyNotExact(response, 200, CONVERSATION_BODY_1);
 
-        response = resourceRequest(HttpMethod.GET, "/folder/big", CONVERSATION_BODY_1, "if-none-match", "\"70edd26b3686de5efcdae93fcc87c2bb\"");
+        response = resourceRequest(HttpMethod.GET, "/folder/big", CONVERSATION_BODY_1, "if-none-match", "\"7c2fb99c2a57e8f50360f659f9f8a163\"");
         assertEquals(304, response.status());
-        assertEquals("\"70edd26b3686de5efcdae93fcc87c2bb\"", response.headers().get("etag"));
+        assertEquals("\"7c2fb99c2a57e8f50360f659f9f8a163\"", response.headers().get("etag"));
 
-        response = resourceRequest(HttpMethod.PUT, "/folder/big", CONVERSATION_BODY_1, "if-none-match", "\"70edd26b3686de5efcdae93fcc87c2bb\"");
+        response = resourceRequest(HttpMethod.PUT, "/folder/big", CONVERSATION_BODY_1, "if-none-match", "\"7c2fb99c2a57e8f50360f659f9f8a163\"");
         assertEquals(412, response.status());
     }
 
@@ -308,7 +508,7 @@ class ResourceApiTest extends ResourceBaseTest {
                  }
                 """, "api-key", "proxyKey2");
 
-        verify(response, 403, "resource is not allowed: conversations/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/folder/conversation");
+        verify(response, 403, "Resource is not allowed: conversations/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/folder/conversation");
     }
 
     @Test
@@ -515,6 +715,7 @@ class ResourceApiTest extends ResourceBaseTest {
                     "description" : "My application description",
                     "forward_auth_token" : false,
                     "defaults" : { },
+                    "responses_defaults" : { },
                     "interceptors" : [ ],
                     "description_keywords" : [ ],
                     "max_retry_attempts" : 1,

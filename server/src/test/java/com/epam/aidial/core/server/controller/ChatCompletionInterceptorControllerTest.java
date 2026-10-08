@@ -1,0 +1,287 @@
+package com.epam.aidial.core.server.controller;
+
+import com.epam.aidial.core.config.Config;
+import com.epam.aidial.core.config.DeploymentInterface;
+import com.epam.aidial.core.config.Interceptor;
+import com.epam.aidial.core.config.InterfaceType;
+import com.epam.aidial.core.config.Model;
+import com.epam.aidial.core.server.Proxy;
+import com.epam.aidial.core.server.ProxyContext;
+import com.epam.aidial.core.server.data.ApiKeyData;
+import com.epam.aidial.core.server.data.ErrorData;
+import com.epam.aidial.core.server.security.ApiKeyStore;
+import com.epam.aidial.core.server.util.ProxyUtil;
+import com.epam.aidial.core.storage.http.HttpStatus;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.vertx.core.Future;
+import io.vertx.core.buffer.Buffer;
+import io.vertx.core.http.HttpClient;
+import io.vertx.core.http.HttpClientOptions;
+import io.vertx.core.http.HttpClientRequest;
+import io.vertx.core.http.HttpServerRequest;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.Answers;
+import org.mockito.ArgumentCaptor;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+import java.io.IOException;
+import java.util.Map;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doCallRealMethod;
+import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+@ExtendWith(MockitoExtension.class)
+public class ChatCompletionInterceptorControllerTest {
+
+    @Mock(answer = Answers.RETURNS_DEEP_STUBS)
+    private Proxy proxy;
+
+    @Mock
+    private ProxyContext context;
+
+    @Mock
+    private HttpServerRequest request;
+
+    @BeforeEach
+    void stubConfig() {
+        // buildUri resolves translator references against the request's config on every call
+        lenient().when(context.getConfig()).thenReturn(new Config());
+    }
+
+    @Test
+    void buildUri_legacyFlow_noQuery() {
+        Model deployment = new Model();
+        deployment.setName("my-interceptor");
+        deployment.setEndpoint("http://interceptor/openai/deployments/my-interceptor/chat/completions");
+
+        when(context.getDeployment()).thenReturn(deployment);
+        when(context.getRequest()).thenReturn(request);
+        when(request.path()).thenReturn("/openai/deployments/original-model/chat/completions");
+        when(request.query()).thenReturn(null);
+
+        ChatCompletionInterceptorController controller = new ChatCompletionInterceptorController(proxy, context, 0, InterfaceType.OPENAI_CHAT_COMPLETIONS);
+
+        assertEquals(
+                "http://interceptor/openai/deployments/my-interceptor/chat/completions",
+                controller.buildUri(context));
+    }
+
+    @Test
+    void buildUri_legacyFlow_withQuery() {
+        Model deployment = new Model();
+        deployment.setName("my-interceptor");
+        deployment.setEndpoint("http://interceptor/openai/deployments/my-interceptor/chat/completions");
+
+        when(context.getDeployment()).thenReturn(deployment);
+        when(context.getRequest()).thenReturn(request);
+        when(request.path()).thenReturn("/openai/deployments/original-model/chat/completions");
+        when(request.query()).thenReturn("api-version=2024-05");
+
+        ChatCompletionInterceptorController controller = new ChatCompletionInterceptorController(proxy, context, 0, InterfaceType.OPENAI_CHAT_COMPLETIONS);
+
+        assertEquals(
+                "http://interceptor/openai/deployments/my-interceptor/chat/completions?api-version=2024-05",
+                controller.buildUri(context));
+    }
+
+    @Test
+    void buildUri_newFlow_rewritesDeploymentSegment_noQuery() {
+        Model deployment = new Model();
+        deployment.setName("my-interceptor");
+        deployment.setInterfaces(Map.of(
+                InterfaceType.OPENAI_CHAT_COMPLETIONS.getValue(), new DeploymentInterface("http://adapter")));
+
+        when(context.getDeployment()).thenReturn(deployment);
+        when(context.getRequest()).thenReturn(request);
+        when(request.query()).thenReturn(null);
+        when(request.path()).thenReturn("/openai/deployments/original-model/chat/completions");
+
+        ChatCompletionInterceptorController controller = new ChatCompletionInterceptorController(proxy, context, 0, InterfaceType.OPENAI_CHAT_COMPLETIONS);
+
+        assertEquals(
+                "http://adapter/openai/deployments/my-interceptor/chat/completions",
+                controller.buildUri(context));
+    }
+
+    @Test
+    void buildUri_newFlow_rewritesDeploymentSegment_withQuery() {
+        Model deployment = new Model();
+        deployment.setName("my-interceptor");
+        deployment.setInterfaces(Map.of(
+                InterfaceType.OPENAI_CHAT_COMPLETIONS.getValue(), new DeploymentInterface("http://adapter")));
+
+        when(context.getDeployment()).thenReturn(deployment);
+        when(context.getRequest()).thenReturn(request);
+        when(request.query()).thenReturn("api-version=2024-05");
+        when(request.path()).thenReturn("/openai/deployments/original-model/chat/completions");
+
+        ChatCompletionInterceptorController controller = new ChatCompletionInterceptorController(proxy, context, 0, InterfaceType.OPENAI_CHAT_COMPLETIONS);
+
+        assertEquals(
+                "http://adapter/openai/deployments/my-interceptor/chat/completions?api-version=2024-05",
+                controller.buildUri(context));
+    }
+
+    @Test
+    void buildUri_newFlow_trailingSlashStripped() {
+        Model deployment = new Model();
+        deployment.setName("my-interceptor");
+        deployment.setInterfaces(Map.of(
+                InterfaceType.OPENAI_CHAT_COMPLETIONS.getValue(), new DeploymentInterface("http://adapter/")));
+
+        when(context.getDeployment()).thenReturn(deployment);
+        when(context.getRequest()).thenReturn(request);
+        when(request.query()).thenReturn(null);
+        when(request.path()).thenReturn("/openai/deployments/model/chat/completions");
+
+        ChatCompletionInterceptorController controller = new ChatCompletionInterceptorController(proxy, context, 0, InterfaceType.OPENAI_CHAT_COMPLETIONS);
+
+        assertEquals(
+                "http://adapter/openai/deployments/my-interceptor/chat/completions",
+                controller.buildUri(context));
+    }
+
+    @Test
+    void buildUri_newFlow_rewritesMultiSegmentDeploymentId() {
+        Model deployment = new Model();
+        deployment.setName("my-interceptor");
+        deployment.setInterfaces(Map.of(
+                InterfaceType.OPENAI_CHAT_COMPLETIONS.getValue(), new DeploymentInterface("http://adapter")));
+
+        when(context.getDeployment()).thenReturn(deployment);
+        when(context.getRequest()).thenReturn(request);
+        when(request.query()).thenReturn("api-version=2025-01-01-preview");
+        when(request.path()).thenReturn("/openai/deployments/models/platform/original-model/chat/completions");
+
+        ChatCompletionInterceptorController controller = new ChatCompletionInterceptorController(proxy, context, 0, InterfaceType.OPENAI_CHAT_COMPLETIONS);
+
+        assertEquals(
+                "http://adapter/openai/deployments/my-interceptor/chat/completions?api-version=2025-01-01-preview",
+                controller.buildUri(context));
+    }
+
+    @Test
+    void buildUri_newFlow_usesOverrideNameForPathSegmentWhenSet() {
+        Interceptor deployment = new Interceptor();
+        deployment.setName("my-interceptor");
+        deployment.setOverrideName("interceptor-override");
+        deployment.setInterfaces(Map.of(
+                InterfaceType.OPENAI_CHAT_COMPLETIONS.getValue(), new DeploymentInterface("http://adapter")));
+
+        when(context.getDeployment()).thenReturn(deployment);
+        when(context.getRequest()).thenReturn(request);
+        when(request.query()).thenReturn(null);
+        when(request.path()).thenReturn("/openai/deployments/original-model/chat/completions");
+
+        ChatCompletionInterceptorController controller = new ChatCompletionInterceptorController(proxy, context, 0, InterfaceType.OPENAI_CHAT_COMPLETIONS);
+
+        assertEquals(
+                "http://adapter/openai/deployments/interceptor-override/chat/completions",
+                controller.buildUri(context));
+    }
+
+    @Test
+    void buildUri_newFlow_nonMatchingPath_leftUnchanged() {
+        Model deployment = new Model();
+        deployment.setName("my-interceptor");
+        deployment.setInterfaces(Map.of(
+                InterfaceType.OPENAI_CHAT_COMPLETIONS.getValue(), new DeploymentInterface("http://adapter")));
+
+        when(context.getDeployment()).thenReturn(deployment);
+        when(context.getRequest()).thenReturn(request);
+        when(request.query()).thenReturn(null);
+        when(request.path()).thenReturn("/some/other/path");
+
+        ChatCompletionInterceptorController controller = new ChatCompletionInterceptorController(proxy, context, 0, InterfaceType.OPENAI_CHAT_COMPLETIONS);
+
+        assertEquals("http://adapter/some/other/path", controller.buildUri(context));
+    }
+
+    @Test
+    void handleRequestBody_overridesModelName() throws IOException {
+        Interceptor interceptor = new Interceptor();
+        interceptor.setName("interceptor1");
+        interceptor.setEndpoint("http://localhost:4088/api/v1/interceptor/handle");
+        interceptor.setOverrideName("overrideName");
+
+        when(context.getDeployment()).thenReturn(interceptor);
+        when(context.getRequest()).thenReturn(request);
+        when(request.path()).thenReturn("/openai/deployments/interceptor/chat/completions");
+        when(request.query()).thenReturn(null);
+
+        when(proxy.getClient()).thenReturn(mock(HttpClient.class, Answers.RETURNS_DEEP_STUBS));
+        when(proxy.getClientOptions()).thenReturn(new HttpClientOptions());
+        when(proxy.getApiKeyStore()).thenReturn(mock(ApiKeyStore.class));
+
+        ApiKeyData proxyApiKeyData = new ApiKeyData();
+        proxyApiKeyData.setInterceptorIndex(0);
+        when(context.getProxyApiKeyData()).thenReturn(proxyApiKeyData);
+
+        when(context.getRequestBody()).thenCallRealMethod();
+        doCallRealMethod().when(context).setRequestBody(any());
+
+        ChatCompletionInterceptorController controller = new ChatCompletionInterceptorController(proxy, context, 0, InterfaceType.OPENAI_CHAT_COMPLETIONS);
+
+        String body = """
+                {
+                    "model": "name",
+                    "messages": [],
+                    "stream": false
+                }
+                """;
+        controller.handleRequestBody(Buffer.buffer(body));
+
+        Buffer updatedBody = context.getRequestBody();
+        assertNotNull(updatedBody);
+        ObjectNode tree = (ObjectNode) ProxyUtil.MAPPER.readTree(updatedBody.getBytes());
+        assertEquals("overrideName", tree.get("model").asText());
+    }
+
+    @Test
+    void handleProxyResponseError_answersBadGateway() {
+        HttpClientRequest proxyRequest = mock(HttpClientRequest.class, Answers.RETURNS_DEEP_STUBS);
+        when(context.getProxyRequest()).thenReturn(proxyRequest);
+        when(context.getProxyApiKeyData()).thenReturn(null);
+        when(context.respond(eq(HttpStatus.BAD_GATEWAY), any(ErrorData.class)))
+                .thenReturn(Future.succeededFuture());
+
+        ChatCompletionInterceptorController controller =
+                new ChatCompletionInterceptorController(proxy, context, 0, InterfaceType.OPENAI_CHAT_COMPLETIONS);
+        controller.handleProxyResponseError(new RuntimeException("ContentLengthNotAllowedException"));
+
+        verify(proxyRequest).reset();
+        ArgumentCaptor<ErrorData> captor = ArgumentCaptor.forClass(ErrorData.class);
+        verify(context).respond(eq(HttpStatus.BAD_GATEWAY), captor.capture());
+        assertEquals(String.valueOf(HttpStatus.BAD_GATEWAY), captor.getValue().getError().getCode());
+        assertEquals("Failed to receive response header from interceptor",
+                captor.getValue().getError().getMessage());
+        assertEquals("Failed to receive response header from interceptor",
+                captor.getValue().getError().getDisplayMessage());
+    }
+
+    @Test
+    void handleProxyResponseError_withoutProxyRequest_stillAnswersBadGateway() {
+        when(context.getProxyRequest()).thenReturn(null);
+        when(context.getProxyApiKeyData()).thenReturn(null);
+        when(context.respond(eq(HttpStatus.BAD_GATEWAY), any(ErrorData.class)))
+                .thenReturn(Future.succeededFuture());
+
+        ChatCompletionInterceptorController controller =
+                new ChatCompletionInterceptorController(proxy, context, 0, InterfaceType.OPENAI_CHAT_COMPLETIONS);
+        controller.handleProxyResponseError(new RuntimeException("ContentLengthNotAllowedException"));
+
+        verify(context).respond(eq(HttpStatus.BAD_GATEWAY), any(ErrorData.class));
+        verify(context, never()).setProxyRequest(any());
+    }
+}

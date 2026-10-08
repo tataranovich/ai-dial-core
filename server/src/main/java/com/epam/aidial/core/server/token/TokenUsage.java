@@ -9,17 +9,24 @@ import java.math.BigDecimal;
 @Data
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class TokenUsage {
-    @JsonAlias({"completion_tokens", "completionTokens"})
+    @JsonAlias({"output_tokens", "completion_tokens", "completionTokens"})
     private long completionTokens;
-    @JsonAlias({"prompt_tokens", "promptTokens"})
+    @JsonAlias({"input_tokens", "prompt_tokens", "promptTokens"})
     private long promptTokens;
     @JsonAlias({"total_tokens", "totalTokens"})
     private long totalTokens;
-    @JsonAlias({"prompt_tokens_details", "promptsTokenDetails"})
+    @JsonAlias({"input_tokens_details", "prompt_tokens_details", "promptsTokenDetails"})
     private PromptTokensDetails promptTokensDetails;
+    @JsonAlias({"output_tokens_details", "completion_tokens_details", "completionTokensDetails"})
+    private CompletionTokensDetails completionTokensDetails;
 
     private BigDecimal cost;
     private BigDecimal aggCost;
+
+    public boolean isEmpty() {
+        return completionTokens == 0 && promptTokens == 0 && totalTokens == 0
+                && promptTokensDetails == null && completionTokensDetails == null;
+    }
 
     public void increase(TokenUsage other) {
         if (other == null) {
@@ -33,10 +40,33 @@ public class TokenUsage {
         } else {
             promptTokensDetails.increase(other.promptTokensDetails);
         }
-        aggCost(other.aggCost);
+        if (completionTokensDetails == null) {
+            completionTokensDetails = other.completionTokensDetails;
+        } else {
+            completionTokensDetails.increase(other.completionTokensDetails);
+        }
+        increaseAggCost(other.aggCost);
     }
 
-    private void aggCost(BigDecimal val) {
+    /**
+     * Overwrites every field from {@code other} except {@code aggCost}, which keeps
+     * accumulating - an ancestor may have already rolled a descendant's cost into this
+     * span before its own deployment self-reports.
+     */
+    public void assign(TokenUsage other) {
+        if (other == null) {
+            return;
+        }
+        completionTokens = other.completionTokens;
+        promptTokens = other.promptTokens;
+        totalTokens = other.totalTokens;
+        promptTokensDetails = other.promptTokensDetails;
+        completionTokensDetails = other.completionTokensDetails;
+        cost = other.cost;
+        increaseAggCost(other.aggCost);
+    }
+
+    public void increaseAggCost(BigDecimal val) {
         if (val == null) {
             return;
         }
@@ -51,7 +81,9 @@ public class TokenUsage {
     public String toString() {
         return "completion=" + completionTokens
                 + ", prompt=" + promptTokens
-                + (promptTokensDetails != null ? ", cached_prompt=" + promptTokensDetails.getCachedTokens() : "")
+                + (promptTokensDetails != null ? ", cached_prompt=" + promptTokensDetails.getCachedTokens()
+                        + ", cache_write=" + promptTokensDetails.getCacheWriteTokens() : "")
+                + (completionTokensDetails != null ? ", reasoning=" + completionTokensDetails.getReasoningTokens() : "")
                 + ", total=" + totalTokens;
     }
 }

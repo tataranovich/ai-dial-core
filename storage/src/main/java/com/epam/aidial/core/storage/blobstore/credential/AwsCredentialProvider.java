@@ -1,21 +1,23 @@
 package com.epam.aidial.core.storage.blobstore.credential;
 
-import com.amazonaws.auth.AWSCredentials;
-import com.amazonaws.auth.AWSSessionCredentials;
-import com.amazonaws.auth.DefaultAWSCredentialsProviderChain;
+import lombok.extern.slf4j.Slf4j;
 import org.jclouds.aws.domain.SessionCredentials;
 import org.jclouds.domain.Credentials;
+import software.amazon.awssdk.auth.credentials.AwsCredentials;
+import software.amazon.awssdk.auth.credentials.AwsSessionCredentials;
+import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
 
+@Slf4j
 public class AwsCredentialProvider implements CredentialProvider {
 
     private Credentials credentials;
-    private DefaultAWSCredentialsProviderChain providerChain;
+    private DefaultCredentialsProvider providerChain;
 
     public AwsCredentialProvider(String identity, String secret) {
         if (identity != null && secret != null) {
             this.credentials = new Credentials(identity, secret);
         } else {
-            providerChain = new DefaultAWSCredentialsProviderChain();
+            providerChain = DefaultCredentialsProvider.create();
         }
     }
 
@@ -24,14 +26,16 @@ public class AwsCredentialProvider implements CredentialProvider {
         if (credentials != null) {
             return credentials;
         }
-        AWSCredentials awsCredentials = providerChain.getCredentials();
-        if (awsCredentials instanceof AWSSessionCredentials awsSessionCredentials) {
+        log.debug("Start requesting temporary token from AWS Identity");
+        AwsCredentials awsCredentials = providerChain.resolveCredentials();
+        log.debug("Received temporary token from AWS Identity");
+        if (awsCredentials instanceof AwsSessionCredentials awsSessionCredentials) {
             return SessionCredentials.builder()
-                    .accessKeyId(awsSessionCredentials.getAWSAccessKeyId())
-                    .secretAccessKey(awsSessionCredentials.getAWSSecretKey())
-                    .sessionToken(awsSessionCredentials.getSessionToken()).build();
+                    .accessKeyId(awsSessionCredentials.accessKeyId())
+                    .secretAccessKey(awsSessionCredentials.secretAccessKey())
+                    .sessionToken(awsSessionCredentials.sessionToken()).build();
         } else {
-            return new Credentials(awsCredentials.getAWSAccessKeyId(), awsCredentials.getAWSSecretKey());
+            return new Credentials(awsCredentials.accessKeyId(), awsCredentials.secretAccessKey());
         }
     }
 }

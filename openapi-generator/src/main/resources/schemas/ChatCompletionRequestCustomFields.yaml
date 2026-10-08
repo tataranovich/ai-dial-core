@@ -1,0 +1,5 @@
+type: object
+description: DIAL-specific extensions of the Chat Completions message.
+properties:
+  cache_breakpoint:
+    $ref: "#/components/schemas/CacheBreakpoint"

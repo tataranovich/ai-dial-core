@@ -1,13 +1,19 @@
 package com.epam.aidial.core.server.util;
 
-import com.epam.aidial.core.config.Deployment;
+import com.epam.aidial.core.config.InterfaceType;
 import com.epam.aidial.core.config.Model;
 import com.epam.aidial.core.config.ModelType;
 import com.epam.aidial.core.config.Pricing;
-import com.epam.aidial.core.server.ProxyContext;
+import com.epam.aidial.core.config.PricingRate;
+import com.epam.aidial.core.config.RoleBasedEntity;
+import com.epam.aidial.core.config.StandardField;
+import com.epam.aidial.core.server.pricing.PricingRateEvaluator;
+import com.epam.aidial.core.server.pricing.UsageEvalContext;
+import com.epam.aidial.core.server.token.PromptTokensDetails;
 import com.epam.aidial.core.server.token.TokenUsage;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.MissingNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.netty.buffer.ByteBufInputStream;
 import io.vertx.core.buffer.Buffer;
@@ -17,14 +23,16 @@ import lombok.extern.slf4j.Slf4j;
 import java.io.InputStream;
 import java.math.BigDecimal;
 import java.util.Scanner;
+import javax.annotation.Nullable;
 
 @Slf4j
 @UtilityClass
 public class ModelCostCalculator {
 
-    public static BigDecimal calculate(ProxyContext context) {
-        Deployment deployment = context.getDeployment();
-        if (!(deployment instanceof Model model)) {
+    public static BigDecimal calculate(
+            RoleBasedEntity roleBasedEntity, TokenUsage tokenUsage, Buffer requestBody, Buffer responseBody,
+            InterfaceType interfaceType, JsonNode liveUsageNode) {
+        if (!(roleBasedEntity instanceof Model model)) {
             return null;
         }
 
@@ -34,33 +42,52 @@ public class ModelCostCalculator {
         }
 
         return switch (pricing.getUnit()) {
-            case "token" -> calculate(context.getTokenUsage(), pricing.getPrompt(), pricing.getCompletion());
+            case "token" -> calculate(tokenUsage, pricing, interfaceType, responseBody, liveUsageNode);
             case "char_without_whitespace" ->
-                    calculate(model.getType(), context.getRequestBody(), context.getResponseBody(), pricing.getPrompt(), pricing.getCompletion());
+                    calculate(model.getType(), requestBody, responseBody, flatRate(pricing.getPrompt()), flatRate(pricing.getCompletion()));
             default -> null;
         };
     }
 
-    private static BigDecimal calculate(TokenUsage tokenUsage, String promptRate, String completionRate) {
+    private static BigDecimal calculate(TokenUsage tokenUsage, Pricing pricing, InterfaceType interfaceType,
+            Buffer responseBody, JsonNode liveUsageNode) {
         if (tokenUsage == null) {
             return null;
         }
+
+        // streaming: already accumulated live by a per-event Fn; non-streaming: one cheap whole-body parse
+        JsonNode nativeRoot = liveUsageNode != null ? liveUsageNode
+                : responseBody == null ? MissingNode.getInstance() : JsonUtil.tryParse(responseBody.getBytes());
+        UsageEvalContext evalContext = UsageEvalContext.build(interfaceType, nativeRoot);
+
+        String promptRate = resolveRate(pricing.getPrompt(), evalContext, null);
+        String completionRate = resolveRate(pricing.getCompletion(), evalContext, null);
+
+        PromptTokensDetails details = tokenUsage.getPromptTokensDetails();
+        long cachedTokens = evalContext.resolveCounter(StandardField.CACHED_READ_TOKENS)
+                .orElseGet(() -> details == null ? 0 : details.getCachedTokens());
+        long cacheWriteTokens = evalContext.resolveCounter(StandardField.CACHED_WRITE_TOKENS)
+                .orElseGet(() -> details == null ? 0 : details.getCacheWriteTokens());
+
+        String cacheReadRate = resolveRate(pricing.getCacheRead(), evalContext, promptRate);
+        String cacheWriteRate = resolveRate(pricing.getCacheWrite(), evalContext, promptRate);
+
         BigDecimal cost = null;
         if (promptRate != null) {
-            cost = new BigDecimal(tokenUsage.getPromptTokens()).multiply(new BigDecimal(promptRate));
+            long baseTokens = tokenUsage.getPromptTokens() - cachedTokens - cacheWriteTokens;
+            cost = new BigDecimal(baseTokens).multiply(new BigDecimal(promptRate));
         }
-        if (completionRate != null) {
-            BigDecimal completionCost = new BigDecimal(tokenUsage.getCompletionTokens()).multiply(new BigDecimal(completionRate));
-            if (cost != null) {
-                cost = cost.add(completionCost);
-            } else {
-                cost = completionCost;
-            }
-        }
+        cost = addCost(cost, completionRate, tokenUsage.getCompletionTokens());
+        cost = addCost(cost, cacheReadRate, cachedTokens);
+        cost = addCost(cost, cacheWriteRate, cacheWriteTokens);
         return cost;
     }
 
     private static BigDecimal calculate(ModelType modelType, Buffer requestBody, Buffer responseBody, String promptRate, String completionRate) {
+        if (requestBody == null || responseBody == null) {
+            log.error("Can't calculate model cost due to missing request or response body.");
+            return null;
+        }
         RequestLengthResult requestLengthResult = getRequestContentLength(modelType, requestBody);
         int responseLength = getResponseContentLength(modelType, responseBody, requestLengthResult.stream());
         BigDecimal cost = null;
@@ -76,6 +103,28 @@ public class ModelCostCalculator {
             }
         }
         return cost;
+    }
+
+    private static String resolveRate(PricingRate pricingRate, UsageEvalContext evalContext, @Nullable String defaultRate) {
+        if (pricingRate == null) {
+            return defaultRate;
+        }
+        return PricingRateEvaluator.evaluate(pricingRate, evalContext).orElse(defaultRate);
+    }
+
+    // char_without_whitespace pricing has no usage data to evaluate a decision tree against
+    // (validated at config load time - see ConfigPostProcessor#validatePricing), so only the
+    // flat leaf rate applies here.
+    private static String flatRate(PricingRate pricingRate) {
+        return pricingRate == null ? null : pricingRate.getRate();
+    }
+
+    private static BigDecimal addCost(BigDecimal cost, String rate, long tokens) {
+        if (rate == null) {
+            return cost;
+        }
+        BigDecimal delta = new BigDecimal(tokens).multiply(new BigDecimal(rate));
+        return cost == null ? delta : cost.add(delta);
     }
 
     private static int getResponseContentLength(ModelType modelType, Buffer responseBody, boolean isStreamingResponse) {

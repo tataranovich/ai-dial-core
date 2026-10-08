@@ -1,8 +1,8 @@
 package com.epam.aidial.core.server.util;
 
+import com.epam.aidial.core.config.Deployment;
 import com.epam.aidial.core.server.Proxy;
 import com.epam.aidial.core.server.function.BaseRequestFunction;
-import com.epam.aidial.core.storage.data.MetadataBase;
 import com.epam.aidial.core.storage.util.EtagHeader;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -11,29 +11,36 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.MapperFeature;
 import com.fasterxml.jackson.databind.exc.MismatchedInputException;
 import com.fasterxml.jackson.databind.json.JsonMapper;
-import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.netty.buffer.ByteBufInputStream;
 import io.vertx.core.MultiMap;
 import io.vertx.core.buffer.Buffer;
+import io.vertx.core.http.HttpClientRequest;
 import io.vertx.core.http.HttpClientResponse;
 import io.vertx.core.http.HttpHeaders;
 import io.vertx.core.http.HttpServerRequest;
+import io.vertx.core.http.HttpServerResponse;
+import io.vertx.core.net.SocketAddress;
 import lombok.experimental.UtilityClass;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.Strings;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import javax.annotation.Nullable;
 
 @UtilityClass
 @Slf4j
 public class ProxyUtil {
-
+    // Default response mapper. No introspector override here: @JsonProperty(WRITE_ONLY) on every
+    // @EncryptedField is honored, dropping the field from serialized output. BLOB_MAPPER below
+    // overrides to READ_WRITE so the blob-write path can persist the ciphertext.
     public static final JsonMapper MAPPER = JsonMapper.builder()
             .enable(MapperFeature.ACCEPT_CASE_INSENSITIVE_ENUMS)
             .build();
@@ -41,19 +48,36 @@ public class ProxyUtil {
     private static final MultiMap TRACE_HEADERS = MultiMap.caseInsensitiveMultiMap()
             .add("traceparent", "whatever")
             .add("tracestate", "whatever");
-    private static final MultiMap HOP_BY_HOP_HEADERS = MultiMap.caseInsensitiveMultiMap()
-            .add(HttpHeaders.CONNECTION, "whatever")
-            .add(HttpHeaders.KEEP_ALIVE, "whatever")
-            .add(HttpHeaders.HOST, "whatever")
-            .add(HttpHeaders.PROXY_AUTHENTICATE, "whatever")
-            .add(HttpHeaders.PROXY_AUTHORIZATION, "whatever")
-            .add("te", "whatever")
-            .add("trailer", "whatever")
-            .add(HttpHeaders.TRANSFER_ENCODING, "whatever")
-            .add(HttpHeaders.UPGRADE, "whatever")
-            .add(HttpHeaders.CONTENT_LENGTH, "whatever")
-            .add(Proxy.HEADER_API_KEY, "whatever");
+    private static MultiMap HOP_BY_HOP_HEADERS = baseHopByHopHeaders();
     public static final String METADATA_PREFIX = "metadata/";
+
+    /**
+     * Rebuilds the hop-by-hop header set from the built-in defaults plus the configured additions.
+     * Safe to call more than once (e.g. from tests) - each call replaces the previous set rather than appending to it.
+     */
+    public static void init(ProxySettings settings) {
+        MultiMap headers = baseHopByHopHeaders();
+        for (String header : settings.additionalHopByHopHeaders()) {
+            headers.add(header, "whatever");
+        }
+        HOP_BY_HOP_HEADERS = headers;
+    }
+
+    private static MultiMap baseHopByHopHeaders() {
+        return MultiMap.caseInsensitiveMultiMap()
+                .add(HttpHeaders.CONNECTION, "whatever")
+                .add(HttpHeaders.KEEP_ALIVE, "whatever")
+                .add(HttpHeaders.HOST, "whatever")
+                .add(HttpHeaders.PROXY_AUTHENTICATE, "whatever")
+                .add(HttpHeaders.PROXY_AUTHORIZATION, "whatever")
+                .add("te", "whatever")
+                .add("trailer", "whatever")
+                .add(HttpHeaders.TRANSFER_ENCODING, "whatever")
+                .add(HttpHeaders.UPGRADE, "whatever")
+                .add(HttpHeaders.CONTENT_LENGTH, "whatever")
+                .add(Proxy.HEADER_API_KEY, "whatever")
+                .add(Proxy.HEADER_X_API_KEY, "whatever");
+    }
 
     public static void copyHeaders(MultiMap from, MultiMap to) {
         copyHeaders(from, to, MultiMap.caseInsensitiveMultiMap());
@@ -68,6 +92,20 @@ public class ProxyUtil {
                 to.add(key, value);
             }
         }
+    }
+
+    public static void setOverrideNameHeader(MultiMap headers, Deployment deployment) {
+        if (deployment == null) {
+            return;
+        }
+        String overrideName = deployment.getOverrideName();
+        if (overrideName != null) {
+            headers.set(Proxy.HEADER_OVERRIDE_NAME, overrideName);
+        }
+    }
+
+    public static void setOverrideNameHeader(HttpClientRequest request, Deployment deployment) {
+        setOverrideNameHeader(request.headers(), deployment);
     }
 
     public static int contentLength(HttpServerRequest request, int defaultValue) {
@@ -89,164 +127,6 @@ public class ProxyUtil {
             }
         }
         return defaultValue;
-    }
-
-    public static void collectAttachmentsFromResponse(ObjectNode tree, boolean isStream, Consumer<String> consumer) {
-        ArrayNode choices = (ArrayNode) tree.get("choices");
-        if (choices == null) {
-            return;
-        }
-        for (int i = 0; i < choices.size(); i++) {
-            JsonNode choice = choices.get(i);
-            String messageNodeName = isStream ? "delta" : "message";
-            JsonNode message = choice.get(messageNodeName);
-            if (message == null) {
-                continue;
-            }
-            JsonNode customContent = message.get("custom_content");
-            if (customContent == null) {
-                continue;
-            }
-            ArrayNode attachments = (ArrayNode) customContent.get("attachments");
-            if (attachments != null) {
-                for (int j = 0; j < attachments.size(); j++) {
-                    JsonNode attachment = attachments.get(j);
-                    collectAttachedFile(attachment, consumer);
-                }
-            }
-            ArrayNode stages = (ArrayNode) customContent.get("stages");
-            if (stages != null) {
-                for (int j = 0; j < stages.size(); j++) {
-                    JsonNode stage = stages.get(j);
-                    attachments = (ArrayNode) stage.get("attachments");
-                    if (attachments == null) {
-                        continue;
-                    }
-                    for (int k = 0; k < attachments.size(); k++) {
-                        JsonNode attachment = attachments.get(k);
-                        collectAttachedFile(attachment, consumer);
-                    }
-                }
-            }
-        }
-    }
-
-    public static void collectAttachedFilesFromRequest(ObjectNode tree, Consumer<String> consumer) {
-        collectAttachedFilesChatCompletion(tree, consumer);
-        collectAttachedFilesEmbeddings(tree, consumer);
-    }
-
-    private static void collectAttachedFilesEmbeddings(ObjectNode tree, Consumer<String> consumer) {
-        JsonNode inputs = tree.get("custom_input");
-
-        if (inputs == null) {
-            return;
-        }
-
-        if (inputs.isArray()) {
-            for (int i = 0; i < inputs.size(); i++) {
-                collectAttachedFilesCustomInput(inputs.get(i), consumer);
-            }
-        }
-    }
-
-    private static void collectAttachedFilesCustomInput(JsonNode input, Consumer<String> consumer) {
-        if (input.isObject()) {
-            collectAttachedFile(input, consumer);
-        } else if (input.isArray()) {
-            for (int i = 0; i < input.size(); i++) {
-                collectAttachedFilesCustomInput(input.get(i), consumer);
-            }
-        }
-    }
-
-    private static void collectAttachedFilesFromContent(JsonNode content, Consumer<String> consumer) {
-        if (!(content instanceof ArrayNode contentParts)) {
-            return;
-        }
-
-        for (int i = 0; i < contentParts.size(); i++) {
-            JsonNode partNode = contentParts.get(i);
-            JsonNode partTypeNode = partNode.get("type");
-            if (partTypeNode == null || !partTypeNode.textValue().equals("image_url")) {
-                continue;
-            }
-            JsonNode imageNode = partNode.get("image_url");
-            if (imageNode == null) {
-                continue;
-            }
-            JsonNode urlNode = imageNode.get("url");
-            collectAttachedFilesFromUrl(urlNode, null, consumer);
-        }
-    }
-
-    private static void collectAttachedFilesFromCustomContent(JsonNode customContent, Consumer<String> consumer) {
-        if (customContent == null) {
-            return;
-        }
-        ArrayNode attachments = (ArrayNode) customContent.get("attachments");
-        if (attachments != null) {
-            for (int i = 0; i < attachments.size(); i++) {
-                JsonNode attachment = attachments.get(i);
-                collectAttachedFile(attachment, consumer);
-            }
-        }
-        ArrayNode stages = (ArrayNode) customContent.get("stages");
-        if (stages != null) {
-            for (int i = 0; i < stages.size(); i++) {
-                JsonNode stage = stages.get(i);
-                attachments = (ArrayNode) stage.get("attachments");
-                if (attachments == null) {
-                    continue;
-                }
-                for (int j = 0; j < attachments.size(); j++) {
-                    JsonNode attachment = attachments.get(j);
-                    collectAttachedFile(attachment, consumer);
-                }
-            }
-        }
-    }
-
-    private static void collectAttachedFilesChatCompletion(ObjectNode tree, Consumer<String> consumer) {
-        ArrayNode messages = (ArrayNode) tree.get("messages");
-        if (messages == null) {
-            return;
-        }
-        for (int i = 0; i < messages.size(); i++) {
-            JsonNode message = messages.get(i);
-            JsonNode content = message.get("content");
-            collectAttachedFilesFromContent(content, consumer);
-
-            JsonNode customContent = message.get("custom_content");
-            collectAttachedFilesFromCustomContent(customContent, consumer);
-        }
-    }
-
-    private static void collectAttachedFilesFromUrl(JsonNode urlNode, JsonNode typeNode, Consumer<String> consumer) {
-        if (urlNode == null) {
-            return;
-        }
-
-        String url = urlNode.textValue();
-
-        if (url == null) {
-            return;
-        }
-
-        if (typeNode != null && typeNode.textValue().equals(MetadataBase.MIME_TYPE)) {
-            if (!url.startsWith(METADATA_PREFIX)) {
-                throw new IllegalArgumentException("Url of metadata attachment must start with metadata/: " + url);
-            }
-            url = url.substring(METADATA_PREFIX.length());
-        }
-
-        consumer.accept(url);
-    }
-
-    private static void collectAttachedFile(JsonNode attachment, Consumer<String> consumer) {
-        JsonNode urlNode = attachment.get("url");
-        JsonNode typeNode = attachment.get("type");
-        collectAttachedFilesFromUrl(urlNode, typeNode, consumer);
     }
 
     public static <T> T convertToObject(Buffer json, Class<T> clazz) {
@@ -314,6 +194,38 @@ public class ProxyUtil {
         }
     }
 
+    /**
+     * Parses the payload into a JSON tree for {@link #hasTopLevelField(JsonNode, String...)} checks,
+     * so a body probed for several fields is parsed once. Returns null for blank or unparseable payloads.
+     */
+    public static JsonNode parseTree(String payload) {
+        if (payload == null || payload.isEmpty()) {
+            return null;
+        }
+        try {
+            return MAPPER.readTree(payload);
+        } catch (JsonProcessingException e) {
+            return null;
+        }
+    }
+
+    /**
+     * Returns true if the JSON payload is an object containing any of the given top-level field names.
+     * Lets a write path tell "field omitted" apart from "field sent (even empty)", which a deserialized
+     * POJO cannot. Returns false for null or non-object payloads.
+     */
+    public static boolean hasTopLevelField(JsonNode payload, String... fieldNames) {
+        if (payload == null || !payload.isObject()) {
+            return false;
+        }
+        for (String fieldName : fieldNames) {
+            if (payload.has(fieldName)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     public static <T> boolean processChain(T item, List<BaseRequestFunction<T>> chain) {
         boolean result = false;
         for (BaseRequestFunction<T> fn : chain) {
@@ -328,7 +240,67 @@ public class ProxyUtil {
         return EtagHeader.fromHeader(request.getHeader(HttpHeaders.IF_MATCH), request.getHeader(HttpHeaders.IF_NONE_MATCH), request.method().name());
     }
 
+    public record MetadataQuery(String token, int limit, boolean recursive) {
+    }
+
+    public static MetadataQuery metadataQuery(HttpServerRequest request) {
+        String token = request.getParam("token");
+        int limit = Integer.parseInt(request.getParam("limit", "100"));
+        boolean recursive = Boolean.parseBoolean(request.getParam("recursive", "false"));
+        if (limit < 0 || limit > 1000) {
+            throw new IllegalArgumentException("Limit is out of allowed range");
+        }
+        return new MetadataQuery(token, limit, recursive);
+    }
+
     public String generateReference() {
         return UUID.randomUUID().toString();
+    }
+
+    @Nullable
+    public String getClientIpAddress(HttpServerRequest request, int proxyCount) {
+        String val = request.getHeader("X-Forwarded-For");
+        if (StringUtils.isEmpty(val) || proxyCount == 0) {
+            return getRealClientRemoteAddress(request);
+        }
+        String[] ips = val.split(",");
+        int index = ips.length - proxyCount;
+        if (index < 0) {
+            return getRealClientRemoteAddress(request);
+        }
+        return ips[index];
+    }
+
+    @Nullable
+    private String getRealClientRemoteAddress(HttpServerRequest request) {
+        SocketAddress socketAddress = request.connection().remoteAddress(true);
+        if (socketAddress == null || !socketAddress.isInetSocket()) {
+            return null;
+        }
+        return socketAddress.host();
+    }
+
+    public void copyResponse(HttpServerResponse response, HttpClientResponse proxyResponse) {
+        response.setStatusCode(proxyResponse.statusCode());
+        copyHeaders(proxyResponse.headers(), response.headers());
+    }
+
+    public void handleChunkedResponse(HttpServerResponse response, HttpClientResponse proxyResponse) {
+        response.setChunked(true);
+        copyResponse(response, proxyResponse);
+        String contentType = proxyResponse.getHeader(HttpHeaders.CONTENT_TYPE);
+        if (Strings.CI.contains(contentType, "text/event-stream")) {
+            response.putHeader("X-Accel-Buffering", "no");
+        }
+    }
+
+    public ObjectNode parseObject(Buffer buffer) throws IOException {
+        try (InputStream stream = new ByteBufInputStream(buffer.getByteBuf())) {
+            JsonNode node = ProxyUtil.MAPPER.readTree(stream);
+            if (!node.isObject()) {
+                throw new IllegalArgumentException("Invalid json object");
+            }
+            return (ObjectNode) node;
+        }
     }
 }

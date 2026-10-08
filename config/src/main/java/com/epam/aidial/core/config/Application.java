@@ -13,6 +13,7 @@ import lombok.experimental.Accessors;
 import java.net.URI;
 import java.util.Collection;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 @Data
@@ -30,9 +31,28 @@ public class Application extends Deployment {
     @JsonAlias({"applicationTypeSchemaId", "application_type_schema_id"})
     private URI applicationTypeSchemaId;
 
+    @JsonAlias({"viewerUrl", "viewer_url"})
     private String viewerUrl;
 
+    @JsonAlias({"editorUrl", "editor_url"})
     private String editorUrl;
+
+    private Mcp mcp;
+
+    @JsonAlias({"externalServices", "external_services"})
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    private Map<String, ExternalService> externalServices = new LinkedHashMap<>();
+
+    // The app's own actor identity for OBO credential retrieval: SHA-256 hex of its DIAL key, or its workload
+    // client_id (azp). The caller's derived identity must equal it. Absent ⇒ OBO off.
+    @JsonAlias({"appIdentity", "app_identity"})
+    private String appIdentity;
+
+    // Governance: when true, regular users (not just admins/owners) may author external services on this
+    // app. Admin-set, default false ⇒ today's admin-only authoring is preserved.
+    @JsonAlias({"allowUserExternalServices", "allow_user_external_services"})
+    @JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    private boolean allowUserExternalServices;
 
     // maintain the order of routes defined in the app config
     private LinkedHashMap<String, Route> routes = new LinkedHashMap<>();
@@ -124,6 +144,32 @@ public class Application extends Deployment {
         private String content;
     }
 
+    @Data
+    public static class Mcp {
+        @JsonAlias({"endpoint", "dial:endpoint"})
+        private String endpoint;
+        @JsonAlias({"transport", "dial:transport"})
+        private final ToolSet.Transport transport = ToolSet.Transport.HTTP;
+        @JsonAlias({"allowedTools", "allowed_tools", "dial:allowedTools"})
+        private List<String> allowedTools = List.of();
+        @JsonAlias({"configDelivery", "config_delivery", "dial:mcpConfigDelivery"})
+        private McpConfigDelivery configDelivery = McpConfigDelivery.META;
+        @JsonAlias({"forwardAuthToken", "forward_auth_token", "dial:forwardPerRequestKey"})
+        private boolean forwardPerRequestKey = true;
+        @JsonAlias({"mcpApps", "mcp_apps"})
+        private McpApps mcpApps;
+
+        @Data
+        @JsonInclude(JsonInclude.Include.NON_NULL)
+        public static class McpApps {
+            private String domainOverride;
+        }
+    }
+
+    public enum McpConfigDelivery {
+        HEADER, META;
+    }
+
     public Application() {
         super();
     }
@@ -133,25 +179,37 @@ public class Application extends Deployment {
         this.setInvalid(source.getInvalid());
         this.setName(source.getName());
         this.setEndpoint(source.getEndpoint());
+        this.setBaseUrl(source.getBaseUrl());
+        this.setInterfaces(source.getInterfaces());
         this.setDisplayName(source.getDisplayName());
         this.setDisplayVersion(source.getDisplayVersion());
         this.setIconUrl(source.getIconUrl());
         this.setDescription(source.getDescription());
+        this.setIntro(source.getIntro());
         this.setReference(source.getReference());
+        this.setOverrideName(source.getOverrideName());
         this.setUserRoles(source.getUserRoles());
         this.setForwardAuthToken(source.isForwardAuthToken());
         this.setFeatures(source.getFeatures());
         this.setInputAttachmentTypes(source.getInputAttachmentTypes());
         this.setMaxInputAttachments(source.getMaxInputAttachments());
         this.setDefaults(source.getDefaults());
+        this.setResponsesDefaults(source.getResponsesDefaults());
+        this.setDefaultHeaders(source.getDefaultHeaders());
         this.setInterceptors(source.getInterceptors());
         this.setDescriptionKeywords(source.getDescriptionKeywords());
         this.setFunction(source.getFunction());
         this.setApplicationProperties(source.getApplicationProperties());
         this.setApplicationTypeSchemaId(source.getApplicationTypeSchemaId());
+        this.setCatalogProperties(source.getCatalogProperties());
+        this.setCatalogSchemaId(source.getCatalogSchemaId());
         this.setAuthor(source.getAuthor());
         this.setCreatedAt(source.getCreatedAt());
         this.setUpdatedAt(source.getUpdatedAt());
         this.setRoutes(source.getRoutes());
+        this.setMcp(source.getMcp());
+        this.setExternalServices(source.getExternalServices());
+        this.setAppIdentity(source.getAppIdentity());
+        this.setAllowUserExternalServices(source.isAllowUserExternalServices());
     }
 }

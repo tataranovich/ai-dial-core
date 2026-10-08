@@ -1,0 +1,137 @@
+package com.epam.aidial.core.server.function.request;
+
+import com.epam.aidial.core.server.data.cache.CachePrefixPath;
+import com.epam.aidial.core.server.util.ChatUtil;
+import com.epam.aidial.core.server.util.EncryptedContentAffinityUtil;
+import com.epam.aidial.core.server.util.ProxyUtil;
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import javax.annotation.Nullable;
+
+@Slf4j
+@RequiredArgsConstructor
+public class ResponsesApiRequest implements RequestObject {
+    private final ObjectNode tree;
+
+    @Nullable
+    @JsonIgnore
+    private String encryptedUpstreamId;
+
+    @Override
+    public String getModel() {
+        return tree.path("model").asText();
+    }
+
+    @Override
+    public void setModel(String model) {
+        tree.put("model", model);
+    }
+
+    @Override
+    public boolean isStreaming() {
+        return tree.path("stream").asBoolean(false);
+    }
+
+    @Override
+    public Set<String> collectAttachments() {
+        return ChatUtil.collectAttachments(tree, List.of(
+                "$.input[?(!@.type || @.type == 'message')].content[?(@.type == 'input_image')].image_url",
+                "$.input[?(!@.type || @.type == 'message')].content[?(@.type == 'input_file')].file_url",
+                "$.input[?(@.type == 'custom_tool_call_output' || @.type == 'function_call_output')].output[?(@.type == 'input_image')].image_url",
+                "$.input[?(@.type == 'custom_tool_call_output' || @.type == 'function_call_output')].output[?(@.type == 'input_file')].file_url",
+                "$.input[?(@.type == 'computer_call_output')].output.image_url",
+                "$.tools[?(@.type == 'image_generation')].input_image_mask.image_url"));
+    }
+
+    @Override
+    public Set<String> collectAppAttachments(List<String> paths) {
+        return ChatUtil.collectAttachments(tree, paths);
+    }
+
+    /**
+     * {@code tools[i]}, {@code instructions[0]}, {@code input[i]} — candidates come solely from
+     * auto-caching (OpenAI prompt caching has no client breakpoint concept), so {@code hasBreakpoint}
+     * is always {@code false}. {@code input} last guarantees monotonicity: appending a turn never
+     * perturbs an earlier prefix.
+     */
+    @Override
+    public List<CacheKey> buildCacheKeys(List<String> nodeOrder) {
+        CacheKeyBuilder builder = new CacheKeyBuilder();
+        List<CacheKey> result = new ArrayList<>();
+        for (String designator : nodeOrder) {
+            String node = CachePrefixPath.parseNode(designator);
+            if (node == null || !("tools".equals(node) || "instructions".equals(node) || "input".equals(node))) {
+                log.warn("Unsupported prefix path: {}", designator);
+                continue;
+            }
+            appendCacheKeys(builder, node, result);
+        }
+        return result;
+    }
+
+    private void appendCacheKeys(CacheKeyBuilder builder, String node, List<CacheKey> result) {
+        List<JsonNode> elements = CacheKeyBuilder.elements(tree.get(node));
+        for (int index = 0; index < elements.size(); index++) {
+            builder.update(elements.get(index));
+            result.add(builder.buildKey(CachePrefixPath.node(node, index), false));
+        }
+    }
+
+    @Override
+    public void clearInterceptorSettings() {
+        ChatUtil.removeInterceptorConfiguration(tree);
+    }
+
+    @Override
+    public void applyDefaults(Map<String, Object> defaults) {
+        ChatUtil.applyDefaults(tree, defaults);
+    }
+
+    @Override
+    public byte[] serialize() throws JsonProcessingException {
+        return ProxyUtil.MAPPER.writeValueAsBytes(tree);
+    }
+
+    @Override
+    public boolean isStore() {
+        return tree.path("store").asBoolean(true);
+    }
+
+    @Override
+    public boolean isBackground() {
+        return tree.path("background").asBoolean(false);
+    }
+
+    @Nullable
+    @Override
+    public String getEncryptedUpstreamId() {
+        return encryptedUpstreamId;
+    }
+
+    @Override
+    public void setEncryptedUpstreamId(String encryptedUpstreamId) {
+        this.encryptedUpstreamId = encryptedUpstreamId;
+    }
+
+    /**
+     * Resolves and unwraps the upstream config id encoded into any echoed encrypted content items in
+     * {@code input}, mutating them in place back to their provider-native shape.
+     *
+     * @return the resolved upstream config id, or {@code null} if {@code input} is missing or carries no
+     *     wrapped item
+     */
+    @Nullable
+    public String resolveAndUnwrapEncryptedContentAffinity() {
+        return tree.get("input") instanceof ArrayNode input ? EncryptedContentAffinityUtil.resolveAndUnwrap(input) : null;
+    }
+}

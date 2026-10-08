@@ -1,0 +1,6 @@
+type: object
+properties:
+  cached_tokens:
+    type: integer
+  cache_write_tokens:
+    type: integer

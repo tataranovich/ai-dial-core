@@ -2,35 +2,54 @@ package com.epam.aidial.core.server.controller;
 
 import com.epam.aidial.core.config.Application;
 import com.epam.aidial.core.config.Config;
+import com.epam.aidial.core.config.ExternalService;
+import com.epam.aidial.core.config.LocalizedValue;
+import com.epam.aidial.core.config.ResourceAccessType;
+import com.epam.aidial.core.config.ResourceAuthSettings;
+import com.epam.aidial.core.config.Route;
+import com.epam.aidial.core.credentials.service.ResourceAuthSettingsService;
+import com.epam.aidial.core.metaschemas.MetaSchemaHolder;
+import com.epam.aidial.core.openapi.annotations.ApiOperation;
+import com.epam.aidial.core.openapi.annotations.ApiParameter;
+import com.epam.aidial.core.openapi.annotations.ApiResponse;
+import com.epam.aidial.core.openapi.annotations.ApiSchema;
+import com.epam.aidial.core.openapi.annotations.OpenApiDescriptions;
+import com.epam.aidial.core.openapi.annotations.ParameterIn;
 import com.epam.aidial.core.server.Proxy;
 import com.epam.aidial.core.server.ProxyContext;
+import com.epam.aidial.core.server.controller.extraction.ApplicationDeploymentExtractor;
 import com.epam.aidial.core.server.data.ApplicationData;
 import com.epam.aidial.core.server.data.FeaturesData;
+import com.epam.aidial.core.server.data.InterfaceConfigData;
 import com.epam.aidial.core.server.data.ListData;
 import com.epam.aidial.core.server.data.ResourceLink;
-import com.epam.aidial.core.server.data.ResourceTypes;
 import com.epam.aidial.core.server.security.AccessService;
 import com.epam.aidial.core.server.security.EncryptionService;
 import com.epam.aidial.core.server.service.ApplicationSchemaService;
 import com.epam.aidial.core.server.service.ApplicationService;
 import com.epam.aidial.core.server.service.DeploymentService;
 import com.epam.aidial.core.server.service.PermissionDeniedException;
-import com.epam.aidial.core.server.util.ApplicationTypeSchemaProcessingException;
+import com.epam.aidial.core.server.service.ResourceAuthStatusEnricher;
+import com.epam.aidial.core.server.service.UserExternalServiceService;
+import com.epam.aidial.core.server.util.CredentialsLocatorFactory;
 import com.epam.aidial.core.server.util.ProxyUtil;
 import com.epam.aidial.core.server.util.ResourceDescriptorFactory;
-import com.epam.aidial.core.server.validation.ApplicationTypeResourceException;
-import com.epam.aidial.core.server.validation.ApplicationTypeSchemaValidationException;
 import com.epam.aidial.core.server.vertx.AsyncTaskExecutor;
 import com.epam.aidial.core.storage.exception.ResourceNotFoundException;
 import com.epam.aidial.core.storage.http.HttpException;
 import com.epam.aidial.core.storage.http.HttpStatus;
 import com.epam.aidial.core.storage.resource.ResourceDescriptor;
+import com.epam.aidial.core.storage.resource.ResourceTypes;
+import com.epam.aidial.core.storage.util.UrlUtil;
 import io.vertx.core.Future;
 import lombok.extern.slf4j.Slf4j;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 
 @Slf4j
@@ -40,11 +59,13 @@ public class ApplicationController {
     private final EncryptionService encryptionService;
     private final AccessService accessService;
     private final ApplicationService applicationService;
+    private final ResourceAuthSettingsService resourceAuthSettingsService;
 
     private final DeploymentService deploymentService;
     private final ApplicationSchemaService applicationSchemaService;
+    private final UserExternalServiceService userExternalServiceService;
 
-    private final DeploymentService.DeploymentExtractor deploymentExtractor;
+    private final ApplicationDeploymentExtractor deploymentExtractor;
 
     private final AsyncTaskExecutor taskExecutor;
 
@@ -53,31 +74,72 @@ public class ApplicationController {
         this.encryptionService = context.getProxy().getEncryptionService();
         this.accessService = context.getProxy().getAccessService();
         this.applicationService = context.getProxy().getApplicationService();
+        this.resourceAuthSettingsService = context.getProxy().getResourceAuthSettingsService();
         this.deploymentService = context.getProxy().getDeploymentService();
         this.applicationSchemaService = context.getProxy().getApplicationSchemaService();
-        this.deploymentExtractor = new ApplicationDeploymentExtractor();
+        this.userExternalServiceService = context.getProxy().getUserExternalServiceService();
+        this.deploymentExtractor = new ApplicationDeploymentExtractor(accessService, applicationService, applicationSchemaService);
         this.taskExecutor = context.getProxy().getTaskExecutor();
     }
 
+    @ApiOperation(
+            method = "GET",
+            path = "/openai/applications/{application_name}",
+            operationId = "getApplication",
+            tags = {"Deployment listing"},
+            parameters = {
+                    @ApiParameter(name = "application_name", in = ParameterIn.PATH, required = true,
+                            description = OpenApiDescriptions.APPLICATION_NAME)
+            },
+            responses = {
+                    @ApiResponse(code = 200, description = "Success", body = @ApiSchema(implementation = ApplicationData.class)),
+                    @ApiResponse(code = 400),
+                    @ApiResponse(code = 403),
+                    @ApiResponse(code = 404),
+                    @ApiResponse(code = 500)
+            }
+    )
     public Future<?> getApplication(String applicationId) {
-        taskExecutor.submit(() -> deploymentService.findDeployment(context, applicationId))
-                .map(deployment -> {
-                    if (deployment instanceof Application application) {
-                        boolean applicationRequestInfoAboutItSelf = applicationId.equals(context.getDecodedSourceDeployment());
-                        return applicationSchemaService.modifySchemaRichApplication(application, !applicationRequestInfoAboutItSelf);
-                    }
-                    throw new ResourceNotFoundException("Application is not found: " + applicationId);
-                })
-                .map(ApplicationController::mapApplication)
+        taskExecutor.submit(() -> {
+            if (!(deploymentService.findDeployment(context, applicationId) instanceof Application application)) {
+                throw new ResourceNotFoundException("Application is not found: " + applicationId);
+            }
+            boolean applicationRequestInfoAboutItSelf = applicationId.equals(context.getDecodedSourceDeployment());
+            if (application.hasApplicationTypeSchemaId()) {
+                application.setMcp(applicationSchemaService.getMcp(application));
+                application.setViewerUrl(applicationSchemaService.getStringProperty(application, MetaSchemaHolder.APPLICATION_TYPE_VIEWER_URL));
+            }
+            Application modified = applicationSchemaService.modifySchemaRichApplication(application, !applicationRequestInfoAboutItSelf);
+            ApplicationData data = mapApplication(modified);
+            // Single-app GET overlays the caller's own user-authored services and enriches per-user
+            // sign-in status (one credential lookup per service). The listing skips both to avoid
+            // N×M lookups — it returns the inline definitions only.
+            overlayUserAuthoredServices(data, application);
+            new ResourceAuthStatusEnricher(context, resourceAuthSettingsService)
+                    .enrichApplication(UrlUtil.tryDecodePath(data.getId()), data.getExternalServices());
+            return data;
+        })
                 .onSuccess(data -> context.respond(HttpStatus.OK, data))
                 .onFailure(this::respondError);
 
         return Future.succeededFuture();
     }
 
-
-
+    @ApiOperation(
+            method = "GET",
+            path = "/openai/applications",
+            operationId = "getApplications",
+            tags = {"Deployment listing"},
+            responses = {
+                    @ApiResponse(code = 200, description = "Success", body = @ApiSchema(implementation = ListData.class, typeArguments = {ApplicationData.class})),
+                    @ApiResponse(code = 400),
+                    @ApiResponse(code = 403),
+                    @ApiResponse(code = 404),
+                    @ApiResponse(code = 500)
+            }
+    )
     public Future<?> getApplications() {
+        log.debug("Start applications listing");
         Config config = context.getConfig();
         Proxy proxy = context.getProxy();
 
@@ -93,11 +155,27 @@ public class ApplicationController {
             if (applicationService.isIncludeCustomApps()) {
                 list.addAll(deploymentService.listDeployments(context, ResourceTypes.APPLICATION, deploymentExtractor));
             }
-            return list.stream().map(ApplicationController::mapApplication).toList();
-        }).onSuccess(apps -> context.respond(HttpStatus.OK, new ListData<>(apps)))
-                .onFailure(this::respondError);
+            return list.stream().map(this::mapApplication).toList();
+        }).onSuccess(apps -> {
+            log.debug("Finish applications listing");
+            context.respond(HttpStatus.OK, new ListData<>(apps));
+        }).onFailure(this::respondError);
     }
 
+    @ApiOperation(
+            method = "POST",
+            path = "/v1/ops/application/deploy",
+            operationId = "deployApplication",
+            requestBody = @ApiSchema(implementation = ResourceLink.class),
+            tags = {"Applications"},
+            responses = {
+                    @ApiResponse(code = 200, description = "Success", body = @ApiSchema(implementation = Application.class)),
+                    @ApiResponse(code = 400),
+                    @ApiResponse(code = 403),
+                    @ApiResponse(code = 404),
+                    @ApiResponse(code = 500)
+            }
+    )
     public Future<?> deployApplication() {
         context.getRequest()
                 .body()
@@ -113,6 +191,20 @@ public class ApplicationController {
         return Future.succeededFuture();
     }
 
+    @ApiOperation(
+            method = "POST",
+            path = "/v1/ops/application/undeploy",
+            operationId = "undeployApplication",
+            requestBody = @ApiSchema(implementation = ResourceLink.class),
+            tags = {"Applications"},
+            responses = {
+                    @ApiResponse(code = 200, description = "Success", body = @ApiSchema(implementation = Application.class)),
+                    @ApiResponse(code = 400),
+                    @ApiResponse(code = 403),
+                    @ApiResponse(code = 404),
+                    @ApiResponse(code = 500)
+            }
+    )
     public Future<?> undeployApplication() {
         context.getRequest()
                 .body()
@@ -128,6 +220,20 @@ public class ApplicationController {
         return Future.succeededFuture();
     }
 
+    @ApiOperation(
+            method = "POST",
+            path = "/v1/ops/application/redeploy",
+            operationId = "redeployApplication",
+            requestBody = @ApiSchema(implementation = ResourceLink.class),
+            tags = {"Applications"},
+            responses = {
+                    @ApiResponse(code = 200, description = "Success", body = @ApiSchema(implementation = Application.class)),
+                    @ApiResponse(code = 400),
+                    @ApiResponse(code = 403),
+                    @ApiResponse(code = 404),
+                    @ApiResponse(code = 500)
+            }
+    )
     public Future<?> redeployApplication() {
         context.getRequest()
                 .body()
@@ -143,6 +249,20 @@ public class ApplicationController {
         return Future.succeededFuture();
     }
 
+    @ApiOperation(
+            method = "POST",
+            path = "/v1/ops/application/logs",
+            operationId = "getApplicationLogs",
+            requestBody = @ApiSchema(implementation = ResourceLink.class),
+            tags = {"Applications"},
+            responses = {
+                    @ApiResponse(code = 200, description = "Success", body = @ApiSchema(implementation = Application.Logs.class)),
+                    @ApiResponse(code = 400),
+                    @ApiResponse(code = 403),
+                    @ApiResponse(code = 404),
+                    @ApiResponse(code = 500)
+            }
+    )
     public Future<?> getApplicationLogs() {
         context.getRequest()
                 .body()
@@ -192,35 +312,87 @@ public class ApplicationController {
     }
 
     private void respondError(Throwable error) {
-        if (error instanceof IllegalArgumentException) {
-            context.respond(HttpStatus.BAD_REQUEST, error.getMessage());
-        } else if (error instanceof PermissionDeniedException) {
-            context.respond(HttpStatus.FORBIDDEN, error.getMessage());
-        } else if (error instanceof ResourceNotFoundException) {
-            context.respond(HttpStatus.NOT_FOUND, error.getMessage());
-        } else {
-            context.respond(error, "Internal error");
-            log.error("Failed to handle application request", error);
+        switch (error) {
+            case IllegalArgumentException ignored ->
+                    context.respond(HttpStatus.BAD_REQUEST, error.getMessage());
+            case PermissionDeniedException ignored ->
+                    context.respond(HttpStatus.FORBIDDEN, error.getMessage());
+            case ResourceNotFoundException ignored ->
+                    context.respond(HttpStatus.NOT_FOUND, error.getMessage());
+            case null, default -> {
+                context.respond(error, "Internal error");
+                log.error("Failed to handle application request", error);
+            }
         }
     }
 
-    private static ApplicationData mapApplication(Application application) {
+    private boolean hasWriteAccess(Application application) {
+        String appName = application.getName();
+        if (appName != null && appName.equals(context.getDecodedSourceDeployment())) {
+            return true;
+        }
+        // Config-registered deployments (bare name or canonical id) are role-based, not governed
+        // by the resource-sharing ACL below - fall through to the admin check instead.
+        if (appName != null && !context.getConfig().isDeploymentExists(appName)) {
+            try {
+                ResourceDescriptor resource = ResourceDescriptorFactory.fromAnyUrl(appName, encryptionService);
+                if (resource.getType() == ResourceTypes.APPLICATION) {
+                    // Reuses the permissions already batched per folder during the listing that produced
+                    // this Application, instead of re-deriving write access (and re-hitting Redis) per item.
+                    // Falls back to a real lookup for callers that didn't come through that listing (e.g.
+                    // the single-app GET), where the resource was never added to the batched map.
+                    Set<ResourceAccessType> batched = deploymentExtractor.getBatchedPermissions().get(resource);
+                    return batched != null
+                            ? batched.contains(ResourceAccessType.WRITE)
+                            : accessService.hasWriteAccess(resource, context);
+                }
+            } catch (Exception e) {
+                // appName is not DIAL resource url, fall through to admin check
+            }
+        }
+        return accessService.hasAdminAccess(context);
+    }
+
+    // Routes may reference live Route instances shared with the Config (e.g. used for actual request routing),
+    // so upstreams must be cleared on copies rather than mutating the shared objects in place.
+    private static Map<String, Route> clearUpstreams(Map<String, Route> routes) {
+        Map<String, Route> copy = new LinkedHashMap<>();
+        routes.forEach((name, route) -> {
+            Route routeCopy = ProxyUtil.MAPPER.convertValue(route, Route.class);
+            routeCopy.setUpstreams(null);
+            copy.put(name, routeCopy);
+        });
+        return copy;
+    }
+
+    private ApplicationData mapApplication(Application application) {
         ApplicationData data = new ApplicationData();
         data.setInvalid(application.getInvalid());
         data.setId(application.getName());
         data.setApplication(application.getName());
-        data.setDisplayName(application.getDisplayName());
+        if (application.getDisplayName() != null) {
+            data.setDisplayName(application.getDisplayName());
+        } else {
+            data.setDisplayName(LocalizedValue.of(application.getName()));
+        }
         data.setDisplayVersion(application.getDisplayVersion());
         data.setIconUrl(application.getIconUrl());
         data.setDescription(application.getDescription());
-        data.setFeatures(FeaturesData.createFeatures(application.getFeatures()));
+        data.setIntro(application.getIntro());
+        FeaturesData featuresData = FeaturesData.createDeploymentFeatures(application);
+        featuresData.setMcp(application.getMcp() != null);
+        data.setFeatures(featuresData);
         data.setInputAttachmentTypes(application.getInputAttachmentTypes());
         data.setMaxInputAttachments(application.getMaxInputAttachments());
         data.setDefaults(application.getDefaults());
+        data.setResponsesDefaults(application.getResponsesDefaults());
+        data.setInterfaceConfigs(InterfaceConfigData.createInterfaceConfigs(application));
         data.setDescriptionKeywords(application.getDescriptionKeywords());
 
         data.setApplicationTypeSchemaId(application.getApplicationTypeSchemaId());
         data.setApplicationProperties(application.getApplicationProperties());
+        data.setCatalogSchemaId(application.getCatalogSchemaId());
+        data.setCatalogProperties(application.getCatalogProperties());
         String reference = application.getReference();
         data.setReference(reference == null ? application.getName() : reference);
         data.setFunction(application.getFunction());
@@ -236,33 +408,64 @@ public class ApplicationController {
             data.setUpdatedAt(application.getUpdatedAt());
         }
 
-        data.setRoutes(application.getRoutes());
+        Map<String, Route> routes = application.getRoutes();
+        if (!hasWriteAccess(application) && routes != null) {
+            routes = clearUpstreams(routes);
+        }
+        data.setRoutes(routes);
+        data.setViewerUrl(application.getViewerUrl());
+        data.setEditorUrl(application.getEditorUrl());
+        data.setExternalServices(buildExternalServiceViews(application));
 
         return data;
     }
 
-    private class ApplicationDeploymentExtractor implements DeploymentService.DeploymentExtractor {
-        @SuppressWarnings("unchecked")
-        @Override
-        public Application extract(ResourceDescriptor resource, ProxyContext context) {
-            Application application = applicationService.getApplication(resource).getValue();
-            return modifySchemaRichApplication(resource, context, application);
+    // Credential-free view (secrets stripped); status is filled only for the single-app GET.
+    private static Map<String, ExternalService> buildExternalServiceViews(Application application) {
+        Map<String, ExternalService> source = application.getExternalServices();
+        if (source == null || source.isEmpty()) {
+            return null;
         }
-
-        private Application modifySchemaRichApplication(ResourceDescriptor resource, ProxyContext ctx, Application application) {
-            try {
-                boolean applicationRequestInfoAboutItSelf = !Objects.equals(ctx.getDecodedSourceDeployment(),
-                        resource.getDecodedUrl());
-                if (applicationRequestInfoAboutItSelf && !accessService.hasWriteAccess(resource, ctx)) {
-                    application = applicationSchemaService.filterCustomClientProperties(application);
-                }
-                application = applicationSchemaService.modifyEndpointsForCustomApplication(application);
-            } catch (ApplicationTypeSchemaProcessingException | ApplicationTypeResourceException | ApplicationTypeSchemaValidationException ex) {
-                log.warn("Failed to modify application to fulfill schema's restrictions %s".formatted(application.getName()), ex);
-                application.setApplicationProperties(null);
-                application.setInvalid(true);
+        Map<String, ExternalService> views = new LinkedHashMap<>();
+        source.forEach((id, service) -> {
+            if (service != null) {
+                views.put(id, toSafeView(service));
             }
-            return application;
-        }
+        });
+        return views;
     }
+
+    private static ExternalService toSafeView(ExternalService service) {
+        ResourceAuthSettings safe = service.getAuthSettings() == null ? null
+                : service.getAuthSettings().withoutSecrets();
+        return new ExternalService()
+                .setDisplayName(service.getDisplayName())
+                .setDescription(service.getDescription())
+                .setAuthSettings(safe);
+    }
+
+    private void overlayUserAuthoredServices(ApplicationData data, Application application) {
+        if (!application.isAllowUserExternalServices() || context.getUserId() == null) {
+            return;
+        }
+        String appPart = appPart(data.getId());
+        if (appPart == null) {
+            return;
+        }
+        // Secrets are stripped here (toSafeView); inline definitions take precedence — see overlay().
+        Map<String, ExternalService> merged = userExternalServiceService.overlay(
+                data.getExternalServices(), context.getUserId(), appPart, ApplicationController::toSafeView);
+        data.setExternalServices(merged);
+    }
+
+    // Static-config apps expose getId() as the bare app name; dynamic apps as the full
+    // "applications/{bucket}/{path}" url. Normalize to the scope's {app_id} segment.
+    private static String appPart(String id) {
+        if (id == null) {
+            return null;
+        }
+        return id.startsWith(CredentialsLocatorFactory.APPLICATIONS_PREFIX)
+                ? id.substring(CredentialsLocatorFactory.APPLICATIONS_PREFIX.length()) : id;
+    }
+
 }

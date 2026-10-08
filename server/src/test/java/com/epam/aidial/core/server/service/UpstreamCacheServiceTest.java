@@ -1,10 +1,17 @@
 package com.epam.aidial.core.server.service;
 
+import com.epam.aidial.core.config.DeploymentInterface;
 import com.epam.aidial.core.config.Features;
+import com.epam.aidial.core.config.InterfaceType;
 import com.epam.aidial.core.config.Model;
 import com.epam.aidial.core.server.data.cache.CacheBreakpointContext;
 import com.epam.aidial.core.server.data.cache.CachePolicy;
 import com.epam.aidial.core.server.data.cache.CachedUpstreamEntry;
+import com.epam.aidial.core.server.function.request.ChatCompletionRequest;
+import com.epam.aidial.core.server.function.request.MessagesApiRequest;
+import com.epam.aidial.core.server.function.request.RequestObject;
+import com.epam.aidial.core.server.function.request.ResponsesApiRequest;
+import com.epam.aidial.core.server.util.JsonUtil;
 import com.epam.aidial.core.server.util.ProxyUtil;
 import com.epam.aidial.core.storage.service.LockService;
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -14,6 +21,8 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.redisson.Redisson;
 import org.redisson.api.RedissonClient;
 import org.redisson.config.ConfigSupport;
@@ -37,6 +46,29 @@ public class UpstreamCacheServiceTest {
     private LockService lockService;
 
     private UpstreamCacheService service;
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void interfaceCanEnableOrDisableAutomaticBreakpoints(boolean enabled) throws Exception {
+        service = new UpstreamCacheService(redissonClient, lockService, System::currentTimeMillis, null);
+        Model model = new Model();
+        Features features = new Features();
+        features.setAutoCachingSupported(!enabled);
+        model.setFeatures(features);
+        Features overrides = new Features();
+        overrides.setAutoCachingSupported(enabled);
+        DeploymentInterface declared = new DeploymentInterface();
+        declared.setFeatures(overrides);
+        model.setInterfaces(Map.of(InterfaceType.OPENAI_CHAT_COMPLETIONS.getValue(), declared));
+        RequestObject request = new ChatCompletionRequest((ObjectNode) ProxyUtil.MAPPER.readTree("""
+                {"messages":[{"role":"user","content":"hello"}]}
+                """));
+
+        CacheBreakpointContext cache = service.buildCacheBreakpointContext(
+                request, CachePolicy.AVAILABILITY_PRIORITY, model, InterfaceType.OPENAI_CHAT_COMPLETIONS);
+
+        assertEquals(enabled ? List.of("prefix.body.messages[0]") : List.of(), cache.breakpoints());
+    }
 
     @BeforeAll
     public static void beforeAll() throws IOException {
@@ -78,9 +110,44 @@ public class UpstreamCacheServiceTest {
     public void testUpdateEntry() {
         service = new UpstreamCacheService(redissonClient, lockService, System::currentTimeMillis, null);
 
-        service.updateEntry("hash", new CachedUpstreamEntry("http://localhost:8080/chat", "prefix.body.messages[1]", null), new Model(), null);
+        service.updateEntry("hash", new CachedUpstreamEntry("http://localhost:8080/chat", null, "prefix.body.messages[1]", null), new Model(), null);
 
         assertTrue(redissonClient.getKeys().getKeys().iterator().hasNext());
+    }
+
+    @Test
+    public void testUpdateEntryWithoutEndpointPinsById() throws JsonProcessingException {
+        // an upstream configured through interfaces carries no legacy endpoint; Redis rejects a null value,
+        // so the field is omitted and the id alone identifies the pinned upstream
+        service = new UpstreamCacheService(redissonClient, lockService, System::currentTimeMillis, null);
+        String body = """
+                {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "hello",
+                            "custom_fields": {
+                                "cache_breakpoint": {}
+                            }
+                        }
+                    ]
+                }
+                """;
+        RequestObject request = new ChatCompletionRequest((ObjectNode) ProxyUtil.MAPPER.readTree(body));
+        Model model = new Model();
+        model.setName("interfaces-model");
+
+        CacheBreakpointContext context = service.buildCacheBreakpointContext(
+                request, CachePolicy.AVAILABILITY_PRIORITY, model, InterfaceType.OPENAI_CHAT_COMPLETIONS);
+        String breakpoint = context.breakpoints().get(context.breakpoints().size() - 1);
+
+        service.updateEntry(context.prefixToHash().get(breakpoint),
+                new CachedUpstreamEntry(null, "up-1", breakpoint, null), model, null);
+
+        CachedUpstreamEntry entry = service.getCacheEntry(context, model);
+        assertNotNull(entry);
+        assertNull(entry.endpoint());
+        assertEquals("up-1", entry.id());
     }
 
     @Test
@@ -172,11 +239,11 @@ public class UpstreamCacheServiceTest {
                     ]
                 }
                 """;
-        ObjectNode objectNode = (ObjectNode) ProxyUtil.MAPPER.readTree(body);
+        RequestObject request = new ChatCompletionRequest((ObjectNode) ProxyUtil.MAPPER.readTree(body));
         Model model = new Model();
         model.setName("gpt-4");
 
-        CacheBreakpointContext context = service.buildCacheBreakpointContext(objectNode, CachePolicy.AVAILABILITY_PRIORITY, model);
+        CacheBreakpointContext context = service.buildCacheBreakpointContext(request, CachePolicy.AVAILABILITY_PRIORITY, model, InterfaceType.OPENAI_CHAT_COMPLETIONS);
 
         assertNotNull(context);
         assertEquals(4, context.breakpoints().size());
@@ -184,6 +251,36 @@ public class UpstreamCacheServiceTest {
         assertEquals(expectedBreakpoints, context.breakpoints());
         assertEquals(5, context.prefixToHash().size());
         assertEquals(CachePolicy.AVAILABILITY_PRIORITY, context.policy());
+    }
+
+    @Test
+    public void testBuildCacheBreakpointContext_chatCompletionsIgnoresFieldsHashingOrderOverride() throws JsonProcessingException {
+        service = new UpstreamCacheService(redissonClient, lockService, System::currentTimeMillis, null);
+        String body = """
+                {
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {"name": "some_function"},
+                            "custom_fields": {"cache_breakpoint": {}}
+                        }
+                    ],
+                    "messages": [
+                        {"role": "user", "content": "hi"}
+                    ]
+                }
+                """;
+        RequestObject request = new ChatCompletionRequest((ObjectNode) ProxyUtil.MAPPER.readTree(body));
+        Model model = new Model();
+        model.setName("gpt-4");
+        // fieldsHashingOrder is deprecated and must have no effect, even for chat completions
+        model.setFieldsHashingOrder(List.of("prefix.body.messages"));
+
+        CacheBreakpointContext context = service.buildCacheBreakpointContext(
+                request, CachePolicy.AVAILABILITY_PRIORITY, model, InterfaceType.OPENAI_CHAT_COMPLETIONS);
+
+        List<String> expectedBreakpoints = List.of("prefix.body.tools[0]");
+        assertEquals(expectedBreakpoints, context.breakpoints());
     }
 
     @Test
@@ -241,14 +338,14 @@ public class UpstreamCacheServiceTest {
                     ]
                 }
                 """;
-        ObjectNode objectNode = (ObjectNode) ProxyUtil.MAPPER.readTree(body);
+        RequestObject request = new ChatCompletionRequest((ObjectNode) ProxyUtil.MAPPER.readTree(body));
         Model model = new Model();
         model.setName("gpt-4");
         Features features = new Features();
         features.setAutoCachingSupported(true);
         model.setFeatures(features);
 
-        CacheBreakpointContext context = service.buildCacheBreakpointContext(objectNode, CachePolicy.AVAILABILITY_PRIORITY, model);
+        CacheBreakpointContext context = service.buildCacheBreakpointContext(request, CachePolicy.AVAILABILITY_PRIORITY, model, InterfaceType.OPENAI_CHAT_COMPLETIONS);
 
         assertNotNull(context);
         assertEquals(4, context.breakpoints().size());
@@ -347,14 +444,14 @@ public class UpstreamCacheServiceTest {
                     ]
                 }
                 """;
-        ObjectNode objectNode = (ObjectNode) ProxyUtil.MAPPER.readTree(body);
+        RequestObject request = new ChatCompletionRequest((ObjectNode) ProxyUtil.MAPPER.readTree(body));
         Model model = new Model();
         model.setName("gpt-4");
 
-        CacheBreakpointContext context = service.buildCacheBreakpointContext(objectNode, CachePolicy.AVAILABILITY_PRIORITY, model);
+        CacheBreakpointContext context = service.buildCacheBreakpointContext(request, CachePolicy.AVAILABILITY_PRIORITY, model, InterfaceType.OPENAI_CHAT_COMPLETIONS);
         Map<String, String> prefixToHash = context.prefixToHash();
         for (var breakpoint : context.breakpoints()) {
-            CachedUpstreamEntry cachedUpstreamEntry = new CachedUpstreamEntry("http://host/chat", breakpoint, null);
+            CachedUpstreamEntry cachedUpstreamEntry = new CachedUpstreamEntry("http://host/chat", null, breakpoint, null);
             service.updateEntry(prefixToHash.get(breakpoint), cachedUpstreamEntry, model, null);
         }
 
@@ -453,16 +550,74 @@ public class UpstreamCacheServiceTest {
                     ]
                 }
                 """;
-        ObjectNode objectNode = (ObjectNode) ProxyUtil.MAPPER.readTree(body);
+        RequestObject request = new ChatCompletionRequest((ObjectNode) ProxyUtil.MAPPER.readTree(body));
         Model model = new Model();
         model.setName("gpt-4");
 
-        CacheBreakpointContext context = service.buildCacheBreakpointContext(objectNode, CachePolicy.AVAILABILITY_PRIORITY, model);
+        CacheBreakpointContext context = service.buildCacheBreakpointContext(request, CachePolicy.AVAILABILITY_PRIORITY, model, InterfaceType.OPENAI_CHAT_COMPLETIONS);
 
         CachedUpstreamEntry entry = service.getCacheEntry(context, model);
         assertNotNull(entry);
         assertEquals("prefix.body.messages[2]", entry.prefixPath());
         assertNull(entry.endpoint());
+    }
+
+    @Test
+    public void testBuildCacheBreakpointContext_anthropicIgnoresFieldsHashingOrderOverride() throws JsonProcessingException {
+        service = new UpstreamCacheService(redissonClient, lockService, System::currentTimeMillis, null);
+        String body = """
+                {
+                    "system": [
+                        {"type": "text", "text": "System prompt", "cache_control": {"type": "ephemeral"}}
+                    ],
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "hi"},
+                                {"type": "text", "text": "there", "cache_control": {"type": "ephemeral"}}
+                            ]
+                        }
+                    ]
+                }
+                """;
+        RequestObject request = new MessagesApiRequest((ObjectNode) ProxyUtil.MAPPER.readTree(body));
+        Model model = new Model();
+        model.setName("claude");
+        // a chat-completions-only override that would drop `system` entirely if Anthropic ever inherited it
+        model.setFieldsHashingOrder(List.of("prefix.body.tools", "prefix.body.messages"));
+
+        CacheBreakpointContext context = service.buildCacheBreakpointContext(
+                request, CachePolicy.AVAILABILITY_PRIORITY, model, InterfaceType.ANTHROPIC_MESSAGES);
+
+        List<String> expectedBreakpoints = List.of("prefix.body.system[0]", "prefix.body.messages[0].content[1]");
+        assertEquals(expectedBreakpoints, context.breakpoints());
+    }
+
+    @Test
+    public void testBuildCacheBreakpointContext_responsesBuiltInOrder_autoCaching() throws JsonProcessingException {
+        service = new UpstreamCacheService(redissonClient, lockService, System::currentTimeMillis, null);
+        String body = """
+                {
+                    "instructions": "Be concise",
+                    "input": [
+                        {"role": "user", "content": "Hi"},
+                        {"role": "assistant", "content": "Hello"}
+                    ]
+                }
+                """;
+        RequestObject request = new ResponsesApiRequest((ObjectNode) ProxyUtil.MAPPER.readTree(body));
+        Model model = new Model();
+        model.setName("gpt-5-responses");
+        Features features = new Features();
+        features.setAutoCachingSupported(true);
+        model.setFeatures(features);
+
+        CacheBreakpointContext context = service.buildCacheBreakpointContext(
+                request, CachePolicy.AVAILABILITY_PRIORITY, model, InterfaceType.OPENAI_RESPONSES);
+
+        List<String> expectedBreakpoints = List.of("prefix.body.instructions[0]", "prefix.body.input[0]", "prefix.body.input[1]");
+        assertEquals(expectedBreakpoints, context.breakpoints());
     }
 
     @Test
@@ -484,7 +639,7 @@ public class UpstreamCacheServiceTest {
                  }
                  """;
         JsonNode node = ProxyUtil.MAPPER.readTree(simpleJson);
-        JsonNode result = UpstreamCacheService.sortObjectProperties(node);
+        JsonNode result = JsonUtil.sort(node);
         assertEquals("""
                  {"a":{"f":2,"z":1},"c":[{"a":"text","d":true},{"a":false,"z":3}],"d":{"a":2,"b":1}}""", result.toString());
     }

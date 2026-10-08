@@ -1,8 +1,12 @@
 package com.epam.aidial.core.server;
 
+import com.epam.aidial.core.server.util.ProxyUtil;
+import com.fasterxml.jackson.databind.JsonNode;
 import io.vertx.core.http.HttpMethod;
 import lombok.SneakyThrows;
 import okhttp3.Headers;
+import okhttp3.mockwebserver.MockResponse;
+import okhttp3.mockwebserver.RecordedRequest;
 import org.junit.jupiter.api.Test;
 
 import java.net.URI;
@@ -10,6 +14,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
 
 public class FeaturesApiTest extends ResourceBaseTest {
 
@@ -36,29 +42,35 @@ public class FeaturesApiTest extends ResourceBaseTest {
     void testRateEndpointModel() {
         String inboundPath = "/v1/chat-gpt-35-turbo/rate";
         String upstream = "http://localhost:7001/upstream/v1/deployments/gpt-35-turbo/rate_response";
-        testUpstreamEndpoint(inboundPath, upstream);
+        String body = """
+                {
+                  "rate": true,
+                  "responseId": "LLM response ID",
+                  "comment": "user may put an optional comment here on LLM response"
+                }
+                """;
+        testUpstreamEndpoint(inboundPath, upstream, HttpMethod.POST, body);
+    }
+
+    @Test
+    void testConfigurationEndpointModel() {
+        String inboundPath = "/v1/deployments/chat-gpt-35-turbo/configuration";
+        String upstream = "http://localhost:7001/upstream/v1/deployments/gpt-35-turbo/model_config";
+        testUpstreamEndpoint(inboundPath, upstream, HttpMethod.GET);
     }
 
     @Test
     void testRateEndpointApplication() {
         String inboundPath = "/v1/app/rate";
         String upstream = "http://localhost:7001/openai/deployments/10k/rate_response";
-        testUpstreamEndpoint(inboundPath, upstream);
-    }
-
-    @Test
-    void testRateEndpointAssistant() {
-        String inboundPath = "/v1/search-assistant/rate";
-        String upstream = "http://localhost:7001/openai/deployments/search_assistant/rate_response";
-        testUpstreamEndpoint(inboundPath, upstream);
-    }
-
-    @Test
-    void testRateEndpointAssistantDefaultResponse() {
-        // The rate endpoint is unset. Checking the default empty response.
-        String inboundPath = "/v1/assistant/rate";
-        Response response = send(HttpMethod.POST, inboundPath);
-        verify(response, 200, "");
+        String body = """
+                {
+                  "rate": true,
+                  "responseId": "LLM response ID",
+                  "comment": "user may put an optional comment here on LLM response"
+                }
+                """;
+        testUpstreamEndpoint(inboundPath, upstream, HttpMethod.POST, body);
     }
 
     @Test
@@ -86,8 +98,12 @@ public class FeaturesApiTest extends ResourceBaseTest {
         testUpstreamEndpoint(inboundPath, upstream, HttpMethod.POST);
     }
 
-    @SneakyThrows
     void testUpstreamEndpoint(String inboundPath, String upstream, HttpMethod method) {
+        testUpstreamEndpoint(inboundPath, upstream, method, null);
+    }
+
+    @SneakyThrows
+    void testUpstreamEndpoint(String inboundPath, String upstream, HttpMethod method, String body) {
         Headers requestExtraHeaders = new Headers.Builder().add("foo", "bar").build();
         String[] requestExtraHeadersArray = convertHeadersToFlatArray(requestExtraHeaders);
 
@@ -95,11 +111,37 @@ public class FeaturesApiTest extends ResourceBaseTest {
         try (TestWebServer server = new TestWebServer(uri.getPort())) {
             server.map(method, uri.getPath(), request -> {
                 Headers responseHeaders = filterHeaders(request.getHeaders(), requestExtraHeaders);
-                return TestWebServer.createResponse(200, "PONG", convertHeadersToFlatArray(responseHeaders));
+                String path = request.getPath();
+                if (path.endsWith("model_config")) {
+                    assertEquals("http://localhost:7001", request.getHeader(Proxy.HEADER_UPSTREAM_ENDPOINT));
+                    assertEquals("modelKey1", request.getHeader(Proxy.HEADER_UPSTREAM_KEY));
+                }
+                if (path.endsWith("rate_response")) {
+                    return handleRateResponse(request, responseHeaders);
+                } else {
+                    return TestWebServer.createResponse(200, "PONG", convertHeadersToFlatArray(responseHeaders));
+                }
             });
 
-            Response response = send(method, inboundPath, null, "", requestExtraHeadersArray);
+            Response response = send(method, inboundPath, null, body == null ? "" : body, requestExtraHeadersArray);
             verify(response, 200, "PONG", requestExtraHeadersArray);
         }
+    }
+
+    @SneakyThrows
+    private MockResponse handleRateResponse(RecordedRequest request, Headers responseHeaders) {
+        JsonNode body = ProxyUtil.MAPPER.readTree(request.getBody().inputStream());
+        int status = 200;
+        String path = request.getPath();
+        if (path.contains("app")) {
+            if (body.has("comment")) {
+                status = 400;
+            }
+        } else if (path.contains("gpt-35-turbo")) {
+            if (!body.has("comment")) {
+                status = 400;
+            }
+        }
+        return TestWebServer.createResponse(status, "PONG", convertHeadersToFlatArray(responseHeaders));
     }
 }

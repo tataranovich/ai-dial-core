@@ -2,6 +2,9 @@ package com.epam.aidial.core.server.controller;
 
 import com.epam.aidial.core.server.Proxy;
 import com.epam.aidial.core.server.ProxyContext;
+import com.epam.aidial.core.server.config.MergedConfigStore;
+import com.epam.aidial.core.server.controller.route.GlobalRouteController;
+import com.epam.aidial.core.server.security.AccessService;
 import com.epam.aidial.core.server.service.ApplicationService;
 import io.vertx.core.Context;
 import io.vertx.core.Vertx;
@@ -95,62 +98,6 @@ public class ControllerSelectorTest {
         Object arg1 = lambda.getCapturedArg(0);
         assertInstanceOf(ModelController.class, arg1);
         assertEquals("getModels", lambda.getImplMethodName());
-    }
-
-    @Test
-    public void testSelectGetAddonController() {
-        when(request.path()).thenReturn("/openai/addons/addon1");
-        when(request.method()).thenReturn(HttpMethod.GET);
-        Controller controller = ControllerSelector.select(request).build(proxy, context);
-        assertNotNull(controller);
-        SerializedLambda lambda = getSerializedLambda(controller);
-        assertNotNull(lambda);
-        Object arg1 = lambda.getCapturedArg(0);
-        Object arg2 = lambda.getCapturedArg(1);
-        assertInstanceOf(AddonController.class, arg1);
-        assertEquals("addon1", arg2);
-    }
-
-    @Test
-    public void testSelectGetAddonsController() {
-        when(request.path()).thenReturn("/openai/addons");
-        when(request.method()).thenReturn(HttpMethod.GET);
-        Controller controller = ControllerSelector.select(request).build(proxy, context);
-        assertNotNull(controller);
-        SerializedLambda lambda = getSerializedLambda(controller);
-        assertNotNull(lambda);
-        assertEquals(1, lambda.getCapturedArgCount());
-        Object arg1 = lambda.getCapturedArg(0);
-        assertInstanceOf(AddonController.class, arg1);
-        assertEquals("getAddons", lambda.getImplMethodName());
-    }
-
-    @Test
-    public void testSelectGetAssistantController() {
-        when(request.path()).thenReturn("/openai/assistants/as1");
-        when(request.method()).thenReturn(HttpMethod.GET);
-        Controller controller = ControllerSelector.select(request).build(proxy, context);
-        assertNotNull(controller);
-        SerializedLambda lambda = getSerializedLambda(controller);
-        assertNotNull(lambda);
-        Object arg1 = lambda.getCapturedArg(0);
-        Object arg2 = lambda.getCapturedArg(1);
-        assertInstanceOf(AssistantController.class, arg1);
-        assertEquals("as1", arg2);
-    }
-
-    @Test
-    public void testSelectGetAssistantsController() {
-        when(request.path()).thenReturn("/openai/assistants");
-        when(request.method()).thenReturn(HttpMethod.GET);
-        Controller controller = ControllerSelector.select(request).build(proxy, context);
-        assertNotNull(controller);
-        SerializedLambda lambda = getSerializedLambda(controller);
-        assertNotNull(lambda);
-        assertEquals(1, lambda.getCapturedArgCount());
-        Object arg1 = lambda.getCapturedArg(0);
-        assertInstanceOf(AssistantController.class, arg1);
-        assertEquals("getAssistants", lambda.getImplMethodName());
     }
 
     @Test
@@ -259,13 +206,11 @@ public class ControllerSelectorTest {
         assertNotNull(controller);
         SerializedLambda lambda = getSerializedLambda(controller);
         assertNotNull(lambda);
-        assertEquals(3, lambda.getCapturedArgCount());
+        assertEquals(2, lambda.getCapturedArgCount());
         Object arg1 = lambda.getCapturedArg(0);
         Object arg2 = lambda.getCapturedArg(1);
-        Object arg3 = lambda.getCapturedArg(2);
         assertInstanceOf(DeploymentPostController.class, arg1);
         assertEquals("app1", arg2);
-        assertEquals("completions", arg3);
     }
 
     @Test
@@ -276,13 +221,11 @@ public class ControllerSelectorTest {
         assertNotNull(controller);
         SerializedLambda lambda = getSerializedLambda(controller);
         assertNotNull(lambda);
-        assertEquals(3, lambda.getCapturedArgCount());
+        assertEquals(2, lambda.getCapturedArgCount());
         Object arg1 = lambda.getCapturedArg(0);
         Object arg2 = lambda.getCapturedArg(1);
-        Object arg3 = lambda.getCapturedArg(2);
         assertInstanceOf(DeploymentPostController.class, arg1);
         assertEquals("applications/bucket/my-application", arg2);
-        assertEquals("chat/completions", arg3);
     }
 
     @Test
@@ -459,6 +402,87 @@ public class ControllerSelectorTest {
     }
 
     @Test
+    public void testSelectGetPlatformApplicationRoutesToConfigResourceController() {
+        when(request.path()).thenReturn("/v1/applications/platform/my-app");
+        when(request.method()).thenReturn(HttpMethod.GET);
+        stubConfigResourceControllerDependencies();
+        Controller controller = ControllerSelector.select(request).build(proxy, context);
+        assertInstanceOf(ConfigResourceController.class, controller);
+    }
+
+    @Test
+    public void testSelectGetPlatformToolSetRoutesToConfigResourceController() {
+        when(request.path()).thenReturn("/v1/toolsets/platform/my-toolset");
+        when(request.method()).thenReturn(HttpMethod.GET);
+        stubConfigResourceControllerDependencies();
+        Controller controller = ControllerSelector.select(request).build(proxy, context);
+        assertInstanceOf(ConfigResourceController.class, controller);
+    }
+
+    @Test
+    public void testSelectGetPlatformApplicationMetadataRoutesToConfigResourceMetadataController() {
+        when(request.path()).thenReturn("/v1/metadata/applications/platform/my-app");
+        when(request.method()).thenReturn(HttpMethod.GET);
+        when(proxy.getAccessService()).thenReturn(mock(AccessService.class));
+        Controller controller = ControllerSelector.select(request).build(proxy, context);
+        assertInstanceOf(ConfigResourceMetadataController.class, controller);
+    }
+
+    @Test
+    public void testSelectPutPlatformApplicationRoutesToConfigResourceController() {
+        when(request.path()).thenReturn("/v1/applications/platform/my-app");
+        when(request.method()).thenReturn(HttpMethod.PUT);
+        stubConfigResourceControllerDependencies();
+        Controller controller = ControllerSelector.select(request).build(proxy, context);
+        assertInstanceOf(ConfigResourceController.class, controller);
+    }
+
+    @Test
+    public void testSelectDeletePlatformToolSetRoutesToConfigResourceController() {
+        when(request.path()).thenReturn("/v1/toolsets/platform/my-toolset");
+        when(request.method()).thenReturn(HttpMethod.DELETE);
+        stubConfigResourceControllerDependencies();
+        Controller controller = ControllerSelector.select(request).build(proxy, context);
+        assertInstanceOf(ConfigResourceController.class, controller);
+    }
+
+    @Test
+    public void testSelectGetPublicApplicationStillRoutesToResourceController() {
+        // public-bucket applications/toolsets are unaffected by the platform-bucket routes —
+        // they must keep going through the generic RESOURCE route (first match still wins).
+        when(context.getRequest()).thenReturn(request);
+        when(request.path()).thenReturn("/v1/applications/public/my-app");
+        when(request.method()).thenReturn(HttpMethod.GET);
+        Controller controller = ControllerSelector.select(request).build(proxy, context);
+        assertNotNull(controller);
+        SerializedLambda lambda = getSerializedLambda(controller);
+        assertNotNull(lambda);
+        Object arg1 = lambda.getCapturedArg(0);
+        Object arg2 = lambda.getCapturedArg(1);
+        assertInstanceOf(ResourceController.class, arg1);
+        assertEquals("/v1/applications/public/my-app", arg2);
+    }
+
+    @Test
+    public void testSelectGetPublicToolSetStillRoutesToResourceController() {
+        when(context.getRequest()).thenReturn(request);
+        when(request.path()).thenReturn("/v1/toolsets/public/my-toolset");
+        when(request.method()).thenReturn(HttpMethod.GET);
+        Controller controller = ControllerSelector.select(request).build(proxy, context);
+        assertNotNull(controller);
+        SerializedLambda lambda = getSerializedLambda(controller);
+        assertNotNull(lambda);
+        Object arg1 = lambda.getCapturedArg(0);
+        Object arg2 = lambda.getCapturedArg(1);
+        assertInstanceOf(ResourceController.class, arg1);
+        assertEquals("/v1/toolsets/public/my-toolset", arg2);
+    }
+
+    private void stubConfigResourceControllerDependencies() {
+        when(proxy.getConfigStore()).thenReturn(mock(MergedConfigStore.class));
+    }
+
+    @Test
     public void testSelectGetBucketController() {
         when(request.path()).thenReturn("/v1/bucket");
         when(request.method()).thenReturn(HttpMethod.GET);
@@ -497,6 +521,68 @@ public class ControllerSelectorTest {
     }
 
     @Test
+    public void testSelectListDeploymentNamesController() {
+        when(request.path()).thenReturn("/v1/deployment-names");
+        when(request.method()).thenReturn(HttpMethod.GET);
+        Controller controller = ControllerSelector.select(request).build(proxy, context);
+        assertNotNull(controller);
+        SerializedLambda lambda = getSerializedLambda(controller);
+        assertNotNull(lambda);
+        assertInstanceOf(DeploymentController.class, lambda.getCapturedArg(0));
+        assertEquals("listDeploymentNames", lambda.getImplMethodName());
+    }
+
+    @Test
+    public void testSelectGetDeploymentInfoController() {
+        when(request.path()).thenReturn("/v1/deployments/name");
+        when(request.method()).thenReturn(HttpMethod.GET);
+        Controller controller = ControllerSelector.select(request).build(proxy, context);
+        assertNotNull(controller);
+        SerializedLambda lambda = getSerializedLambda(controller);
+        assertNotNull(lambda);
+        Object arg1 = lambda.getCapturedArg(0);
+        Object arg2 = lambda.getCapturedArg(1);
+        assertInstanceOf(DeploymentController.class, arg1);
+        assertEquals("name", arg2);
+    }
+
+    @Test
+    public void testSelectGetDeploymentInfoControllerWithCustomApplication() {
+        when(request.path()).thenReturn("/v1/deployments/applications/bucket/my-application");
+        when(request.method()).thenReturn(HttpMethod.GET);
+        Controller controller = ControllerSelector.select(request).build(proxy, context);
+        assertNotNull(controller);
+        SerializedLambda lambda = getSerializedLambda(controller);
+        assertNotNull(lambda);
+        Object arg1 = lambda.getCapturedArg(0);
+        Object arg2 = lambda.getCapturedArg(1);
+        assertInstanceOf(DeploymentController.class, arg1);
+        assertEquals("applications/bucket/my-application", arg2);
+    }
+
+    // The {id} of the deployment info route spans slashes, so it matches the sub-resource paths as well
+    // and must stay the last registered route.
+    @Test
+    public void testDeploymentInfoRouteDoesNotShadowSubResources() {
+        when(request.method()).thenReturn(HttpMethod.GET);
+
+        when(request.path()).thenReturn("/v1/deployments/name/limits");
+        assertEquals("/v1/deployments/{id}/limits", ControllerSelector.select(request).pathTemplate());
+
+        when(request.path()).thenReturn("/v1/deployments/name/configuration");
+        assertEquals("/v1/deployments/{id}/configuration", ControllerSelector.select(request).pathTemplate());
+
+        when(request.path()).thenReturn("/v1/deployments/name/mcp");
+        assertEquals("/v1/deployments/{id}/mcp", ControllerSelector.select(request).pathTemplate());
+
+        when(request.path()).thenReturn("/v1/deployments/name/route/v1/search");
+        assertEquals("/v1/deployments/{id}/route{routePath}", ControllerSelector.select(request).pathTemplate());
+
+        when(request.path()).thenReturn("/v1/deployments/name");
+        assertEquals("/v1/deployments/{id}", ControllerSelector.select(request).pathTemplate());
+    }
+
+    @Test
     public void testSelectGetLimitsController() {
         when(request.path()).thenReturn("/v1/deployments/name/limits");
         when(request.method()).thenReturn(HttpMethod.GET);
@@ -508,6 +594,28 @@ public class ControllerSelectorTest {
         Object arg2 = lambda.getCapturedArg(1);
         assertInstanceOf(LimitController.class, arg1);
         assertEquals("name", arg2);
+    }
+
+    @Test
+    public void testSelectGetUserLimitsController() {
+        when(request.path()).thenReturn("/v1/user/limits");
+        when(request.method()).thenReturn(HttpMethod.GET);
+        Controller controller = ControllerSelector.select(request).build(proxy, context);
+        assertNotNull(controller);
+        SerializedLambda lambda = getSerializedLambda(controller);
+        assertNotNull(lambda);
+        assertInstanceOf(LimitController.class, lambda.getCapturedArg(0));
+    }
+
+    @Test
+    public void testSelectGetUserUsageController() {
+        when(request.path()).thenReturn("/v1/user/usage");
+        when(request.method()).thenReturn(HttpMethod.GET);
+        Controller controller = ControllerSelector.select(request).build(proxy, context);
+        assertNotNull(controller);
+        SerializedLambda lambda = getSerializedLambda(controller);
+        assertNotNull(lambda);
+        assertInstanceOf(LimitController.class, lambda.getCapturedArg(0));
     }
 
     @Test

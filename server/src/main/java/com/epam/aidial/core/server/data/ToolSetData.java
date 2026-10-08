@@ -1,5 +1,6 @@
 package com.epam.aidial.core.server.data;
 
+import com.epam.aidial.core.config.LocalizedValue;
 import com.epam.aidial.core.config.ToolSet;
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonInclude;
@@ -18,6 +19,8 @@ public class ToolSetData extends SecuredResourceData {
 
     private String transport;
     private List<String> allowedTools;
+    private String provider;
+    private String vendorWebsite;
 
     {
         setObject("toolset");
@@ -31,13 +34,22 @@ public class ToolSetData extends SecuredResourceData {
 
         data.setToolset(toolSet.getName());
         data.setId(toolSet.getName());
-        data.setDisplayName(toolSet.getDisplayName());
+        if (toolSet.getDisplayName() != null) {
+            data.setDisplayName(toolSet.getDisplayName());
+        } else {
+            data.setDisplayName(LocalizedValue.of(toolSet.getName()));
+        }
         data.setIconUrl(toolSet.getIconUrl());
         data.setDisplayVersion(toolSet.getDisplayVersion());
         data.setDescription(toolSet.getDescription());
+        data.setIntro(toolSet.getIntro());
         data.setDescriptionKeywords(toolSet.getDescriptionKeywords());
+        data.setCatalogSchemaId(toolSet.getCatalogSchemaId());
+        data.setCatalogProperties(toolSet.getCatalogProperties());
         data.setReference(toolSet.getReference() == null ? toolSet.getName() : toolSet.getReference());
-        data.setFeatures(FeaturesData.createFeatures(toolSet.getFeatures()));
+        FeaturesData featuresData = FeaturesData.createFeatures(toolSet.getFeatures());
+        featuresData.setMcp(true);
+        data.setFeatures(featuresData);
 
         data.setMaxRetryAttempts(toolSet.getMaxRetryAttempts());
 
@@ -54,6 +66,8 @@ public class ToolSetData extends SecuredResourceData {
         data.setAllowedTools(toolSet.getAllowedTools());
         data.setTransport(toolSet.getTransport().toString());
         data.setAuthSettings(ResourceAuthSettingsData.toData(toolSet.getAuthSettings()));
+        data.setProvider(toolSet.getProvider());
+        data.setVendorWebsite(toolSet.getVendorWebsite());
 
         return data;
     }

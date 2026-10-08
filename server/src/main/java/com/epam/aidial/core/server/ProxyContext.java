@@ -6,14 +6,19 @@ import com.epam.aidial.core.config.Key;
 import com.epam.aidial.core.config.Route;
 import com.epam.aidial.core.server.data.ApiKeyData;
 import com.epam.aidial.core.server.data.cache.CacheBreakpointContext;
+import com.epam.aidial.core.server.log.AnalyticsLogContext;
 import com.epam.aidial.core.server.security.ExtractedClaims;
 import com.epam.aidial.core.server.token.TokenUsage;
+import com.epam.aidial.core.server.token.UsagePerModel;
+import com.epam.aidial.core.server.tracing.GenAiTraceAttributes;
+import com.epam.aidial.core.server.tracing.TracingSettings;
 import com.epam.aidial.core.server.upstream.UpstreamRoute;
 import com.epam.aidial.core.server.util.ProxyUtil;
-import com.epam.aidial.core.server.vertx.stream.BufferingReadStream;
 import com.epam.aidial.core.storage.http.HttpException;
 import com.epam.aidial.core.storage.http.HttpStatus;
 import com.epam.aidial.core.storage.util.UrlUtil;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.vertx.core.Future;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.HttpClientRequest;
@@ -21,6 +26,7 @@ import io.vertx.core.http.HttpClientResponse;
 import io.vertx.core.http.HttpHeaders;
 import io.vertx.core.http.HttpServerRequest;
 import io.vertx.core.http.HttpServerResponse;
+import io.vertx.core.http.ServerWebSocket;
 import lombok.Getter;
 import lombok.Setter;
 import lombok.SneakyThrows;
@@ -31,6 +37,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -38,8 +45,6 @@ import java.util.stream.Stream;
 @Getter
 @Setter
 public class ProxyContext {
-
-    private static final int LOG_MAX_ERROR_LENGTH = 200;
     private static final Set<CharSequence> CORS_SAFE_LIST = Stream.of(
                     HttpHeaders.CACHE_CONTROL,
                     HttpHeaders.CONTENT_LANGUAGE,
@@ -51,7 +56,6 @@ public class ProxyContext {
             .collect(Collectors.toUnmodifiableSet());
 
     private final Proxy proxy;
-    private final Config config;
     // API key of root requester
     private final Key key;
     private final HttpServerRequest request;
@@ -66,24 +70,27 @@ public class ProxyContext {
     private final String parentSpanId;
     // OpenTelemetry trace flags
     private final String traceFlags;
-    // deployment name of the source(application/assistant/model) associated with the current request
+    // deployment name of the source(application/model) associated with the current request
     private final String sourceDeployment;
     private final String decodedSourceDeployment;
 
     private Deployment deployment;
-    private String userSub;
+    private String userId;
     private List<String> userRoles;
     private String userProject;
     private String userHash;
     private TokenUsage tokenUsage;
+    private List<UsagePerModel> usagePerModel;
+    // Raw usage JSON accumulated live from SSE events, for pricing decision-tree evaluation. Null
+    // for non-streaming requests, where ModelCostCalculator parses responseBody directly instead.
+    private JsonNode pricingUsageNode;
     private Route route;
     private UpstreamRoute upstreamRoute;
     private HttpClientRequest proxyRequest;
-    private Map<String, String> requestHeaders = Map.of();
+    private String proxyRequestUri;
     private HttpClientResponse proxyResponse;
     private Buffer requestBody;
     private Buffer responseBody;
-    private BufferingReadStream responseStream; // received from origin
     private long requestTimestamp;
     private long requestBodyTimestamp;
     private long proxyConnectTimestamp;
@@ -93,19 +100,24 @@ public class ProxyContext {
     private ApiKeyData proxyApiKeyData;
     // deployment triggers interceptors
     private String initialDeployment;
-    private String initialDeploymentApi;
-    // List of interceptors copied from the deployment config
+    // List of interceptors copied from the deployment config, global interceptors and application type interceptors
     private List<String> interceptors;
     private boolean isStreamingRequest;
     private String traceOperation;
     // userName to be extracted from JWT or project name belongs to API key
     private String userDisplayName;
     private CacheBreakpointContext cacheBreakpointContext;
+    private ServerWebSocket serverWebSocket;
+    private boolean isStoreResponse;
+    private boolean isBackgroundJob;
+    // read from the log layout, which AsyncTaskExecutor may run on a virtual thread sharing this Vert.x context
+    private final Map<String, Object> tracingAttributes = new ConcurrentHashMap<>();
+    // the merged chat completions body, or the terminal Responses frame - whichever surface streamed
+    private String assembledStreamingResponse;
 
-    public ProxyContext(Proxy proxy, Config config, HttpServerRequest request, ApiKeyData apiKeyData,
+    public ProxyContext(Proxy proxy, HttpServerRequest request, ApiKeyData apiKeyData,
                         ExtractedClaims extractedClaims, String traceId, String spanId, String traceFlags) {
         this.proxy = proxy;
-        this.config = config;
         this.apiKeyData = apiKeyData;
         this.request = request;
         this.response = request.response();
@@ -133,7 +145,7 @@ public class ProxyContext {
         if (extractedClaims != null) {
             this.userRoles = extractedClaims.userRoles();
             this.userHash = extractedClaims.userHash();
-            this.userSub = extractedClaims.sub();
+            this.userId = extractedClaims.userId();
             this.userProject = extractedClaims.project();
             this.userDisplayName = extractedClaims.userDisplayName();
         } else {
@@ -160,13 +172,20 @@ public class ProxyContext {
     }
 
     public Future<?> respond(HttpStatus status, String body) {
+        return respond(status.getCode(), body == null ? null : Buffer.buffer(body));
+    }
+
+    public Future<?> respond(int status, Buffer body) {
         if (body == null) {
-            body = "";
+            body = Buffer.buffer();
         }
 
-        response.setStatusCode(status.getCode()).end(body);
+        // the one funnel every short and error response passes through, and the only place on those paths
+        // that knows the status: the controllers finalize the request before it is set
+        GenAiTraceAttributes.setFailureStatus(this, status);
+        response.setStatusCode(status).end(body);
 
-        if (status != HttpStatus.OK) {
+        if (status < 200 || status >= 300) {
             log.warn("Responding with error. Body: {}", body);
         }
 
@@ -184,6 +203,16 @@ public class ProxyContext {
         return respond(exception.getStatus(), exception.getMessage());
     }
 
+    public Config getConfig() {
+        return proxy.getConfigStore().get();
+    }
+
+    public TracingSettings getTracingSettings() {
+        // respond(...) enriches the span on the error path, and a context can reach it without a proxy -
+        // an NPE from tracing there would turn an error response into a failure to respond at all
+        return proxy == null ? null : proxy.getTracingSettings();
+    }
+
     public String getProject() {
         if (userProject != null) {
             return userProject;
@@ -191,8 +220,35 @@ public class ProxyContext {
         return key == null ? null : key.getProject();
     }
 
+    /**
+     * Returns an identifier of the request initiator: the JWT user id when present,
+     * otherwise the API key project name. Mirrors the fallback used by
+     * {@link com.epam.aidial.core.server.util.BucketBuilder#buildInitiatorBucket(ProxyContext)}
+     * so features that track per-principal state work for both auth types.
+     */
+    public String getInitiatorId() {
+        return userId != null ? userId : getProject();
+    }
+
     public boolean isSecuredApiKey() {
         return key != null && key.isSecured();
+    }
+
+    /**
+     * The whole claim payload as the identity provider returned it, or null for API key authentication.
+     */
+    public ObjectNode getUserClaims() {
+        return extractedClaims == null ? null : extractedClaims.userClaims();
+    }
+
+    /**
+     * How long the core worked on the request: from accepting it to having the full response body. Paths that never
+     * produce a response body, e.g. a deployment without an endpoint, fall back to the current time. Both bounds are
+     * wall-clock, so a backwards clock adjustment in between must not produce a negative duration.
+     */
+    public long calculateOperationDurationMs() {
+        long end = responseBodyTimestamp == 0 ? System.currentTimeMillis() : responseBodyTimestamp;
+        return Math.max(0, end - requestTimestamp);
     }
 
     public List<String> getExecutionPath() {
@@ -209,8 +265,11 @@ public class ProxyContext {
 
     public boolean hasNextInterceptor() {
         // initial call to the deployment or the interceptor calls another deployment
-        if (apiKeyData.getInterceptors() == null || !deployment.getName().equals(getInitialDeployment())) {
-            return !deployment.getInterceptors().isEmpty();
+        // a name is url form for an application and plain config text for a model, so it is decoded the same
+        // lenient way as the source deployment above - a model named "claude-opus-4-8[1m]" is not a valid URI
+        String decodedName = UrlUtil.tryDecodePath(deployment.getName());
+        if (apiKeyData.getInterceptors() == null || !decodedName.equals(getInitialDeployment())) {
+            return !interceptors.isEmpty();
         } else { // make sure if a next interceptor is available from the list
             return apiKeyData.getInterceptorIndex() + 1 < apiKeyData.getInterceptors().size();
         }
@@ -218,10 +277,6 @@ public class ProxyContext {
 
     public String getInitialDeployment() {
         return initialDeployment == null ? apiKeyData.getInitialDeployment() : initialDeployment;
-    }
-
-    public String getInitialDeploymentApi() {
-        return initialDeploymentApi == null ? apiKeyData.getInitialDeploymentApi() : initialDeploymentApi;
     }
 
     public ProxyContext putHeader(CharSequence name, String value) {
@@ -255,5 +310,25 @@ public class ProxyContext {
                 .map(ApiKeyData::getHttpHeaders)
                 .map(h -> h.get(name))
                 .orElse(null);
+    }
+
+    public ProxyContext copyWith(ApiKeyData newApiKeyData) {
+        return new ProxyContext(proxy, request, newApiKeyData, extractedClaims, traceId, spanId, traceFlags);
+    }
+
+    public boolean isOriginalRequest() {
+        return apiKeyData.getPerRequestKey() == null;
+    }
+
+    /**
+     * Merges the streamed chat completions body at most once per request, from {@code responseBody} - the one
+     * body there is. Both the analytics log and the GenAI trace attributes read it, and merging it twice
+     * doubles a full-body scan and merge.
+     */
+    public String assembledChatCompletionsResponse() {
+        if (assembledStreamingResponse == null && responseBody != null) {
+            assembledStreamingResponse = AnalyticsLogContext.assembleStreamingChatCompletionsResponse(responseBody);
+        }
+        return assembledStreamingResponse;
     }
 }

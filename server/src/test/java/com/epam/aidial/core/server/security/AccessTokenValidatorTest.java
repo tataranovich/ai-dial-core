@@ -3,10 +3,14 @@ package com.epam.aidial.core.server.security;
 import com.auth0.jwt.JWT;
 import com.auth0.jwt.algorithms.Algorithm;
 import com.auth0.jwt.interfaces.DecodedJWT;
+import com.epam.aidial.core.server.util.ProxyUtil;
 import com.epam.aidial.core.server.vertx.AsyncTaskExecutor;
+import io.vertx.core.Context;
 import io.vertx.core.Future;
+import io.vertx.core.Promise;
 import io.vertx.core.Vertx;
 import io.vertx.core.http.HttpClient;
+import io.vertx.core.impl.ContextInternal;
 import io.vertx.core.json.JsonObject;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -21,11 +25,13 @@ import java.security.interfaces.RSAPrivateKey;
 import java.security.interfaces.RSAPublicKey;
 import java.util.Collections;
 import java.util.List;
-import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -58,7 +64,7 @@ public class AccessTokenValidatorTest {
 
     @Test
     public void testExtractClaims_01() {
-        AccessTokenValidator validator = new AccessTokenValidator(idpConfig, vertx, taskExecutor, client);
+        AccessTokenValidator validator = new AccessTokenValidator(idpConfig, vertx, taskExecutor, client, "DEBUG");
         Future<ExtractedClaims> future = validator.extractClaims(null);
         assertNotNull(future);
         future.onComplete(res -> {
@@ -69,7 +75,7 @@ public class AccessTokenValidatorTest {
 
     @Test
     public void testExtractClaims_02() {
-        AccessTokenValidator validator = new AccessTokenValidator(idpConfig, vertx, taskExecutor, client);
+        AccessTokenValidator validator = new AccessTokenValidator(idpConfig, vertx, taskExecutor, client, "DEBUG");
         Future<ExtractedClaims> future = validator.extractClaims("bad-auth-header");
         assertNotNull(future);
         future.onComplete(res -> {
@@ -80,7 +86,7 @@ public class AccessTokenValidatorTest {
 
     @Test
     public void testExtractClaims_03() {
-        AccessTokenValidator validator = new AccessTokenValidator(idpConfig, vertx, taskExecutor, client);
+        AccessTokenValidator validator = new AccessTokenValidator(idpConfig, vertx, taskExecutor, client, "DEBUG");
         Future<ExtractedClaims> future = validator.extractClaims("bearer bad-token");
         assertNotNull(future);
         future.onComplete(res -> {
@@ -91,7 +97,7 @@ public class AccessTokenValidatorTest {
 
     @Test
     public void testExtractClaims_04() throws NoSuchAlgorithmException {
-        AccessTokenValidator validator = new AccessTokenValidator(idpConfig, vertx, taskExecutor, client);
+        AccessTokenValidator validator = new AccessTokenValidator(idpConfig, vertx, taskExecutor, client, "DEBUG");
         IdentityProvider provider1 = mock(IdentityProvider.class);
         when(provider1.match(any(DecodedJWT.class))).thenReturn(false);
         IdentityProvider provider2 = mock(IdentityProvider.class);
@@ -111,13 +117,14 @@ public class AccessTokenValidatorTest {
 
     @Test
     public void testExtractClaims_05() throws NoSuchAlgorithmException {
-        AccessTokenValidator validator = new AccessTokenValidator(idpConfig, vertx, taskExecutor, client);
+        AccessTokenValidator validator = new AccessTokenValidator(idpConfig, vertx, taskExecutor, client, "DEBUG");
         IdentityProvider provider1 = mock(IdentityProvider.class);
         when(provider1.match(any(DecodedJWT.class))).thenReturn(false);
         IdentityProvider provider2 = mock(IdentityProvider.class);
         when(provider2.match(any(DecodedJWT.class))).thenReturn(true);
         when(provider2.extractClaimsFromJwt(any(DecodedJWT.class))).thenReturn(Future
-                .succeededFuture(new ExtractedClaims("sub", Collections.emptyList(), "hash", Map.of(), null, null)));
+                .succeededFuture(new ExtractedClaims("sub", Collections.emptyList(), "hash",
+                        ProxyUtil.MAPPER.createObjectNode(), null, null)));
         List<IdentityProvider> providerList = List.of(provider1, provider2);
         validator.setProviders(providerList);
         KeyPair keyPair = generateRsa256Pair();
@@ -129,7 +136,7 @@ public class AccessTokenValidatorTest {
             assertTrue(res.succeeded());
             ExtractedClaims claims = res.result();
             assertNotNull(claims);
-            assertEquals("sub", claims.sub());
+            assertEquals("sub", claims.userId());
             assertEquals(Collections.emptyList(), claims.userRoles());
             assertEquals("hash", claims.userHash());
         });
@@ -137,11 +144,12 @@ public class AccessTokenValidatorTest {
 
     @Test
     public void testExtractClaims_06() throws NoSuchAlgorithmException {
-        AccessTokenValidator validator = new AccessTokenValidator(idpConfig, vertx, taskExecutor, client);
+        AccessTokenValidator validator = new AccessTokenValidator(idpConfig, vertx, taskExecutor, client, "DEBUG");
         IdentityProvider provider = mock(IdentityProvider.class);
         when(provider.hasUserinfoUrl()).thenReturn(false);
         when(provider.extractClaimsFromJwt(any(DecodedJWT.class))).thenReturn(Future
-                .succeededFuture(new ExtractedClaims("sub", Collections.emptyList(), "hash", Map.of(), null, null)));
+                .succeededFuture(new ExtractedClaims("sub", Collections.emptyList(), "hash",
+                        ProxyUtil.MAPPER.createObjectNode(), null, null)));
         List<IdentityProvider> providerList = List.of(provider);
         validator.setProviders(providerList);
         KeyPair keyPair = generateRsa256Pair();
@@ -153,7 +161,7 @@ public class AccessTokenValidatorTest {
             assertTrue(res.succeeded());
             ExtractedClaims claims = res.result();
             assertNotNull(claims);
-            assertEquals("sub", claims.sub());
+            assertEquals("sub", claims.userId());
             assertEquals(Collections.emptyList(), claims.userRoles());
             assertEquals("hash", claims.userHash());
             verify(provider, never()).match(any(DecodedJWT.class));
@@ -162,7 +170,7 @@ public class AccessTokenValidatorTest {
 
     @Test
     public void testExtractClaims_07() {
-        AccessTokenValidator validator = new AccessTokenValidator(idpConfig, vertx, taskExecutor, client);
+        AccessTokenValidator validator = new AccessTokenValidator(idpConfig, vertx, taskExecutor, client, "DEBUG");
         IdentityProvider provider = mock(IdentityProvider.class);
         List<IdentityProvider> providerList = List.of(provider);
         validator.setProviders(providerList);
@@ -176,10 +184,11 @@ public class AccessTokenValidatorTest {
 
     @Test
     public void testExtractClaims_08() {
-        AccessTokenValidator validator = new AccessTokenValidator(idpConfig, vertx, taskExecutor, client);
+        AccessTokenValidator validator = new AccessTokenValidator(idpConfig, vertx, taskExecutor, client, "DEBUG");
         IdentityProvider provider = mock(IdentityProvider.class);
         when(provider.hasUserinfoUrl()).thenReturn(true);
-        ExtractedClaims extractedClaims = new ExtractedClaims("sub", List.of("role1"), "hash", Map.of(), null, null);
+        ExtractedClaims extractedClaims = new ExtractedClaims("sub", List.of("role1"), "hash",
+                ProxyUtil.MAPPER.createObjectNode(), null, null);
         when(provider.extractClaimsFromUserInfo(anyString())).thenReturn(Future.succeededFuture(extractedClaims));
         List<IdentityProvider> providerList = List.of(provider);
         validator.setProviders(providerList);
@@ -194,10 +203,11 @@ public class AccessTokenValidatorTest {
 
     @Test
     public void testExtractClaims_09() {
-        AccessTokenValidator validator = new AccessTokenValidator(idpConfig, vertx, taskExecutor, client);
+        AccessTokenValidator validator = new AccessTokenValidator(idpConfig, vertx, taskExecutor, client, "DEBUG");
         IdentityProvider provider = mock(IdentityProvider.class);
         when(provider.hasUserinfoUrl()).thenReturn(true);
-        ExtractedClaims extractedClaims = new ExtractedClaims("sub", List.of("role1"), "hash", Map.of(), "project1", null);
+        ExtractedClaims extractedClaims = new ExtractedClaims("sub", List.of("role1"), "hash",
+                ProxyUtil.MAPPER.createObjectNode(), "project1", null);
         when(provider.extractClaimsFromUserInfo(anyString())).thenReturn(Future.succeededFuture(extractedClaims));
         List<IdentityProvider> providerList = List.of(provider);
         validator.setProviders(providerList);
@@ -208,7 +218,7 @@ public class AccessTokenValidatorTest {
             assertTrue(res.succeeded());
             ExtractedClaims claims = res.result();
             assertNotNull(claims);
-            assertEquals("sub", claims.sub());
+            assertEquals("sub", claims.userId());
             assertEquals(List.of("role1"), claims.userRoles());
             assertEquals("hash", claims.userHash());
             assertEquals("project1", claims.project());
@@ -222,6 +232,70 @@ public class AccessTokenValidatorTest {
         assertThrows(IllegalArgumentException.class, () -> AccessTokenValidator.extractTokenFromHeader("wrong-token"));
         assertEquals("token", AccessTokenValidator.extractTokenFromHeader("bearer token"));
         assertEquals("token", AccessTokenValidator.extractTokenFromHeader("bearer token more"));
+    }
+
+    @Test
+    public void testResolveProviderByIssuer_singleProviderRefusesAnIssuerItDisclaims() {
+        // The lone provider is the only candidate, but a record minted by an identity provider that has since been
+        // removed must not be refreshed against it — that would use the wrong client.
+        JsonObject single = new JsonObject().put("idp1", idpConfig.getJsonObject("idp1"));
+        AccessTokenValidator validator = new AccessTokenValidator(single, vertx, taskExecutor, client, "DEBUG");
+
+        assertNotNull(validator.resolveProviderByIssuer("issue1"));
+        assertNotNull(validator.resolveProviderByIssuer(null));
+        assertThrows(IllegalArgumentException.class, () -> validator.resolveProviderByIssuer("issue2"));
+    }
+
+    @Test
+    public void testResolveProviderByIssuer_singleProviderWithoutPatternClaimsEveryIssuer() {
+        // Without an issuerPattern a non-match proves nothing, so the provider still answers.
+        JsonObject single = new JsonObject().put("idp1",
+                JsonObject.of("jwksUrl", "http://host1/keys", "rolePath", "role1"));
+        AccessTokenValidator validator = new AccessTokenValidator(single, vertx, taskExecutor, client, "DEBUG");
+
+        assertNotNull(validator.resolveProviderByIssuer("anything"));
+    }
+
+    @Test
+    public void testResolveProvider_withoutTokenFailsAsBadRequest() {
+        AccessTokenValidator validator = new AccessTokenValidator(idpConfig, vertx, taskExecutor, client, "DEBUG");
+        assertThrows(IllegalArgumentException.class, () -> validator.resolveProvider(null));
+    }
+
+    @Test
+    public void testResolveProvider_withoutTokenFailsForSingleProviderToo() {
+        JsonObject single = new JsonObject().put("idp1", idpConfig.getJsonObject("idp1"));
+        AccessTokenValidator validator = new AccessTokenValidator(single, vertx, taskExecutor, client, "DEBUG");
+        assertThrows(IllegalArgumentException.class, () -> validator.resolveProvider(null));
+    }
+
+    @Test
+    public void testExtractClaims_waiterOnSharedUserInfoContinuesOnItsOwnContext() throws Exception {
+        Vertx realVertx = Vertx.vertx();
+        try {
+            AccessTokenValidator validator = new AccessTokenValidator(idpConfig, vertx, taskExecutor, client, "DEBUG");
+            IdentityProvider provider = mock(IdentityProvider.class);
+            when(provider.hasUserinfoUrl()).thenReturn(true);
+            Promise<ExtractedClaims> userInfo = Promise.promise();
+            when(provider.extractClaimsFromUserInfo(anyString())).thenReturn(userInfo.future());
+            validator.setProviders(List.of(provider));
+            String header = getBearerHeaderValue("opaque-token");
+
+            // one event loop: the three tasks below run in order, so the second request is always a waiter
+            ContextInternal loop = (ContextInternal) realVertx.getOrCreateContext();
+            ContextInternal first = loop.duplicate();
+            ContextInternal second = loop.duplicate();
+            CompletableFuture<Context> continuedOn = new CompletableFuture<>();
+            first.runOnContext(v -> validator.extractClaims(header));
+            second.runOnContext(v -> validator.extractClaims(header).onComplete(res -> continuedOn.complete(Vertx.currentContext())));
+            first.runOnContext(v -> userInfo.complete(new ExtractedClaims("sub", List.of(), "hash",
+                    ProxyUtil.MAPPER.createObjectNode(), null, null)));
+
+            // the second request continues on its own context, not on the first request's which completed the lookup
+            assertSame(second, continuedOn.get(5, TimeUnit.SECONDS));
+        } finally {
+            realVertx.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+        }
     }
 
     private static String getBearerHeaderValue(String token) {

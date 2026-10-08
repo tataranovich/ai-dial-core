@@ -2,6 +2,7 @@ package com.epam.aidial.core.server.log.layout;
 
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.classic.spi.IThrowableProxy;
+import ch.qos.logback.classic.spi.ThrowableProxy;
 import ch.qos.logback.core.LayoutBase;
 import com.epam.aidial.core.server.AiDial;
 import com.epam.aidial.core.server.ContextManager;
@@ -11,13 +12,13 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.opentelemetry.api.trace.Span;
 
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.time.Instant;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
-import java.util.stream.Collectors;
-import java.util.stream.Stream;
 
 public class AutoEnrichedOtelJsonLayout extends LayoutBase<ILoggingEvent> {
 
@@ -54,6 +55,10 @@ public class AutoEnrichedOtelJsonLayout extends LayoutBase<ILoggingEvent> {
 
         Map<String, Object> attributes = new LinkedHashMap<>();
 
+        attributes.put("instant", event.getInstant().toString());
+        attributes.put("loggerName", event.getLoggerName());
+        attributes.put("threadName", event.getThreadName());
+
         // Enrich attributes from context
         enrichAttributesFromContext(event, attributes);
         
@@ -62,6 +67,11 @@ public class AutoEnrichedOtelJsonLayout extends LayoutBase<ILoggingEvent> {
         
         // Enrich OpenTelemetry span
         enrichOpenTelemetrySpan(event, attributes);
+
+        // after the span pass: GenAiTraceAttributes already set these on the span, typed
+        if (proxyContext != null) {
+            attributes.putAll(proxyContext.getTracingAttributes());
+        }
 
         Map<String, Object> resource = new HashMap<>();
         resource.put("service.name", serviceName);
@@ -87,7 +97,7 @@ public class AutoEnrichedOtelJsonLayout extends LayoutBase<ILoggingEvent> {
         ProxyContext proxyContext = ContextManager.getProxyContext();
         if (proxyContext != null) {
             attributes.put("user.project", proxyContext.getProject());
-            attributes.put("user.sub", proxyContext.getUserSub());
+            attributes.put("user.id", proxyContext.getUserId());
             if (proxyContext.getRequest() != null) {
                 attributes.put("request.method", proxyContext.getRequest().method().name());
                 attributes.put("request.uri", proxyContext.getRequest().uri());
@@ -102,9 +112,12 @@ public class AutoEnrichedOtelJsonLayout extends LayoutBase<ILoggingEvent> {
     private void enrichExceptionAttributes(ILoggingEvent event, Map<String, Object> attributes) {
         IThrowableProxy throwableProxy = event.getThrowableProxy();
         if (throwableProxy != null) {
-            String stacktrace = Stream.of(throwableProxy.getStackTraceElementProxyArray())
-                    .map(String::valueOf)
-                    .collect(Collectors.joining("\n"));
+            ThrowableProxy throwableProxyImpl = (ThrowableProxy) throwableProxy;
+            Throwable throwable = throwableProxyImpl.getThrowable();
+            StringWriter sw = new StringWriter();
+            PrintWriter pw = new PrintWriter(sw);
+            throwable.printStackTrace(pw);
+            String stacktrace = sw.toString();
 
             attributes.put("error", true);
             attributes.put("exception.type", throwableProxy.getClassName());

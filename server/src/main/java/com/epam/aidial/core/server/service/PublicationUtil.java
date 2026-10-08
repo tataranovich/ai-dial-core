@@ -1,10 +1,10 @@
 package com.epam.aidial.core.server.service;
 
-import com.epam.aidial.core.server.data.ResourceTypes;
 import com.epam.aidial.core.server.security.EncryptionService;
 import com.epam.aidial.core.server.util.ProxyUtil;
 import com.epam.aidial.core.server.util.ResourceDescriptorFactory;
 import com.epam.aidial.core.storage.resource.ResourceDescriptor;
+import com.epam.aidial.core.storage.resource.ResourceTypes;
 import com.epam.aidial.core.storage.util.UrlUtil;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
@@ -127,4 +127,26 @@ public class PublicationUtil {
             return appPath + ResourceDescriptor.PATH_SEPARATOR + "." + appName + ResourceDescriptor.PATH_SEPARATOR;
         }
     }
+
+    /**
+     * Extracts the root bucket location from a given resource location.
+     *
+     * <p>If the location represents a nested resource (e.g., a publication bucket),
+     * this method ensures that only the root bucket location is returned.
+     * Otherwise, the full location is returned unchanged.
+     *
+     * @param location the resource location to extract the root bucket from
+     * @return the root bucket location
+     */
+    public String getRootLocation(String location) {
+        String[] elements = location.split(ResourceDescriptor.PATH_SEPARATOR);
+
+        if (elements.length > 2) {
+            return elements[0] + ResourceDescriptor.PATH_SEPARATOR
+                    + elements[1] + ResourceDescriptor.PATH_SEPARATOR;
+        }
+
+        return location;
+    }
+
 }

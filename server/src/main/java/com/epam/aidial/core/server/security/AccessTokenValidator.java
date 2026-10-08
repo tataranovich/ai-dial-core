@@ -3,7 +3,10 @@ package com.epam.aidial.core.server.security;
 import com.auth0.jwk.UrlJwkProvider;
 import com.auth0.jwt.exceptions.JWTDecodeException;
 import com.auth0.jwt.interfaces.DecodedJWT;
+import com.epam.aidial.core.config.ResourceAuthSettings;
+import com.epam.aidial.core.server.http.HttpProxySelector;
 import com.epam.aidial.core.server.vertx.AsyncTaskExecutor;
+import com.epam.aidial.core.server.vertx.FutureUtil;
 import com.google.common.annotations.VisibleForTesting;
 import io.vertx.core.Future;
 import io.vertx.core.Promise;
@@ -11,9 +14,13 @@ import io.vertx.core.Vertx;
 import io.vertx.core.http.HttpClient;
 import io.vertx.core.http.HttpClientOptions;
 import io.vertx.core.json.JsonObject;
+import io.vertx.core.net.ProxyOptions;
 import lombok.extern.slf4j.Slf4j;
 
 import java.net.MalformedURLException;
+import java.net.Proxy;
+import java.net.ProxySelector;
+import java.net.URI;
 import java.net.URL;
 import java.util.ArrayList;
 import java.util.List;
@@ -34,24 +41,32 @@ public class AccessTokenValidator {
 
     private final ConcurrentMap<String, Future<UserInfoResult>> userInfoCache = new ConcurrentHashMap<>();
 
-    public AccessTokenValidator(JsonObject idpConfig, Vertx vertx, AsyncTaskExecutor taskExecutor, HttpClient client) {
-        this(idpConfig, vertx, taskExecutor, client, new HttpClientOptions());
+    public AccessTokenValidator(JsonObject idpConfig, Vertx vertx, AsyncTaskExecutor taskExecutor, HttpClient client,
+                                String claimsLogLevel) {
+        this(idpConfig, vertx, taskExecutor, client, new HttpClientOptions(), claimsLogLevel);
     }
 
-    public AccessTokenValidator(JsonObject idpConfig, Vertx vertx, AsyncTaskExecutor taskExecutor, HttpClient client, HttpClientOptions clientOptions) {
+    public AccessTokenValidator(JsonObject idpConfig, Vertx vertx, AsyncTaskExecutor taskExecutor, HttpClient client,
+                                HttpClientOptions clientOptions, String claimsLogLevel) {
         int size = idpConfig.size();
         if (size < 1) {
             throw new IllegalArgumentException("At least one identity provider is required");
         }
         GetUserRoleFunctionFactory factory = new GetUserRoleFunctionFactory(client);
+        ProxyOptions proxyOptions = clientOptions.getProxyOptions();
+        ProxySelector jwksProxySelector = (proxyOptions == null) ? null
+                : new HttpProxySelector(proxyOptions, clientOptions.getNonProxyHosts());
         for (String idpKey : idpConfig.fieldNames()) {
             providers.add(new IdentityProvider(idpConfig.getJsonObject(idpKey), vertx, taskExecutor, client, clientOptions, jwksUrl -> {
                 try {
-                    return new UrlJwkProvider(new URL(jwksUrl));
+                    URI uri = URI.create(jwksUrl);
+                    URL url = uri.toURL();
+                    Proxy proxy = (jwksProxySelector == null) ? null : jwksProxySelector.select(uri).getFirst();
+                    return new UrlJwkProvider(url, null, null, proxy);
                 } catch (MalformedURLException e) {
                     throw new IllegalArgumentException(e);
                 }
-            }, factory));
+            }, factory, claimsLogLevel));
         }
         vertx.setPeriodic(0, USER_INFO_EXP_PERIOD_MS, event -> evictExpiredUserInfo());
     }
@@ -80,7 +95,7 @@ public class AccessTokenValidator {
             DecodedJWT jwt = IdentityProvider.decodeJwtToken(accessToken);
             return extractClaimsFromJwt(jwt);
         } catch (JWTDecodeException e) {
-            log.info("JWT decoding error occurred: {}. Try to extract claims from user info endpoint.", e.getMessage());
+            log.debug("JWT decoding error occurred: {}. Try to extract claims from user info endpoint.", e.getMessage());
             // access token is not JWT. let's try to extract claims from user info
             return extractClaimsFromUserInfo(accessToken);
         } catch (Throwable e) {
@@ -116,12 +131,79 @@ public class AccessTokenValidator {
     }
 
     private Future<ExtractedClaims> extractClaimsFromUserInfo(String accessToken, Supplier<Future<UserInfoResult>> fn) {
+        return FutureUtil.shareLookup(userInfoCache, accessToken, fn).map(UserInfoResult::claims);
+    }
 
-        return userInfoCache.computeIfAbsent(accessToken, k -> fn.get())
-                .map(UserInfoResult::claims).onFailure(error -> {
-                    /* we don't need to keep the failed response any longer */
-                    userInfoCache.remove(accessToken);
-                });
+    /**
+     * The offline client of the provider that issued the caller's token, or {@code null} when that provider has
+     * none configured. The provider itself stays inside this package.
+     *
+     * @throws IllegalArgumentException when no token is presented or no provider matches.
+     * @throws JWTDecodeException when the access token is opaque, so the issuer cannot be read from it.
+     */
+    public ResourceAuthSettings resolveOfflineClient(String authHeader) {
+        return resolveProvider(authHeader).getOfflineClient();
+    }
+
+    /**
+     * As above, for a recorded issuer — the refresh path, where there is no caller token to match on.
+     *
+     * @throws IllegalArgumentException when no provider matches.
+     */
+    public ResourceAuthSettings resolveOfflineClientByIssuer(String issuer) {
+        return resolveProviderByIssuer(issuer).getOfflineClient();
+    }
+
+    /** The user id the caller's provider derives from an ID token, via the same {@code userIdPath} as a request. */
+    public String resolveIdTokenUserId(String authHeader, String idToken) {
+        return resolveProvider(authHeader).extractUserIdFromIdToken(idToken);
+    }
+
+    /** Issuer claim of an ID token, recorded at sign-in so a later refresh can find the provider again. */
+    public String extractIdTokenIssuer(String idToken) {
+        return IdentityProvider.decodeJwtToken(idToken).getIssuer();
+    }
+
+    /**
+     * The provider that issued the caller's token. A userinfo-only provider carries no {@code issuerPattern} and so
+     * can never match here, and cannot offer offline credentials.
+     *
+     * @throws IllegalArgumentException when no token is presented or no provider matches.
+     * @throws JWTDecodeException when the access token is opaque, so the issuer cannot be read from it.
+     */
+    IdentityProvider resolveProvider(String authHeader) {
+        String accessToken = extractTokenFromHeader(authHeader);
+        if (accessToken == null) {
+            throw new IllegalArgumentException("Access token must be presented in Auth header");
+        }
+        // The single-provider answer never needs the issuer, which keeps opaque tokens usable there.
+        if (providers.size() == 1) {
+            return providers.get(0);
+        }
+        return resolveProviderByIssuer(IdentityProvider.decodeJwtToken(accessToken).getIssuer());
+    }
+
+    /**
+     * The provider for a recorded issuer, for refreshes where there is no caller token to match on.
+     *
+     * @throws IllegalArgumentException when no provider matches.
+     */
+    IdentityProvider resolveProviderByIssuer(String issuer) {
+        if (providers.size() == 1) {
+            IdentityProvider provider = providers.get(0);
+            // The only candidate, but an issuer it explicitly disclaims means the record was minted by an identity
+            // provider that is no longer configured — refreshing it against this one would use the wrong client.
+            if (issuer != null && provider.hasIssuerPattern() && !provider.matchesIssuer(issuer)) {
+                throw new IllegalArgumentException("Unknown Identity Provider for issuer: " + issuer);
+            }
+            return provider;
+        }
+        for (IdentityProvider idp : providers) {
+            if (idp.matchesIssuer(issuer)) {
+                return idp;
+            }
+        }
+        throw new IllegalArgumentException("Unknown Identity Provider for issuer: " + issuer);
     }
 
     private Future<UserInfoResult> createUserInfoResultFuture(String accessToken, IdentityProvider idp) {
@@ -151,7 +233,7 @@ public class AccessTokenValidator {
                     return null;
                 }
             }
-            promise.fail("IdP is not found in Core settings to support user info endpoint for extracting user claims from access token.");
+            promise.fail(new IdpNotFoundException("IdP is not found in Core settings to support user info endpoint for extracting user claims from access token."));
             return null;
         }).onFailure(promise::fail);
         return promise.future();

@@ -1,13 +1,9 @@
 package com.epam.aidial.core.server.log;
 
-import com.epam.aidial.core.config.Deployment;
-import com.epam.aidial.core.config.Upstream;
-import com.epam.aidial.core.server.Proxy;
-import com.epam.aidial.core.server.ProxyContext;
+import com.epam.aidial.core.server.token.CompletionTokensDetails;
 import com.epam.aidial.core.server.token.PromptTokensDetails;
 import com.epam.aidial.core.server.token.TokenUsage;
-import com.epam.aidial.core.server.upstream.UpstreamRoute;
-import com.epam.aidial.core.server.util.MergeChunks;
+import com.epam.aidial.core.server.token.UsagePerModel;
 import com.epam.aidial.core.server.util.ProxyUtil;
 import com.epam.deltix.gflog.api.Log;
 import com.epam.deltix.gflog.api.LogEntry;
@@ -17,27 +13,24 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.common.annotations.VisibleForTesting;
-import io.netty.buffer.ByteBufInputStream;
-import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
-import io.vertx.core.http.HttpMethod;
-import io.vertx.core.http.HttpServerRequest;
-import io.vertx.core.http.HttpServerResponse;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.concurrent.BasicThreadFactory;
+import org.apache.commons.lang3.mutable.MutableBoolean;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
-import java.util.Optional;
-import java.util.Scanner;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.ThreadPoolExecutor;
+import java.util.regex.Pattern;
 import javax.annotation.Nullable;
 
 @Slf4j
@@ -46,10 +39,25 @@ public class GfLogStore implements LogStore {
     private static final Log LOGGER = LogFactory.getLog("aidial.log");
     // Max allowed size is 4 mb for request/response body
     private static final int MAX_BODY_SIZE_BYTES = 4 * 1024 * 1024;
+    // Max allowed size for a single collected request header value
+    private static final int MAX_HEADER_VALUE_LENGTH = 4 * 1024;
+    // Max allowed size for a single collected claim value, matching the header limit
+    private static final int MAX_CLAIM_VALUE_LENGTH = 4 * 1024;
+
+    private static final String[] CONTROL_SYMBOLS = new String[0x1F + 1];
+
+    static {
+        for (int i = 0; i < CONTROL_SYMBOLS.length; i++) {
+            String s = String.format("%04x", i);
+            CONTROL_SYMBOLS[i] = s.toUpperCase();
+        }
+    }
 
     private final ExecutorService executor;
+    private final AnalyticsSettings settings;
 
-    public GfLogStore() {
+    public GfLogStore(AnalyticsSettings settings) {
+        this.settings = settings;
         BasicThreadFactory factory = BasicThreadFactory.builder()
                 .namingPattern("gflog-store-%d")
                 .daemon(true)
@@ -58,32 +66,23 @@ public class GfLogStore implements LogStore {
     }
 
     @Override
-    public void save(ProxyContext context) {
-        if (!LOGGER.isInfoEnabled() || !context.getRequest().method().equals(HttpMethod.POST)) {
+    public void save(AnalyticsLogContext logContext) {
+        if (!LOGGER.isInfoEnabled() || !"POST".equals(logContext.getRequestMethod())) {
             return;
         }
         // run the process of saving analytics logs in a single thread in order to reduce memory footprint.
         // Gflog allocates a buffer per thread: the more threads the more buffers need to be allocated.
-        executor.submit(() -> doSave(context));
+        executor.submit(() -> doSave(logContext));
     }
 
-    private Void doSave(ProxyContext context) {
+    private Void doSave(AnalyticsLogContext logContext) {
         // Note. Any logs must be written by slf4j logger:
         // 1. before the prompt logger starts writing any message OR
         // 2. after the prompt logger ends writing messages
 
-        // Any new items must be added to the section below
-        // prepare items to be written by the prompt logger
-        Buffer responseBody = context.getResponseBody();
-        String assembledStreamingResponse = null;
-        if (isStreamingResponse(responseBody) && !exceedLimit(responseBody)) {
-            assembledStreamingResponse = assembleStreamingResponse(responseBody);
-        }
-        // end
-
         LogEntry entry = LOGGER.log(LogLevel.INFO);
         try {
-            append(context, entry, assembledStreamingResponse);
+            append(logContext, entry);
             entry.commit();
         } catch (Throwable e) {
             entry.abort();
@@ -92,24 +91,30 @@ public class GfLogStore implements LogStore {
         return null;
     }
 
-    private void append(ProxyContext context, LogEntry entry, String assembledStreamingResponse) throws JsonProcessingException {
-        HttpServerRequest request = context.getRequest();
-        HttpServerResponse response = context.getResponse();
-
+    @VisibleForTesting
+    void append(AnalyticsLogContext logContext, LogEntry entry) throws JsonProcessingException {
         append(entry, "{\"apiType\":\"DialOpenAI\",\"chat\":{\"id\":\"", false);
-        append(entry, context.getRequestHeader(Proxy.HEADER_CONVERSATION_ID), true);
+        append(entry, logContext.getConversationId(), true);
 
         append(entry, "\"},\"project\":{\"id\":\"", false);
-        append(entry, context.getProject(), true);
+        append(entry, logContext.getProject(), true);
 
         append(entry, "\"},\"user\":{\"id\":\"", false);
-        append(entry, context.getUserHash(), true);
+        append(entry, logContext.getUserHash(), true);
 
         append(entry, "\",\"title\":\"", false);
-        append(entry, context.getRequestHeader(Proxy.HEADER_JOB_TITLE), true);
+        append(entry, logContext.getJobTitle(), true);
         append(entry, "\"}", false);
 
-        TokenUsage tokenUsage = context.getTokenUsage();
+        if (settings.claimsEnabled()) {
+            appendClaims(logContext, entry);
+        }
+
+        if (settings.collectHeaders()) {
+            appendHeaders(logContext, entry);
+        }
+
+        TokenUsage tokenUsage = logContext.getTokenUsage();
         if (tokenUsage != null) {
             append(entry, ",\"token_usage\":{", false);
             append(entry, "\"completion_tokens\":", false);
@@ -120,8 +125,16 @@ public class GfLogStore implements LogStore {
             append(entry, Long.toString(tokenUsage.getTotalTokens()), true);
             if (tokenUsage.getPromptTokensDetails() != null) {
                 PromptTokensDetails details = tokenUsage.getPromptTokensDetails();
-                append(entry, ",\"prompt_token_details\":{\"cached_tokens\":", false);
+                append(entry, ",\"prompt_tokens_details\":{\"cached_tokens\":", false);
                 append(entry, Long.toString(details.getCachedTokens()), true);
+                append(entry, ",\"cache_write_tokens\":", false);
+                append(entry, Long.toString(details.getCacheWriteTokens()), true);
+                append(entry, "}", false);
+            }
+            if (tokenUsage.getCompletionTokensDetails() != null) {
+                CompletionTokensDetails details = tokenUsage.getCompletionTokensDetails();
+                append(entry, ",\"completion_tokens_details\":{\"reasoning_tokens\":", false);
+                append(entry, Long.toString(details.getReasoningTokens()), true);
                 append(entry, "}", false);
             }
             if (tokenUsage.getCost() != null) {
@@ -135,101 +148,90 @@ public class GfLogStore implements LogStore {
             append(entry, "}", false);
         }
 
-        Deployment deployment = context.getDeployment();
-        if (deployment != null) {
+        List<UsagePerModel> usagePerModel = logContext.getUsagePerModel();
+        if (usagePerModel != null && !usagePerModel.isEmpty()) {
+            append(entry, ",\"usage_per_model\":", false);
+            append(entry, ProxyUtil.MAPPER.writeValueAsString(usagePerModel), false);
+        }
+
+        if (logContext.getDeploymentName() != null) {
             append(entry, ",\"deployment\":\"", false);
-            append(entry, deployment.getName(), true);
+            append(entry, logContext.getDeploymentName(), true);
             append(entry, "\"", false);
         }
 
-        String parentDeployment = getParentDeployment(context);
-        if (parentDeployment != null) {
+        if (logContext.getParentDeployment() != null) {
             append(entry, ",\"parent_deployment\":\"", false);
-            append(entry, parentDeployment, true);
+            append(entry, logContext.getParentDeployment(), true);
             append(entry, "\"", false);
         }
 
-        List<String> executionPath = context.getExecutionPath();
+        List<String> executionPath = logContext.getExecutionPath();
         if (executionPath != null) {
             append(entry, ",\"execution_path\":", false);
             append(entry, ProxyUtil.MAPPER.writeValueAsString(executionPath), false);
         }
 
-        if (!context.isSecuredApiKey()) {
+        append(entry, ",\"operation_duration_ms\":", false);
+        append(entry, Long.toString(logContext.getOperationDurationMs()), true);
+
+        if (!logContext.isSecuredApiKey()) {
             append(entry, ",\"assembled_response\":\"", false);
-            if (assembledStreamingResponse != null) {
-                append(entry, assembledStreamingResponse, true);
+            if (logContext.getAssembledStreamingResponse() != null) {
+                appendBody(entry, Buffer.buffer(logContext.getAssembledStreamingResponse()));
             } else {
-                append(entry, context.getResponseBody());
+                appendBody(entry, logContext.getResponseBody());
             }
             append(entry, "\"", false);
         }
 
         append(entry, ",\"trace\":{\"trace_id\":\"", false);
-        append(entry, context.getTraceId(), true);
+        append(entry, logContext.getTraceId(), true);
 
         append(entry, "\",\"core_span_id\":\"", false);
-        append(entry, context.getSpanId(), true);
+        append(entry, logContext.getSpanId(), true);
 
-        String parentSpanId = context.getParentSpanId();
+        String parentSpanId = logContext.getParentSpanId();
         if (parentSpanId != null) {
             append(entry, "\",\"core_parent_span_id\":\"", false);
-            append(entry, context.getParentSpanId(), true);
+            append(entry, logContext.getParentSpanId(), true);
         }
 
         append(entry, "\"},\"request\":{\"protocol\":\"", false);
-        append(entry, request.version().alpnName().toUpperCase(), true);
+        append(entry, logContext.getRequestProtocol(), true);
 
         append(entry, "\",\"method\":\"", false);
-        append(entry, request.method().name(), true);
+        append(entry, logContext.getRequestMethod(), true);
 
         append(entry, "\",\"uri\":\"", false);
-        append(entry, request.uri(), true);
+        append(entry, logContext.getRequestUri(), true);
 
         append(entry, "\",\"time\":\"", false);
-        append(entry, formatTimestamp(context.getRequestTimestamp()), true);
+        append(entry, formatTimestamp(logContext.getRequestTimestamp()), true);
 
-        if (!context.isSecuredApiKey()) {
+        if (!logContext.isSecuredApiKey()) {
             append(entry, "\",\"body\":\"", false);
-            append(entry, context.getRequestBody());
+            appendBody(entry, logContext.getRequestBody());
         }
 
         append(entry, "\"},\"response\":{\"status\":\"", false);
-        append(entry, Integer.toString(response.getStatusCode()), true);
+        append(entry, Integer.toString(logContext.getResponseStatusCode()), true);
 
-        Optional<String> upstreamEndpoint = Optional.ofNullable(context.getUpstreamRoute())
-                .map(UpstreamRoute::get).map(Upstream::getEndpoint);
-        if (upstreamEndpoint.isPresent()) {
+        if (logContext.getUpstreamEndpoint() != null) {
             append(entry, "\",\"upstream_uri\":\"", false);
-            append(entry, upstreamEndpoint.get(), true);
+            append(entry, logContext.getUpstreamEndpoint(), true);
         }
 
-        if (!context.isSecuredApiKey()) {
+        if (!logContext.isSecuredApiKey()) {
             append(entry, "\",\"body\":\"", false);
-            append(entry, context.getResponseBody());
+            appendBody(entry, logContext.getResponseBody());
         }
 
         append(entry, "\"}}", false);
     }
 
-    private static void append(LogEntry entry, Buffer buffer) {
-        if (buffer == null) {
-            return;
-        }
-        boolean largeBuffer = exceedLimit(buffer);
-        if (largeBuffer) {
-            buffer = buffer.slice(0, MAX_BODY_SIZE_BYTES);
-        }
-        byte[] bytes = buffer.getBytes();
-        String chars = new String(bytes, StandardCharsets.UTF_8); // not efficient, but ok for now
-        append(entry, chars, true);
-        if (largeBuffer) {
-            // append a special marker that entry is cut off due to its large size
-            append(entry, ">>", false);
-        }
-    }
-
-    private static void append(LogEntry entry, String chars, boolean escape) {
+    @VisibleForTesting
+    static void append(LogEntry entry, String chars, boolean escape) {
         if (chars == null) {
             return;
         }
@@ -250,11 +252,204 @@ public class GfLogStore implements LogStore {
                 entry.append(chars, j, i);
                 entry.append('\\');
                 entry.append(e);
+                if (e == 'u') {
+                    entry.append(CONTROL_SYMBOLS[c]);
+                }
                 j = i + 1;
             }
         }
 
         entry.append(chars, j, i);
+    }
+
+    @VisibleForTesting
+    void appendClaims(AnalyticsLogContext context, LogEntry entry) throws JsonProcessingException {
+        append(entry, ",\"claims\":{", false);
+        MutableBoolean firstMember = new MutableBoolean(true);
+        Set<String> written = mayRepeatNames() ? new HashSet<>() : null;
+        if (settings.collectClaims()) {
+            if (appendStringMember(entry, "user_id", context.getUserId(), firstMember)) {
+                reserveName(written, "user_id");
+            }
+            List<String> roles = context.getUserRoles();
+            if (roles != null) {
+                appendSeparator(entry, firstMember);
+                append(entry, "\"roles\":", false);
+                append(entry, ProxyUtil.MAPPER.writeValueAsString(roles), false);
+                reserveName(written, "roles");
+            }
+            if (appendStringMember(entry, "user_display_name", context.getUserDisplayName(), firstMember)) {
+                reserveName(written, "user_display_name");
+            }
+        }
+        appendAllowedClaims(context.getUserClaims(), entry, firstMember, written);
+        append(entry, "}", false);
+    }
+
+    /**
+     * Whether two sources may contribute the same member name, which would produce a duplicate JSON key. Within a
+     * single source names are unique already: the allowlist is deduplicated when parsed, and so are the claim
+     * payload's own field names.
+     */
+    private boolean mayRepeatNames() {
+        boolean allowlisted = !settings.claimsAllowlist().isEmpty();
+        return settings.collectClaims() && (allowlisted || settings.collectAllClaims())
+                || settings.collectAllClaims() && allowlisted;
+    }
+
+    /**
+     * Claims the member name, returning false when it was already written and must not be repeated. A null set means
+     * no two sources are active, so nothing can collide.
+     */
+    private static boolean reserveName(@Nullable Set<String> written, String name) {
+        return written == null || written.add(name);
+    }
+
+    private void appendAllowedClaims(ObjectNode claims, LogEntry entry, MutableBoolean firstMember,
+                                     @Nullable Set<String> written) throws JsonProcessingException {
+        if (claims == null) {
+            return;
+        }
+        if (settings.collectAllClaims()) {
+            Iterator<String> names = claims.fieldNames();
+            while (names.hasNext()) {
+                String name = names.next();
+                appendClaimMember(entry, name, claims.get(name), firstMember, written);
+            }
+        }
+        for (AnalyticsSettings.ClaimPath allowed : settings.claimsAllowlist()) {
+            appendClaimMember(entry, allowed.name(), resolveClaim(claims, allowed.segments()), firstMember, written);
+        }
+    }
+
+    private static JsonNode resolveClaim(ObjectNode claims, List<String> path) {
+        JsonNode node = claims;
+        for (String segment : path) {
+            node = node.get(segment);
+            if (node == null) {
+                return null;
+            }
+        }
+        return node;
+    }
+
+    private static void appendClaimMember(LogEntry entry, String name, JsonNode value, MutableBoolean firstMember,
+                                          @Nullable Set<String> written) throws JsonProcessingException {
+        if (value == null || value.isNull() || !reserveName(written, name)) {
+            return;
+        }
+        appendSeparator(entry, firstMember);
+        append(entry, "\"", false);
+        append(entry, name, true);
+        append(entry, "\":", false);
+        String json = ProxyUtil.MAPPER.writeValueAsString(value);
+        if (json.length() <= MAX_CLAIM_VALUE_LENGTH) {
+            // already valid JSON, so it must not be escaped again
+            append(entry, json, false);
+        } else {
+            // cutting JSON in half would not parse, so an oversized value is reported as a truncated string instead
+            append(entry, "\"", false);
+            append(entry, truncate(json, MAX_CLAIM_VALUE_LENGTH), true);
+            append(entry, ">>\"", false);
+        }
+    }
+
+    @VisibleForTesting
+    void appendHeaders(AnalyticsLogContext context, LogEntry entry) {
+        append(entry, ",\"headers\":{", false);
+        Map<String, List<String>> headers = context.getRequestHeaders();
+        MutableBoolean firstMember = new MutableBoolean(true);
+        if (headers != null) {
+            for (Map.Entry<String, List<String>> header : headers.entrySet()) {
+                String name = header.getKey();
+                if (!isHeaderCollectable(name)) {
+                    continue;
+                }
+                appendSeparator(entry, firstMember);
+                append(entry, "\"", false);
+                append(entry, name, true);
+                append(entry, "\":\"", false);
+                String value = String.join(", ", header.getValue());
+                boolean truncated = value.length() > MAX_HEADER_VALUE_LENGTH;
+                if (truncated) {
+                    value = truncate(value, MAX_HEADER_VALUE_LENGTH);
+                }
+                append(entry, value, true);
+                if (truncated) {
+                    // append a special marker that the value is cut off due to its large size
+                    append(entry, ">>", false);
+                }
+                append(entry, "\"", false);
+            }
+        }
+        append(entry, "}", false);
+    }
+
+    private boolean isHeaderCollectable(String name) {
+        List<Pattern> allowlist = settings.headersAllowlist();
+        if (allowlist != null && !matchesAny(allowlist, name)) {
+            return false;
+        }
+        return !matchesAny(settings.headersBlacklist(), name);
+    }
+
+    private static boolean matchesAny(List<Pattern> patterns, String name) {
+        for (Pattern pattern : patterns) {
+            if (pattern.matcher(name).matches()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * @return true when the member was written, false when there was no value to write.
+     */
+    private static boolean appendStringMember(LogEntry entry, String name, String value, MutableBoolean firstMember) {
+        if (value == null) {
+            return false;
+        }
+        appendSeparator(entry, firstMember);
+        append(entry, "\"", false);
+        append(entry, name, true);
+        append(entry, "\":\"", false);
+        append(entry, value, true);
+        append(entry, "\"", false);
+        return true;
+    }
+
+    private static void appendSeparator(LogEntry entry, MutableBoolean firstMember) {
+        if (firstMember.isTrue()) {
+            firstMember.setFalse();
+        } else {
+            append(entry, ",", false);
+        }
+    }
+
+    /**
+     * Cuts a value known to be longer than {@code length}, never between the halves of a surrogate pair: a lone
+     * surrogate has no UTF-8 encoding and would reach the log as a replacement character at best.
+     */
+    private static String truncate(String value, int length) {
+        int end = Character.isHighSurrogate(value.charAt(length - 1)) ? length - 1 : length;
+        return value.substring(0, end);
+    }
+
+    private static void appendBody(LogEntry entry, Buffer buffer) {
+        if (buffer == null) {
+            return;
+        }
+        boolean largeBuffer = exceedLimit(buffer);
+        if (largeBuffer) {
+            buffer = buffer.slice(0, MAX_BODY_SIZE_BYTES);
+        }
+        byte[] bytes = buffer.getBytes();
+        String chars = new String(bytes, StandardCharsets.UTF_8); // not efficient, but ok for now
+        append(entry, chars, true);
+        if (largeBuffer) {
+            // append a special marker that entry is cut off due to its large size
+            append(entry, ">>", false);
+        }
     }
 
     private static char escape(char c) {
@@ -265,7 +460,7 @@ public class GfLogStore implements LogStore {
             case '\r' -> 'r';
             case '\t' -> 't';
             case '"', '\\', '/' -> c;
-            default -> 0;
+            default -> c <= 0x1F ? 'u' : 0;
         };
     }
 
@@ -276,151 +471,5 @@ public class GfLogStore implements LogStore {
 
     private static boolean exceedLimit(Buffer body) {
         return body.length() > MAX_BODY_SIZE_BYTES;
-    }
-
-    /**
-     * Assembles streaming response into a single one.
-     * The assembling process merges chunks of the streaming response one by one using separator: <code>\n*data: *</code>
-     *
-     * @param response byte array response to be assembled.
-     * @return assembled streaming response
-     */
-    @Nullable
-    static String assembleStreamingResponse(@Nullable Buffer response) {
-        if (response == null) {
-            return null;
-        }
-        try (Scanner scanner = new Scanner(new ByteBufInputStream(response.getByteBuf()))) {
-            ObjectNode last = null;
-            JsonNode usage = null;
-            JsonNode statistics = null;
-            JsonNode systemFingerprint = null;
-            JsonNode model = null;
-            JsonNode choices = null;
-            // each chunk is separated by one or multiple new lines with the prefix: 'data:' (except the first chunk)
-            // chunks may contain `data:` inside chunk data, which may lead to incorrect parsing
-            scanner.useDelimiter("(^data: *|\n+data: *)");
-            while (scanner.hasNext()) {
-                String chunk = scanner.next();
-                if (chunk.startsWith("[DONE]")) {
-                    break;
-                }
-                ObjectNode tree = (ObjectNode) ProxyUtil.MAPPER.readTree(chunk);
-                usage = MergeChunks.merge(usage, tree.get("usage"));
-                statistics = MergeChunks.merge(statistics, tree.get("statistics"));
-                if (tree.get("system_fingerprint") != null) {
-                    systemFingerprint = tree.get("system_fingerprint");
-                }
-                if (model == null && tree.get("model") != null) {
-                    model = tree.get("model");
-                }
-                last = tree;
-                choices = MergeChunks.merge(choices, tree.get("choices"));
-            }
-
-            if (last == null) {
-                log.warn("no chunk is found in streaming response");
-                return "{}";
-            }
-
-            ObjectNode result = ProxyUtil.MAPPER.createObjectNode();
-            result.set("id", last.get("id"));
-            result.put("object", "chat.completion");
-            result.set("created", last.get("created"));
-            result.set("model", model);
-
-            if (usage != null) {
-                MergeChunks.removeIndices(usage);
-                result.set("usage", usage);
-            }
-            if (statistics != null) {
-                MergeChunks.removeIndices(statistics);
-                result.set("statistics", statistics);
-            }
-            if (systemFingerprint != null) {
-                result.set("system_fingerprint", systemFingerprint);
-            }
-
-            if (choices != null) {
-                if (choices.isArray()) {
-                    for (JsonNode choice : choices) {
-                        MergeChunks.removeIndices(choice);
-                        if (choice.isObject()) {
-                            ObjectNode choiceObj = (ObjectNode) choice;
-                            JsonNode delta = choiceObj.get("delta");
-                            if (delta != null) {
-                                choiceObj.set("message", delta);
-                                choiceObj.remove("delta");
-                            }
-                        }
-                    }
-                }
-
-                result.set("choices", choices);
-            }
-            return ProxyUtil.convertToString(result);
-        } catch (Throwable e) {
-            log.warn("Can't assemble streaming response", e);
-            return "{}";
-        }
-    }
-
-    /**
-     * Determines if the given response is streaming.
-     * <p>
-     *     Streaming response is spitted into chunks. Each chunk starts with a new line and has a prefix: 'data:'.
-     *     For example<br/>
-     *     <code>
-     *         data: {content: "some text"}
-     *         \n\ndata: {content: "some text"}
-     *         \ndata: [DONE]
-     *     </code>
-     * </p>
-     *
-     * @param response byte array response.
-     * @return <code>true</code> is the response is streaming.
-     */
-    static boolean isStreamingResponse(@Nullable Buffer response) {
-        if (response == null) {
-            return false;
-        }
-        int i = 0;
-        for (; i < response.length(); i++) {
-            byte b = response.getByte(i);
-            if (!Character.isWhitespace(b)) {
-                break;
-            }
-        }
-        String dataToken = "data:";
-        int j = 0;
-        for (; i < response.length() && j < dataToken.length(); i++, j++) {
-            if (dataToken.charAt(j) != response.getByte(i)) {
-                break;
-            }
-        }
-        return j == dataToken.length();
-    }
-
-    @VisibleForTesting
-    static String getParentDeployment(ProxyContext context) {
-        List<String> interceptors = context.getInterceptors();
-        if (interceptors == null) {
-            return context.getSourceDeployment();
-        }
-        // skip interceptors and return the deployment which called the current one
-        List<String> executionPath = context.getExecutionPath();
-        if (executionPath == null) {
-            return null;
-        }
-        int i = executionPath.size() - 2;
-        for (int j = interceptors.size() - 1; i >= 0 && j >= 0; i--, j--) {
-            String deployment = executionPath.get(i);
-            String interceptor = interceptors.get(j);
-            if (!deployment.equals(interceptor)) {
-                log.warn("Can't find parent deployment because interceptor path doesn't match: expected - {}, actual - {}", interceptor, deployment);
-                return null;
-            }
-        }
-        return i < 0 ? null : executionPath.get(i);
     }
 }

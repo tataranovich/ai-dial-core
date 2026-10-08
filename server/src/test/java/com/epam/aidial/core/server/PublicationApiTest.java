@@ -2,24 +2,167 @@ package com.epam.aidial.core.server;
 
 import com.epam.aidial.core.server.data.ApiKeyData;
 import com.epam.aidial.core.server.data.Publications;
-import com.epam.aidial.core.server.data.ResourceTypes;
 import com.epam.aidial.core.server.util.ProxyUtil;
+import com.epam.aidial.core.storage.resource.ResourceTypes;
 import com.epam.aidial.core.storage.util.UrlUtil;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import io.vertx.core.http.HttpMethod;
+import okhttp3.mockwebserver.MockResponse;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
+import java.io.File;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class PublicationApiTest extends ResourceBaseTest {
+
+    @Test
+    void testPublishApplicationWithOauthExternalServiceReencryptsSecret() {
+        String plaintextSecret = "pub-plaintext-secret";
+        AtomicReference<String> tokenBody = new AtomicReference<>();
+        TestWebServer.Handler handler = request -> {
+            tokenBody.set(request.getBody().readUtf8());
+            return new MockResponse()
+                    .setBody("{\"access_token\":\"a\",\"refresh_token\":\"r\",\"expires_in\":3600}")
+                    .setHeader("Content-Type", "application/json");
+        };
+        try (TestWebServer ignore = new TestWebServer(9876, handler)) {
+            Response r = send(HttpMethod.PUT, "/v1/applications/%s/pub-ext-app".formatted(bucket), null, """
+                    {
+                        "endpoint": "http://localhost:7001/v1/x",
+                        "display_name": "Pub Ext App",
+                        "external_services": {
+                            "sf": {
+                                "auth_settings": {
+                                    "authentication_type": "OAUTH",
+                                    "client_id": "cid",
+                                    "client_secret": "%s",
+                                    "authorization_endpoint": "http://localhost:9876/authorize",
+                                    "token_endpoint": "http://localhost:9876/token",
+                                    "token_endpoint_auth_method": "client_secret_post"
+                                }
+                            }
+                        }
+                    }
+                    """.formatted(plaintextSecret));
+            assertEquals(200, r.status(), r.body());
+
+            r = send(HttpMethod.POST, "/v1/ops/publication/create", null, """
+                    {
+                        "name": "Pub ext app",
+                        "targetFolder": "public/folder/",
+                        "resources": [
+                            {"action":"ADD","sourceUrl":"applications/%s/pub-ext-app","targetUrl":"applications/public/folder/pub-ext-app"}
+                        ],
+                        "rules": [{"source":"roles","function":"TRUE"}]
+                    }
+                    """.formatted(bucket));
+            assertEquals(200, r.status(), r.body());
+
+            r = send(HttpMethod.POST, "/v1/ops/publication/approve", null,
+                    "{\"url\":\"publications/" + bucket + "/0123\"}", "authorization", "admin");
+            assertEquals(200, r.status(), r.body());
+
+            // OAUTH sign-in against the PUBLISHED app: the secret must re-encrypt once and decrypt
+            // back to plaintext at runtime (guards against double-encryption on publish).
+            Response signIn = send(HttpMethod.POST, "/v1/ops/external-service/signin", null, """
+                    {
+                        "url": "applications/public/folder/pub-ext-app/external_services/sf",
+                        "credentials_level": "USER",
+                        "authentication_type": "OAUTH",
+                        "code": "auth-code"
+                    }
+                    """, "authorization", "admin");
+            assertEquals(200, signIn.status(), signIn.body());
+            assertNotNull(tokenBody.get(), "token endpoint should have been called on sign-in");
+            assertTrue(tokenBody.get().contains("client_secret=" + plaintextSecret),
+                    "published app's external-service secret must decrypt to plaintext, got: " + tokenBody.get());
+        }
+    }
+
+    @Test
+    void testUpdatePublicationWithOauthExternalServiceKeepsSecretSingleEncrypted() {
+        // updatePublication re-puts the review app to rewrite links via getApplication()+putApplication();
+        // without decrypting on read it double-encrypts the external-service secret. Guards that path.
+        String plaintextSecret = "upd-plaintext-secret";
+        AtomicReference<String> tokenBody = new AtomicReference<>();
+        TestWebServer.Handler handler = request -> {
+            tokenBody.set(request.getBody().readUtf8());
+            return new MockResponse()
+                    .setBody("{\"access_token\":\"a\",\"refresh_token\":\"r\",\"expires_in\":3600}")
+                    .setHeader("Content-Type", "application/json");
+        };
+        try (TestWebServer ignore = new TestWebServer(9876, handler)) {
+            Response r = send(HttpMethod.PUT, "/v1/applications/%s/upd-ext-app".formatted(bucket), null, """
+                    {
+                        "endpoint": "http://localhost:7001/v1/x",
+                        "display_name": "Upd Ext App",
+                        "external_services": {
+                            "sf": {
+                                "auth_settings": {
+                                    "authentication_type": "OAUTH",
+                                    "client_id": "cid",
+                                    "client_secret": "%s",
+                                    "authorization_endpoint": "http://localhost:9876/authorize",
+                                    "token_endpoint": "http://localhost:9876/token",
+                                    "token_endpoint_auth_method": "client_secret_post"
+                                }
+                            }
+                        }
+                    }
+                    """.formatted(plaintextSecret));
+            assertEquals(200, r.status(), r.body());
+
+            String resources = """
+                    "resources": [
+                        {"action":"ADD","sourceUrl":"applications/%s/upd-ext-app","targetUrl":"applications/public/folder/upd-ext-app"}
+                    ],
+                    "rules": [{"source":"roles","function":"TRUE"}]
+                    """.formatted(bucket);
+
+            r = send(HttpMethod.POST, "/v1/ops/publication/create", null,
+                    "{\"name\":\"Upd\",\"targetFolder\":\"public/folder/\"," + resources + "}");
+            assertEquals(200, r.status(), r.body());
+
+            // Re-submit the pending publication — this routes through updatePublication's link re-put.
+            r = send(HttpMethod.POST, "/v1/ops/publication/update", null,
+                    "{\"url\":\"publications/" + bucket + "/0123\",\"targetFolder\":\"public/folder/\"," + resources + "}",
+                    "authorization", "admin");
+            assertEquals(200, r.status(), r.body());
+
+            r = send(HttpMethod.POST, "/v1/ops/publication/approve", null,
+                    "{\"url\":\"publications/" + bucket + "/0123\"}", "authorization", "admin");
+            assertEquals(200, r.status(), r.body());
+
+            Response signIn = send(HttpMethod.POST, "/v1/ops/external-service/signin", null, """
+                    {
+                        "url": "applications/public/folder/upd-ext-app/external_services/sf",
+                        "credentials_level": "USER",
+                        "authentication_type": "OAUTH",
+                        "code": "auth-code"
+                    }
+                    """, "authorization", "admin");
+            assertEquals(200, signIn.status(), signIn.body());
+            assertNotNull(tokenBody.get(), "token endpoint should have been called on sign-in");
+            assertTrue(tokenBody.get().contains("client_secret=" + plaintextSecret),
+                    "secret must stay single-encrypted through publication update, got: " + tokenBody.get());
+        }
+    }
 
     private static final String PUBLICATION_REQUEST = """
             {
@@ -92,7 +235,8 @@ class PublicationApiTest extends ResourceBaseTest {
                 "action": "ADD",
                 "sourceUrl" : "conversations/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/my/folder/conversation",
                 "targetUrl" : "conversations/public/folder/conversation",
-                "reviewUrl" : "conversations/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/conversation"
+                "reviewUrl" : "conversations/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/conversation",
+                "publishCredentials" : false
                } ],
               "resourceTypes" : [ "CONVERSATION" ],
               "rules" : [ {
@@ -154,7 +298,6 @@ class PublicationApiTest extends ResourceBaseTest {
                     "temperature": 1,
                     "folderId": "conversations/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo",
                     "messages": [],
-                    "selectedAddons": ["R", "T", "G"],
                     "assistantModelId": "assistantId",
                     "lastActivityDate": 4848683153
                 }
@@ -220,7 +363,8 @@ class PublicationApiTest extends ResourceBaseTest {
                     "action": "ADD",
                     "sourceUrl" : "conversations/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/my/folder/conversation",
                     "targetUrl" : "conversations/public/folder/conversation",
-                    "reviewUrl" : "conversations/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/conversation"
+                    "reviewUrl" : "conversations/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/conversation",
+                    "publishCredentials" : false
                    } ],
                    "resourceTypes" : [ "CONVERSATION" ],
                    "rules" : [],
@@ -431,7 +575,8 @@ class PublicationApiTest extends ResourceBaseTest {
                     "action": "ADD",
                     "sourceUrl" : "conversations/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/my/folder/conversation",
                     "targetUrl" : "conversations/public/folder/conversation",
-                    "reviewUrl" : "conversations/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/conversation"
+                    "reviewUrl" : "conversations/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/conversation",
+                    "publishCredentials": false
                    } ],
                    "resourceTypes" : [ "CONVERSATION" ],
                    "rules" : [],
@@ -647,7 +792,6 @@ class PublicationApiTest extends ResourceBaseTest {
                         ]
                     }
                 }],
-                "selectedAddons": ["R", "T", "G"],
                 "assistantModelId": "assistantId",
                 "lastActivityDate": 4848683153
                 }
@@ -673,13 +817,15 @@ class PublicationApiTest extends ResourceBaseTest {
                     "action": "ADD",
                     "sourceUrl" : "conversations/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/my/folder/conversation1",
                     "targetUrl" : "conversations/public/folder/conversation1",
-                    "reviewUrl" : "conversations/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/conversation1"
+                    "reviewUrl" : "conversations/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/conversation1",
+                    "publishCredentials" : false
                     },
                     {
                     "action": "ADD_IF_ABSENT",
                     "sourceUrl" : "files/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/file",
                     "targetUrl" : "files/public/folder/file",
-                    "reviewUrl" : "files/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/file"
+                    "reviewUrl" : "files/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/file",
+                    "publishCredentials" : false
                     }
                    ],
                    "resourceTypes" : [ "@ignore", "@ignore" ],
@@ -711,13 +857,15 @@ class PublicationApiTest extends ResourceBaseTest {
                     "action": "ADD",
                     "sourceUrl" : "conversations/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/my/folder/conversation2",
                     "targetUrl" : "conversations/public/folder/conversation2",
-                    "reviewUrl" : "conversations/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhQHmtD7fN295EFSG4HiW8Zi/conversation2"
+                    "reviewUrl" : "conversations/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhQHmtD7fN295EFSG4HiW8Zi/conversation2",
+                    "publishCredentials" : false
                     },
                     {
                     "action": "ADD_IF_ABSENT",
                     "sourceUrl" : "files/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/file",
                     "targetUrl" : "files/public/folder/file",
-                    "reviewUrl" : "files/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhQHmtD7fN295EFSG4HiW8Zi/file"
+                    "reviewUrl" : "files/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhQHmtD7fN295EFSG4HiW8Zi/file",
+                    "publishCredentials" : false
                     }
                    ],
                    "resourceTypes" : [ "@ignore", "@ignore" ],
@@ -758,7 +906,8 @@ class PublicationApiTest extends ResourceBaseTest {
                     "action": "ADD",
                     "sourceUrl" : "conversations/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/my/folder/conversation",
                     "targetUrl" : "conversations/public/folder/conversation",
-                    "reviewUrl" : "conversations/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/conversation"
+                    "reviewUrl" : "conversations/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/conversation",
+                    "publishCredentials" : false
                    } ],
                    "resourceTypes" : [ "CONVERSATION" ],
                    "rules" : [ {
@@ -836,7 +985,8 @@ class PublicationApiTest extends ResourceBaseTest {
                     "action": "ADD",
                     "sourceUrl" : "conversations/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/my/folder/conversation",
                     "targetUrl" : "conversations/public/folder/conversation",
-                    "reviewUrl" : "conversations/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/conversation"
+                    "reviewUrl" : "conversations/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/conversation",
+                    "publishCredentials" : false
                   } ],
                   "resourceTypes" : [ "CONVERSATION" ],
                   "rules" : [ {
@@ -1201,7 +1351,8 @@ class PublicationApiTest extends ResourceBaseTest {
                     "action": "ADD",
                     "sourceUrl" : "conversations/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/my/folder/conversation",
                     "targetUrl" : "conversations/public/folder/conversation",
-                    "reviewUrl" : "conversations/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/conversation"
+                    "reviewUrl" : "conversations/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/conversation",
+                    "publishCredentials" : false
                    } ],
                   "resourceTypes" : [ "CONVERSATION" ],
                   "rules" : [ {
@@ -1224,7 +1375,8 @@ class PublicationApiTest extends ResourceBaseTest {
                     "action": "ADD",
                     "sourceUrl" : "conversations/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/my/folder/conversation",
                     "targetUrl" : "conversations/public/folder/conversation",
-                    "reviewUrl" : "conversations/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/conversation"
+                    "reviewUrl" : "conversations/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/conversation",
+                    "publishCredentials" : false
                    } ],
                    "resourceTypes" : [ "CONVERSATION" ],
                    "rules" : [ {
@@ -1681,7 +1833,8 @@ class PublicationApiTest extends ResourceBaseTest {
                     "action" : "ADD",
                     "sourceUrl" : "applications/%s/test_app",
                     "targetUrl" : "applications/public/folder/with_apps/test_app",
-                    "reviewUrl" : "applications/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/with_apps/test_app"
+                    "reviewUrl" : "applications/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/with_apps/test_app",
+                    "publishCredentials" : false
                   }],
                   "resourceTypes" : [ "APPLICATION" ],
                   "rules" : [ {
@@ -1698,6 +1851,64 @@ class PublicationApiTest extends ResourceBaseTest {
         response = operationRequest("/v1/ops/publication/approve", PUBLICATION_URL, "authorization", "admin");
         verify(response, 200);
 
+    }
+
+    @Test
+    void testApplicationWithTypeSchemaPublish_Ok_DuplicateFileReference() {
+        Response response = upload(HttpMethod.PUT, "/v1/files/%s/screenshot.png".formatted(bucket), null, """
+                  Test1
+                """);
+
+        Assertions.assertEquals(200, response.status());
+
+        response = send(HttpMethod.PUT, "/v1/applications/%s/test_app_dup".formatted(bucket), null, """
+                  {
+                      "displayName": "test_app_dup",
+                      "applicationTypeSchemaId": "https://mydial.somewhere.com/custom_application_schemas/specific_application_type",
+                      "applicationProperties": {
+                        "property1": "test property1",
+                        "property2": "test property2",
+                        "property3": [
+                                "files/%s/screenshot.png",
+                                "files/%s/screenshot.png"
+                        ]
+                       },
+                       "userRoles": [
+                            "Admin"
+                       ],
+                       "forwardAuthToken": true,
+                       "iconUrl": "https://mydial.somewhere.com/app-icon.svg",
+                       "description": "My application description"
+                  }
+                """.formatted(bucket, bucket));
+        Assertions.assertEquals(200, response.status());
+
+        response = operationRequest("/v1/ops/publication/create", """
+                {
+                      "name": "Publication of my application",
+                      "targetFolder": "public/folder/",
+                      "resources": [
+                        {
+                          "action": "ADD",
+                          "sourceUrl": "applications/%s/test_app_dup",
+                          "targetUrl": "applications/public/folder/with_apps/test_app_dup"
+                        }
+                      ],
+                      "rules": [
+                        {
+                          "source": "roles",
+                          "function": "TRUE"
+                        }
+                      ]
+                    }
+                """.formatted(bucket));
+        Assertions.assertEquals(200, response.status());
+
+        // Before the fix: 400 "Can't copy source file: ..." (second identical copyResource call fails
+        // because the same file URL is collected twice from the schema and the second copy hits an
+        // already-existing destination).
+        response = operationRequest("/v1/ops/publication/approve", PUBLICATION_URL, "authorization", "admin");
+        verify(response, 200);
     }
 
     @Test
@@ -1764,7 +1975,8 @@ class PublicationApiTest extends ResourceBaseTest {
                             "action" : "ADD",
                             "sourceUrl" : "applications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/test_app2",
                             "targetUrl" : "applications/public/folder/with_apps/test_app2",
-                            "reviewUrl" : "applications/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/with_apps/test_app2"
+                            "reviewUrl" : "applications/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/with_apps/test_app2",
+                            "publishCredentials" : false
                           }
                   ],
                   "resourceTypes" : [ "APPLICATION" ],
@@ -1793,6 +2005,7 @@ class PublicationApiTest extends ResourceBaseTest {
                   "reference" : "@ignore",
                   "forward_auth_token" : false,
                   "defaults" : { },
+                  "responses_defaults" : { },
                   "interceptors" : [ ],
                   "description_keywords" : [ ],
                   "max_retry_attempts" : 1,
@@ -1826,6 +2039,7 @@ class PublicationApiTest extends ResourceBaseTest {
                   "reference" : "@ignore",
                   "forward_auth_token" : false,
                   "defaults" : { },
+                  "responses_defaults" : { },
                   "interceptors" : [ ],
                   "description_keywords" : [ ],
                   "max_retry_attempts" : 1,
@@ -1928,7 +2142,8 @@ class PublicationApiTest extends ResourceBaseTest {
                             "action" : "ADD",
                             "sourceUrl" : "applications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/test_app3",
                             "targetUrl" : "applications/public/abc_app",
-                            "reviewUrl" : "applications/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/abc_app"
+                            "reviewUrl" : "applications/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/abc_app",
+                            "publishCredentials" : false
                           }
                   ],
                   "resourceTypes" : [ "APPLICATION" ],
@@ -1952,6 +2167,7 @@ class PublicationApiTest extends ResourceBaseTest {
                   "reference" : "@ignore",
                   "forward_auth_token" : false,
                   "defaults" : { },
+                  "responses_defaults" : { },
                   "interceptors" : [ ],
                   "description_keywords" : [ ],
                   "max_retry_attempts" : 1,
@@ -1984,6 +2200,7 @@ class PublicationApiTest extends ResourceBaseTest {
                   "reference" : "@ignore",
                   "forward_auth_token" : false,
                   "defaults" : { },
+                  "responses_defaults" : { },
                   "interceptors" : [ ],
                   "description_keywords" : [ ],
                   "max_retry_attempts" : 1,
@@ -2060,7 +2277,8 @@ class PublicationApiTest extends ResourceBaseTest {
                             "action" : "ADD",
                             "sourceUrl" : "applications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/test",
                             "targetUrl" : "applications/public/test",
-                            "reviewUrl" : "applications/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/test"
+                            "reviewUrl" : "applications/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/test",
+                            "publishCredentials" : false
                           }
                   ],
                   "resourceTypes" : [ "APPLICATION" ],
@@ -2084,6 +2302,7 @@ class PublicationApiTest extends ResourceBaseTest {
                   "reference" : "@ignore",
                   "forward_auth_token" : false,
                   "defaults" : { },
+                  "responses_defaults" : { },
                   "interceptors" : [ ],
                   "description_keywords" : [ ],
                   "max_retry_attempts" : 1,
@@ -2116,6 +2335,7 @@ class PublicationApiTest extends ResourceBaseTest {
                   "reference" : "@ignore",
                   "forward_auth_token" : false,
                   "defaults" : { },
+                  "responses_defaults" : { },
                   "interceptors" : [ ],
                   "description_keywords" : [ ],
                   "max_retry_attempts" : 1,
@@ -2220,7 +2440,8 @@ class PublicationApiTest extends ResourceBaseTest {
                        "action" : "ADD",
                        "sourceUrl" : "applications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/test%%20app%%202",
                        "targetUrl" : "applications/public/xyz%%20app%%204",
-                       "reviewUrl" : "applications/%s/xyz%%20app%%204"
+                       "reviewUrl" : "applications/%s/xyz%%20app%%204",
+                       "publishCredentials" : false
                      }],
                   "resourceTypes" : [ "APPLICATION" ],
                   "author" : "EPM-RTC-GPT"
@@ -2249,6 +2470,7 @@ class PublicationApiTest extends ResourceBaseTest {
                    "reference" : "@ignore",
                    "forward_auth_token" : false,
                    "defaults" : { },
+                   "responses_defaults" : { },
                    "interceptors" : [ ],
                    "description_keywords" : [ ],
                    "max_retry_attempts" : 1,
@@ -2330,7 +2552,8 @@ class PublicationApiTest extends ResourceBaseTest {
                        "action" : "ADD",
                        "sourceUrl" : "applications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/test%20app%202",
                        "targetUrl" : "applications/public/xyz%20app%204",
-                       "reviewUrl" : "applications/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/xyz%20app%204"
+                       "reviewUrl" : "applications/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/xyz%20app%204",
+                       "publishCredentials" : false
                      }],
                   "resourceTypes" : [ "APPLICATION" ],
                   "author" : "EPM-RTC-GPT"
@@ -2355,6 +2578,7 @@ class PublicationApiTest extends ResourceBaseTest {
                    "reference" : "@ignore",
                    "forward_auth_token" : false,
                    "defaults" : { },
+                   "responses_defaults" : { },
                    "interceptors" : [ ],
                    "description_keywords" : [ ],
                    "max_retry_attempts" : 1,
@@ -2498,7 +2722,8 @@ class PublicationApiTest extends ResourceBaseTest {
                     "action": "ADD",
                     "sourceUrl" : "conversations/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/my/folder/conversation",
                     "targetUrl" : "conversations/public/folder/conversation2",
-                    "reviewUrl" : "conversations/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/conversation2"
+                    "reviewUrl" : "conversations/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/conversation2",
+                    "publishCredentials" : false
                    } ],
                   "resourceTypes" : [ "CONVERSATION" ],
                   "author" : "EPM-RTC-GPT"
@@ -2578,7 +2803,8 @@ class PublicationApiTest extends ResourceBaseTest {
                     "action": "ADD",
                     "sourceUrl" : "conversations/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/my/folder/conversation",
                     "targetUrl" : "conversations/public/new-folder/conversation2",
-                    "reviewUrl" : "conversations/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/conversation2"
+                    "reviewUrl" : "conversations/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/conversation2",
+                    "publishCredentials" : false
                    } ],
                   "resourceTypes" : [ "CONVERSATION" ],
                   "author" : "EPM-RTC-GPT"
@@ -2660,7 +2886,8 @@ class PublicationApiTest extends ResourceBaseTest {
                     "action": "ADD",
                     "sourceUrl" : "conversations/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/my/folder/conversation",
                     "targetUrl" : "conversations/public/folder/conversation2",
-                    "reviewUrl" : "conversations/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/conversation2"
+                    "reviewUrl" : "conversations/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/conversation2",
+                    "publishCredentials" : false
                    } ],
                   "resourceTypes" : [ "CONVERSATION" ],
                   "author" : "EPM-RTC-GPT"
@@ -2712,7 +2939,6 @@ class PublicationApiTest extends ResourceBaseTest {
                         ]
                     }
                 }],
-                "selectedAddons": ["R", "T", "G"],
                 "assistantModelId": "assistantId",
                 "lastActivityDate": 4848683153
                 }
@@ -2782,7 +3008,6 @@ class PublicationApiTest extends ResourceBaseTest {
                         ]
                     }
                 }],
-                "selectedAddons": ["R", "T", "G"],
                 "assistantModelId": "assistantId",
                 "lastActivityDate": 4848683153
                 }
@@ -2935,7 +3160,8 @@ class PublicationApiTest extends ResourceBaseTest {
                             "action" : "ADD",
                             "sourceUrl" : "applications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/test_app2",
                             "targetUrl" : "applications/public/folder/with_apps/test_app2",
-                            "reviewUrl" : "applications/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/with_apps/test_app2"
+                            "reviewUrl" : "applications/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/with_apps/test_app2",
+                            "publishCredentials" : false
                           }
                   ],
                   "resourceTypes" : [ "APPLICATION" ],
@@ -2988,6 +3214,7 @@ class PublicationApiTest extends ResourceBaseTest {
                   "reference" : "@ignore",
                   "forward_auth_token" : false,
                   "defaults" : { },
+                  "responses_defaults" : { },
                   "interceptors" : [ ],
                   "description_keywords" : [ ],
                   "max_retry_attempts" : 1,
@@ -3031,6 +3258,91 @@ class PublicationApiTest extends ResourceBaseTest {
             }
         }
         assertEquals(count, files.size(), "Application files are missed");
+    }
+
+    @Test
+    void testApplicationWithTypeSchemaPublish_WhenCopyAppBucket() throws IOException {
+
+        var response = send(HttpMethod.PUT, "/v1/applications/%s/test_app2".formatted(bucket), null, """
+                  {
+                      "displayName": "test_app2",
+                      "applicationTypeSchemaId": "https://mydial.somewhere.com/custom_application_schemas/specific_application_type",
+                      "applicationProperties": {
+                        "property1": "test property1",
+                        "property2": "test property2"
+                       },
+                       "userRoles": [
+                            "Admin"
+                       ],
+                       "forwardAuthToken": true,
+                       "iconUrl": "https://mydial.somewhere.com/app-icon.svg",
+                       "description": "My application description"
+                  }
+                """);
+        Assertions.assertEquals(200, response.status());
+
+        // simulate application's work
+        // put file to app bucket
+        String appFileFolder = testDir + "/test/test-2/Keys/applications/%s/test_app2/files/folder".formatted(bucket);
+        List<String> lines = Arrays.asList("The first line", "The second line");
+        Path path = Paths.get(appFileFolder + "/app_file1.txt");
+        Files.createDirectories(Paths.get(appFileFolder));
+        Files.write(path, lines, StandardCharsets.UTF_8);
+
+        response = operationRequest("/v1/ops/publication/create", """
+                {
+                      "name": "Publication of my application",
+                      "targetFolder": "public/folder/",
+                      "resources": [
+                        {
+                          "action": "ADD",
+                          "sourceUrl": "applications/%s/test_app2",
+                          "targetUrl": "applications/public/folder/with_apps/test_app2"
+                        }
+                      ],
+                      "rules": [
+                        {
+                          "source": "roles",
+                          "function": "TRUE"
+                        }
+                      ]
+                    }
+                """.formatted(bucket));
+        String correctResponse = """
+                {
+                  "url" : "publications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/0123",
+                  "name" : "Publication of my application",
+                  "targetFolder" : "public/folder/",
+                  "status" : "PENDING",
+                  "createdAt" : 0,
+                  "resources" : [ {
+                            "action" : "ADD",
+                            "sourceUrl" : "applications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/test_app2",
+                            "targetUrl" : "applications/public/folder/with_apps/test_app2",
+                            "reviewUrl" : "applications/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/with_apps/test_app2",
+                            "publishCredentials" : false
+                          }
+                  ],
+                  "resourceTypes" : [ "APPLICATION" ],
+                  "rules" : [ {
+                    "function" : "TRUE",
+                    "source" : "roles",
+                    "targets" : null
+                  } ],
+                  "author" : "EPM-RTC-GPT"
+                }""";
+
+        verifyJsonNotExact(response, 200, correctResponse);
+
+        response = operationRequest("/v1/ops/publication/approve", PUBLICATION_URL, "authorization", "admin");
+        verify(response, 200);
+
+        // check app files are copied to public app folder
+        var appPublicFiles = new File(testDir + "/test/test-2/Keys/applications/public/folder/with_apps/test_app2/files/folder").listFiles();
+        assertNotNull(appPublicFiles);
+        assertEquals(1, appPublicFiles.length);
+        assertEquals("app_file1.txt", appPublicFiles[0].getName());
+
     }
 
 }

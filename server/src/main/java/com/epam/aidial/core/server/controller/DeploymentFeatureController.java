@@ -2,15 +2,27 @@ package com.epam.aidial.core.server.controller;
 
 import com.epam.aidial.core.config.Application;
 import com.epam.aidial.core.config.Deployment;
+import com.epam.aidial.core.config.Model;
+import com.epam.aidial.core.config.Upstream;
+import com.epam.aidial.core.openapi.annotations.ApiOperation;
+import com.epam.aidial.core.openapi.annotations.ApiParameter;
+import com.epam.aidial.core.openapi.annotations.ApiResponse;
+import com.epam.aidial.core.openapi.annotations.ApiSchema;
+import com.epam.aidial.core.openapi.annotations.OpenApiDescriptions;
+import com.epam.aidial.core.openapi.annotations.ParameterIn;
 import com.epam.aidial.core.server.Proxy;
 import com.epam.aidial.core.server.ProxyContext;
 import com.epam.aidial.core.server.data.ApiKeyData;
+import com.epam.aidial.core.server.function.BaseRequestFunction;
+import com.epam.aidial.core.server.log.AnalyticsLogContext;
 import com.epam.aidial.core.server.service.PermissionDeniedException;
 import com.epam.aidial.core.server.util.ProxyUtil;
 import com.epam.aidial.core.server.vertx.stream.BufferingReadStream;
 import com.epam.aidial.core.storage.exception.ResourceNotFoundException;
 import com.epam.aidial.core.storage.http.HttpException;
 import com.epam.aidial.core.storage.http.HttpStatus;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.netty.buffer.ByteBufInputStream;
 import io.vertx.core.Future;
 import io.vertx.core.MultiMap;
 import io.vertx.core.buffer.Buffer;
@@ -23,7 +35,10 @@ import io.vertx.core.http.RequestOptions;
 import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
 
+import java.io.InputStream;
 import java.net.URL;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.function.Function;
 
 import static com.epam.aidial.core.server.Proxy.HEADER_APPLICATION_ID;
@@ -34,12 +49,69 @@ public class DeploymentFeatureController {
 
     private final Proxy proxy;
     private final ProxyContext context;
+    protected final List<BaseRequestFunction<ObjectNode>> enhancementFunctions = new ArrayList<>();
 
     public DeploymentFeatureController(Proxy proxy, ProxyContext context) {
         this.proxy = proxy;
         this.context = context;
     }
 
+    @ApiOperation(
+            method = "GET",
+            path = "/v1/deployments/{deployment_name}/configuration",
+            operationId = "configurationDeployment",
+            tags = {"Deployment Feature"},
+            parameters = {
+                    @ApiParameter(name = "deployment_name", in = ParameterIn.PATH, required = true,
+                            description = OpenApiDescriptions.DEPLOYMENT_NAME)
+            },
+            responses = {
+                    @ApiResponse(code = 200, description = "Success", body = @ApiSchema(schemaRef = "ProxyResponse")),
+                    @ApiResponse(code = 403),
+                    @ApiResponse(code = 404),
+                    @ApiResponse(code = 422),
+                    @ApiResponse(code = 500),
+                    @ApiResponse(code = 502)
+            }
+    )
+    @ApiOperation(
+            method = "POST",
+            path = "/v1/deployments/{deployment_name}/tokenize",
+            operationId = "tokenize",
+            tags = {"Deployment Feature"},
+            parameters = {
+                    @ApiParameter(name = "deployment_name", in = ParameterIn.PATH, required = true,
+                            description = OpenApiDescriptions.DEPLOYMENT_NAME)
+            },
+            requestBody = @ApiSchema(schemaRef = "TokenizeRequest"),
+            responses = {
+                    @ApiResponse(code = 200, description = "Success", body = @ApiSchema(schemaRef = "TokenizeResponse")),
+                    @ApiResponse(code = 403),
+                    @ApiResponse(code = 404),
+                    @ApiResponse(code = 422),
+                    @ApiResponse(code = 500),
+                    @ApiResponse(code = 502)
+            }
+    )
+    @ApiOperation(
+            method = "POST",
+            path = "/v1/deployments/{deployment_name}/truncate_prompt",
+            operationId = "truncatePrompt",
+            tags = {"Deployment Feature"},
+            parameters = {
+                    @ApiParameter(name = "deployment_name", in = ParameterIn.PATH, required = true,
+                            description = OpenApiDescriptions.DEPLOYMENT_NAME)
+            },
+            requestBody = @ApiSchema(schemaRef = "TruncatePromptRequest"),
+            responses = {
+                    @ApiResponse(code = 200, description = "Success", body = @ApiSchema(schemaRef = "TruncatePromptResponse")),
+                    @ApiResponse(code = 403),
+                    @ApiResponse(code = 404),
+                    @ApiResponse(code = 422),
+                    @ApiResponse(code = 500),
+                    @ApiResponse(code = 502)
+            }
+    )
     public Future<?> handle(String deploymentId, Function<Deployment, String> endpointGetter, boolean requireEndpoint) {
         // make sure request.body() called before request.resume()
         return proxy.getTaskExecutor().submit(() -> proxy.getDeploymentService().findDeployment(context, deploymentId)).map(dep -> {
@@ -60,26 +132,53 @@ public class DeploymentFeatureController {
 
     @SneakyThrows
     private void handleRequestBody(String endpoint, boolean requireEndpoint, Buffer requestBody) {
+        context.setRequestBody(requestBody);
         if (endpoint == null) {
             if (requireEndpoint) {
                 respond(HttpStatus.FORBIDDEN, "Forbidden deployment");
             } else {
                 respond(HttpStatus.OK);
-                proxy.getLogStore().save(context);
+                proxy.getLogStore().save(AnalyticsLogContext.from(context, null));
             }
             return;
         }
-
-        context.setRequestBody(requestBody);
 
         ApiKeyData proxyApiKeyData = new ApiKeyData();
         setupProxyApiKeyData(proxyApiKeyData);
 
         proxy.getTaskExecutor().submit(() -> {
-            proxy.getApiKeyStore().assignPerRequestApiKey(proxyApiKeyData);
-            return null;
-        }).onSuccess(ignore -> sendRequest(endpoint)).onFailure(this::handleError);
+            if (runEnhancementFunctions(requestBody)) {
+                proxy.getApiKeyStore().assignPerRequestApiKey(proxyApiKeyData);
+                return true;
+            }
+            return false;
+        }).onSuccess(result -> {
+            if (result) {
+                sendRequest(endpoint);
+            }
+        }).onFailure(this::handleError);
 
+    }
+
+    private boolean runEnhancementFunctions(Buffer requestBody) {
+        if (enhancementFunctions.isEmpty()) {
+            return true;
+        }
+        try (InputStream stream = new ByteBufInputStream(requestBody.getByteBuf())) {
+            ObjectNode tree = (ObjectNode) ProxyUtil.MAPPER.readTree(stream);
+            if (ProxyUtil.processChain(tree, enhancementFunctions)) {
+                context.setRequestBody(Buffer.buffer(ProxyUtil.MAPPER.writeValueAsBytes(tree)));
+            }
+        } catch (Throwable e) {
+            if (e instanceof HttpException httpException) {
+                respond(httpException.getStatus(), httpException.getMessage());
+            } else {
+                respond(HttpStatus.BAD_REQUEST);
+            }
+            log.warn("Can't process JSON request body. Error:", e);
+            return false;
+        }
+        return true;
     }
 
     private void handleError(Throwable error) {
@@ -138,6 +237,7 @@ public class DeploymentFeatureController {
         excludeHeaders.add(HEADER_APPLICATION_ID, "whatever");
 
         ProxyUtil.copyHeaders(request.headers(), proxyRequest.headers(), excludeHeaders);
+        ProxyUtil.setOverrideNameHeader(proxyRequest, deployment);
 
         if ((deployment instanceof Application application && application.hasApplicationTypeSchemaId())) {
             try {
@@ -156,9 +256,14 @@ public class DeploymentFeatureController {
         ApiKeyData proxyApiKeyData = context.getProxyApiKeyData();
         proxyRequest.headers().add(Proxy.HEADER_API_KEY, proxyApiKeyData.getPerRequestKey());
 
+        if (deployment instanceof Model model && !model.getUpstreams().isEmpty()) {
+            Upstream upstream = model.getUpstreams().getFirst();
+            proxyRequest.putHeader(Proxy.HEADER_UPSTREAM_ENDPOINT, upstream.getEndpoint());
+            proxyRequest.putHeader(Proxy.HEADER_UPSTREAM_KEY, upstream.getKey());
+        }
+
         Buffer requestBody = context.getRequestBody();
         proxyRequest.putHeader(HttpHeaders.CONTENT_LENGTH, Integer.toString(requestBody.length()));
-        context.getRequestHeaders().forEach(proxyRequest::putHeader);
 
         proxyRequest.send(requestBody)
                 .onSuccess(this::handleProxyResponse)
@@ -176,7 +281,6 @@ public class DeploymentFeatureController {
                 ProxyUtil.contentLength(proxyResponse, 1024));
 
         context.setProxyResponse(proxyResponse);
-        context.setResponseStream(proxyResponseStream);
 
         HttpServerResponse response = context.getResponse();
         response.setChunked(true);
@@ -186,17 +290,18 @@ public class DeploymentFeatureController {
         proxyResponseStream.pipe()
                 .endOnFailure(false)
                 .to(response)
-                .onSuccess(ignored -> handleResponse())
+                .onSuccess(ignored -> handleResponse(proxyResponseStream))
                 .onFailure(this::handleResponseError);
     }
 
     /**
      * Called when proxy sent response from the origin to the client.
      */
-    private void handleResponse() {
-        Buffer proxyResponseBody = context.getResponseStream().getContent();
+    private void handleResponse(BufferingReadStream responseStream) {
+        Buffer proxyResponseBody = responseStream.getContent();
         context.setResponseBody(proxyResponseBody);
-        proxy.getLogStore().save(context);
+        context.setResponseBodyTimestamp(System.currentTimeMillis());
+        proxy.getLogStore().save(AnalyticsLogContext.from(context, null));
         finalizeRequest();
     }
 

@@ -1,12 +1,20 @@
 package com.epam.aidial.core.server.controller;
 
 import com.epam.aidial.core.config.Config;
+import com.epam.aidial.core.config.LocalizedValue;
 import com.epam.aidial.core.config.Model;
 import com.epam.aidial.core.config.ModelType;
 import com.epam.aidial.core.config.Pricing;
 import com.epam.aidial.core.config.TokenLimits;
+import com.epam.aidial.core.openapi.annotations.ApiOperation;
+import com.epam.aidial.core.openapi.annotations.ApiParameter;
+import com.epam.aidial.core.openapi.annotations.ApiResponse;
+import com.epam.aidial.core.openapi.annotations.ApiSchema;
+import com.epam.aidial.core.openapi.annotations.OpenApiDescriptions;
+import com.epam.aidial.core.openapi.annotations.ParameterIn;
 import com.epam.aidial.core.server.ProxyContext;
 import com.epam.aidial.core.server.data.FeaturesData;
+import com.epam.aidial.core.server.data.InterfaceConfigData;
 import com.epam.aidial.core.server.data.ListData;
 import com.epam.aidial.core.server.data.ModelData;
 import com.epam.aidial.core.server.data.PricingData;
@@ -23,6 +31,21 @@ public class ModelController {
 
     private final ProxyContext context;
 
+    @ApiOperation(
+            method = "GET",
+            path = "/openai/models/{model_name}",
+            operationId = "getModel",
+            tags = {"Deployment listing"},
+            parameters = {
+                    @ApiParameter(name = "model_name", in = ParameterIn.PATH, required = true,
+                            description = OpenApiDescriptions.MODEL_NAME)
+            },
+            responses = {
+                    @ApiResponse(code = 200, description = "Success", body = @ApiSchema(implementation = ModelData.class)),
+                    @ApiResponse(code = 403),
+                    @ApiResponse(code = 404)
+            }
+    )
     public Future<?> getModel(String modelId) {
         Config config = context.getConfig();
         Model model = config.getModels().get(modelId);
@@ -39,6 +62,15 @@ public class ModelController {
         return context.respond(HttpStatus.OK, data);
     }
 
+    @ApiOperation(
+            method = "GET",
+            path = "/openai/models",
+            operationId = "getModels",
+            tags = {"Deployment listing"},
+            responses = {
+                    @ApiResponse(code = 200, description = "Success", body = @ApiSchema(implementation = ListData.class, typeArguments = {ModelData.class}))
+            }
+    )
     public Future<?> getModels() {
         Config config = context.getConfig();
         List<ModelData> models = new ArrayList<>();
@@ -60,16 +92,23 @@ public class ModelController {
         ModelData data = new ModelData();
         data.setId(model.getName());
         data.setModel(model.getName());
-        data.setDisplayName(model.getDisplayName());
+        if (model.getDisplayName() != null) {
+            data.setDisplayName(model.getDisplayName());
+        } else {
+            data.setDisplayName(LocalizedValue.of(model.getName()));
+        }
         data.setDisplayVersion(model.getDisplayVersion());
         data.setIconUrl(model.getIconUrl());
         data.setDescription(model.getDescription());
-        data.setFeatures(FeaturesData.createFeatures(model.getFeatures()));
+        data.setIntro(model.getIntro());
+        data.setFeatures(FeaturesData.createDeploymentFeatures(model));
         data.setInputAttachmentTypes(model.getInputAttachmentTypes());
         data.setMaxInputAttachments(model.getMaxInputAttachments());
         data.setReference(model.getName());
         data.setDescriptionKeywords(model.getDescriptionKeywords());
         data.setMaxRetryAttempts(model.getMaxRetryAttempts());
+        data.setCatalogSchemaId(model.getCatalogSchemaId());
+        data.setCatalogProperties(model.getCatalogProperties());
 
         if (model.getType() == ModelType.EMBEDDING) {
             data.getCapabilities().setEmbeddings(true);
@@ -80,9 +119,12 @@ public class ModelController {
         }
 
         data.setTokenizerModel(model.getTokenizerModel());
+        data.setEmbeddingDimensions(model.getEmbeddingDimensions());
         data.setLimits(createLimits(model.getLimits()));
         data.setPricing(createPricing(model.getPricing()));
         data.setDefaults(model.getDefaults());
+        data.setResponsesDefaults(model.getResponsesDefaults());
+        data.setInterfaceConfigs(InterfaceConfigData.createInterfaceConfigs(model));
         if (model.getAuthor() != null) {
             data.setOwner(model.getAuthor());
         }
@@ -114,6 +156,8 @@ public class ModelController {
         data.setUnit(pricing.getUnit());
         data.setPrompt(pricing.getPrompt());
         data.setCompletion(pricing.getCompletion());
+        data.setCacheRead(pricing.getCacheRead());
+        data.setCacheWrite(pricing.getCacheWrite());
         return data;
     }
 }

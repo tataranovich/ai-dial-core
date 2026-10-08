@@ -3,14 +3,22 @@ package com.epam.aidial.core.server.service;
 import com.epam.aidial.core.config.Application;
 import com.epam.aidial.core.config.Features;
 import com.epam.aidial.core.config.ResourceAccessType;
+import com.epam.aidial.core.metaschemas.CopyAppBucketOptions;
 import com.epam.aidial.core.server.ProxyContext;
+import com.epam.aidial.core.server.config.ConfigPostProcessor;
+import com.epam.aidial.core.server.config.ConfigStore;
+import com.epam.aidial.core.server.config.ValidationWarning;
 import com.epam.aidial.core.server.data.ApiKeyData;
 import com.epam.aidial.core.server.data.AutoSharedData;
-import com.epam.aidial.core.server.data.ResourceTypes;
 import com.epam.aidial.core.server.security.ApiKeyStore;
 import com.epam.aidial.core.server.security.EncryptionService;
+import com.epam.aidial.core.server.util.BucketBuilder;
+import com.epam.aidial.core.server.util.CatalogPropertiesLinkRewriter;
+import com.epam.aidial.core.server.util.DeploymentEndpointUtil;
 import com.epam.aidial.core.server.util.ProxyUtil;
 import com.epam.aidial.core.server.util.ResourceDescriptorFactory;
+import com.epam.aidial.core.server.validation.ApplicationTypeSchemaValidationException;
+import com.epam.aidial.core.server.validation.CatalogSchemaValidationException;
 import com.epam.aidial.core.server.vertx.AsyncTaskExecutor;
 import com.epam.aidial.core.storage.blobstore.BlobStorageUtil;
 import com.epam.aidial.core.storage.data.ResourceItemMetadata;
@@ -18,14 +26,11 @@ import com.epam.aidial.core.storage.exception.ResourceNotFoundException;
 import com.epam.aidial.core.storage.http.HttpException;
 import com.epam.aidial.core.storage.http.HttpStatus;
 import com.epam.aidial.core.storage.resource.ResourceDescriptor;
+import com.epam.aidial.core.storage.resource.ResourceTypes;
 import com.epam.aidial.core.storage.service.LockService;
 import com.epam.aidial.core.storage.service.ResourceService;
 import com.epam.aidial.core.storage.util.EtagHeader;
 import com.epam.aidial.core.storage.util.UrlUtil;
-import com.fasterxml.jackson.core.type.TypeReference;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.node.ArrayNode;
-import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.vertx.core.Future;
 import io.vertx.core.Vertx;
 import io.vertx.core.json.JsonObject;
@@ -37,6 +42,7 @@ import org.redisson.api.RScoredSortedSet;
 import org.redisson.api.RedissonClient;
 import org.redisson.client.codec.StringCodec;
 
+import java.net.URI;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -54,10 +60,11 @@ public class ApplicationService {
     private static final String PUBLIC_DEPLOYMENTS_PREFIX = ResourceDescriptor.PUBLIC_BUCKET
             + ResourceDescriptor.PATH_SEPARATOR + DEPLOYMENTS_NAME + ResourceDescriptor.PATH_SEPARATOR;
 
-    private final Vertx vertx;
+    private final ConfigStore configStore;
     private final AsyncTaskExecutor taskExecutor;
     private final ApiKeyStore apiKeyStore;
     private final EncryptionService encryptionService;
+    private final ExternalServiceService externalServiceService;
     private final ResourceService resourceService;
     private final LockService lockService;
     private final Supplier<String> idGenerator;
@@ -69,26 +76,32 @@ public class ApplicationService {
     private final boolean includeCustomApps;
 
     private final ApplicationSchemaService applicationSchemaService;
+    private final CatalogSchemaService catalogSchemaService;
 
     public ApplicationService(Vertx vertx,
                               AsyncTaskExecutor taskExecutor,
                               RedissonClient redis,
                               ApiKeyStore apiKeyStore,
                               EncryptionService encryptionService,
+                              ExternalServiceService externalServiceService,
                               ResourceService resourceService,
                               LockService lockService,
                               ApplicationOperatorService operatorService,
                               ApplicationSchemaService applicationSchemaService,
+                              CatalogSchemaService catalogSchemaService,
+                              ConfigStore configStore,
                               Supplier<String> idGenerator,
                               JsonObject settings) {
         String pendingApplicationsKey = BlobStorageUtil.toStoragePath(lockService.getPrefix(), "pending-applications");
 
-        this.vertx = vertx;
         this.taskExecutor = taskExecutor;
         this.apiKeyStore = apiKeyStore;
         this.encryptionService = encryptionService;
+        this.externalServiceService = externalServiceService;
         this.resourceService = resourceService;
         this.applicationSchemaService = applicationSchemaService;
+        this.catalogSchemaService = catalogSchemaService;
+        this.configStore = configStore;
         this.lockService = lockService;
         this.idGenerator = idGenerator;
         this.pendingApplications = redis.getScoredSortedSet(pendingApplicationsKey, StringCodec.INSTANCE);
@@ -145,52 +158,109 @@ public class ApplicationService {
         return Pair.of(meta, application);
     }
 
-    public Pair<ResourceItemMetadata, Application> putApplication(ResourceDescriptor resource, EtagHeader etag, String author, Application application) {
-        prepareApplication(resource, application);
+    public Application extractFrom(String content, ResourceItemMetadata meta) {
+        Application application = ProxyUtil.convertToObject(content, Application.class);
+        if (application == null) {
+            throw new IllegalArgumentException("Application content is missed");
+        }
+        application.setAuthor(meta.getAuthor());
+        application.setCreatedAt(meta.getCreatedAt());
+        application.setUpdatedAt(meta.getUpdatedAt());
+        return application;
+    }
 
+    public void putApplication(ResourceDescriptor resource, EtagHeader etag, String author,
+                               Application application, boolean preserveForwardAuthToken,
+                               AdminManagedFieldsWriteMode adminManagedFieldsWriteMode) {
+        // In-memory callers (publication copy, admin apply) provide an authoritative application object.
+        putApplication(resource, etag, author, application, preserveForwardAuthToken, adminManagedFieldsWriteMode,
+                ExternalServicesWriteMode.OVERRIDE);
+    }
+
+    public Pair<ResourceItemMetadata, Application> putApplication(ResourceDescriptor resource, EtagHeader etag, String author,
+                                                                   Application application, boolean preserveForwardAuthToken,
+                                                                   AdminManagedFieldsWriteMode adminManagedFieldsWriteMode,
+                                                                   ExternalServicesWriteMode externalServicesWriteMode) {
+        prepareApplication(resource, application, preserveForwardAuthToken);
+
+        MutableObject<List<String>> purgeableExternalServices = new MutableObject<>(List.of());
         ResourceItemMetadata meta = resourceService.computeResource(resource, etag, author, json -> {
             Application existing = ProxyUtil.convertToObject(json, Application.class);
-            Application.Function function = application.getFunction();
-
             verifySchemaRichApp(application, existing);
-
-            if (function != null) {
-                if (existing == null || existing.getFunction() == null) {
-                    if (isPublicOrReview(resource)) {
-                        throw new HttpException(HttpStatus.CONFLICT, "The application function cannot be created in public/review bucket");
-                    }
-
-                    function.setId(UrlUtil.encodePathSegment(idGenerator.get()));
-                    function.setAuthorBucket(resource.getBucketName());
-                    function.setStatus(Application.Function.Status.UNDEPLOYED);
-                    function.setTargetFolder(encodeTargetFolder(resource, function.getId()));
-                } else {
-                    if (isPublicOrReview(resource) && !function.getSourceFolder().equals(existing.getFunction().getSourceFolder())) {
-                        throw new HttpException(HttpStatus.CONFLICT, "The application function source folder cannot be updated in public/review bucket");
-                    }
-                    application.setEndpoint(existing.getEndpoint());
-                    application.getFeatures().setRateEndpoint(existing.getFeatures().getRateEndpoint());
-                    application.getFeatures().setTokenizeEndpoint(existing.getFeatures().getTokenizeEndpoint());
-                    application.getFeatures().setTruncatePromptEndpoint(existing.getFeatures().getTruncatePromptEndpoint());
-                    application.getFeatures().setConfigurationEndpoint(existing.getFeatures().getConfigurationEndpoint());
-                    function.setId(existing.getFunction().getId());
-                    function.setAuthorBucket(existing.getFunction().getAuthorBucket());
-                    function.setStatus(existing.getFunction().getStatus());
-                    function.setTargetFolder(existing.getFunction().getTargetFolder());
-                    function.setError(existing.getFunction().getError());
-                }
-            }
-
+            prepareApplicationFunction(resource, application, existing);
+            prepareAdminManagedFields(application, existing, adminManagedFieldsWriteMode);
+            List<String> externalServices = externalServiceService.processOnWrite(resource, application, existing, externalServicesWriteMode);
+            purgeableExternalServices.setValue(externalServices);
             return ProxyUtil.convertToString(application);
         });
 
+        // Purge credentials of services this write dropped or changed the auth type of (after commit).
+        externalServiceService.purgeApplicationCredentials(resource, purgeableExternalServices.get());
+
         return Pair.of(meta, application);
+    }
+
+    // app_identity and allow_user_external_services are admin-managed: a field the mode does not honor is
+    // inherited from the stored value on update (so a read-modify-write can't wipe it) and stripped on create.
+    private static void prepareAdminManagedFields(Application application, Application existing, AdminManagedFieldsWriteMode mode) {
+        if (!mode.honorAppIdentity()) {
+            application.setAppIdentity(existing != null ? existing.getAppIdentity() : null);
+        }
+        if (!mode.honorAllowUserExternalServices()) {
+            application.setAllowUserExternalServices(existing != null && existing.isAllowUserExternalServices());
+        }
+    }
+
+    private void prepareApplicationFunction(ResourceDescriptor resource, Application application, Application existing) {
+        Application.Function function = application.getFunction();
+        if (function == null) {
+            return;
+        }
+        if (existing == null || existing.getFunction() == null) {
+            function.setId(UrlUtil.encodePathSegment(idGenerator.get()));
+            function.setAuthorBucket(resource.getBucketName());
+            function.setStatus(Application.Function.Status.UNDEPLOYED);
+            function.setTargetFolder(encodeTargetFolder(resource, function.getId()));
+        } else {
+            application.setEndpoint(existing.getEndpoint());
+            application.getFeatures().setRateEndpoint(existing.getFeatures().getRateEndpoint());
+            application.getFeatures().setTokenizeEndpoint(existing.getFeatures().getTokenizeEndpoint());
+            application.getFeatures().setTruncatePromptEndpoint(existing.getFeatures().getTruncatePromptEndpoint());
+            application.getFeatures().setConfigurationEndpoint(existing.getFeatures().getConfigurationEndpoint());
+            function.setId(existing.getFunction().getId());
+            function.setAuthorBucket(existing.getFunction().getAuthorBucket());
+            function.setStatus(existing.getFunction().getStatus());
+            function.setTargetFolder(existing.getFunction().getTargetFolder());
+            function.setError(existing.getFunction().getError());
+        }
+    }
+
+    public Pair<ResourceItemMetadata, Application> getApplicationWithDecryptedSecrets(ResourceDescriptor resource) {
+        Pair<ResourceItemMetadata, Application> result = getApplication(resource);
+        externalServiceService.decryptSecrets(resource, result.getValue());
+        return result;
+    }
+
+    /**
+     * Decrypts inline external-service secrets of an already-loaded application, for a caller that redacts them
+     * itself afterwards. See {@link ExternalServiceService#decryptSecretsForResponse}.
+     */
+    public void decryptExternalServiceSecretsForResponse(ResourceDescriptor resource, Application application) {
+        externalServiceService.decryptSecretsForResponse(resource, application);
     }
 
     private static void verifySchemaRichApp(Application application, Application existing) {
         if (application.getApplicationTypeSchemaId() != null && existing != null
                 && existing.getApplicationProperties() != null && application.getApplicationProperties() == null) {
             throw new HttpException(HttpStatus.BAD_REQUEST, "The application with schema can not be updated to the one without properties");
+        }
+    }
+
+    private void validateCatalogProperties(Application application) {
+        try {
+            catalogSchemaService.validate(application);
+        } catch (CatalogSchemaValidationException e) {
+            throw new HttpException(HttpStatus.BAD_REQUEST, "Catalog properties validation failed: " + e.getMessage(), e);
         }
     }
 
@@ -215,11 +285,20 @@ public class ApplicationService {
 
         Application application = reference.get();
 
+        if (application.getExternalServices() != null) {
+            externalServiceService.purgeApplicationCredentials(resource, application.getExternalServices().keySet());
+        }
+
         if (isPublicOrReview(resource)) {
             if (application.getFunction() != null) {
-                deleteFolder(application.getFunction().getSourceFolder());
+                deleteFolder(application.getFunction().getTargetFolder());
             }
-            List<ResourceDescriptor> appFiles = applicationSchemaService.getFiles(application);
+            List<ResourceDescriptor> appFiles;
+            try {
+                appFiles = applicationSchemaService.getFiles(application);
+            } catch (ApplicationTypeSchemaValidationException e) {
+                appFiles = List.of();
+            }
             for (ResourceDescriptor file : appFiles) {
                 if (file.isFolder()) {
                     resourceService.deleteFolder(file);
@@ -230,12 +309,20 @@ public class ApplicationService {
         }
     }
 
+    private ResourceDescriptor getAppFileBucket(ResourceDescriptor app) {
+        String appBucketLocation = BucketBuilder.API_KEY_BUCKET_PATTERN.formatted(app.getUrl());
+        String appBucket = Objects.requireNonNull(encryptionService.encrypt(appBucketLocation));
+        return ResourceDescriptorFactory.fromDecoded(ResourceTypes.FILE, appBucket, appBucketLocation, ResourceDescriptor.PATH_SEPARATOR);
+    }
+
     public void copyApplication(ResourceDescriptor source, ResourceDescriptor destination, String author, boolean overwrite, Consumer<Application> consumer) {
         verifyApplication(source);
         verifyApplication(destination);
 
         Pair<ResourceItemMetadata, Application> result = getApplication(source);
         Application application = result.getValue();
+
+        externalServiceService.decryptSecrets(source, application);
         if (author == null) {
             author = result.getKey().getAuthor();
         }
@@ -243,6 +330,7 @@ public class ApplicationService {
 
         EtagHeader etag = overwrite ? EtagHeader.ANY : EtagHeader.NEW_ONLY;
         consumer.accept(application);
+        requireRenderableOverridePaths(application);
         application.setName(destination.getUrl());
 
         boolean isPublicOrReview = isPublicOrReview(destination);
@@ -251,13 +339,22 @@ public class ApplicationService {
         Map<String, String> fileReplacementLinks;
         List<ResourceDescriptor> sourceAppFiles = List.of();
         List<ResourceDescriptor> destAppFiles = List.of();
+        List<ResourceDescriptor> sourceCatalogFiles = List.of();
+        List<ResourceDescriptor> destCatalogFiles = List.of();
         if (isPublicOrReview) {
             sourceAppFiles = applicationSchemaService.getFiles(application);
             destAppFiles = toDestAppFiles(source, destination, sourceAppFiles);
+            sourceCatalogFiles = catalogSchemaService.getFiles(application);
+            destCatalogFiles = toDestAppFiles(source, destination, sourceCatalogFiles);
             fileReplacementLinks = new HashMap<>();
             for (int i = 0; i < sourceAppFiles.size(); i++) {
                 ResourceDescriptor sourceFile = sourceAppFiles.get(i);
                 ResourceDescriptor destFile = destAppFiles.get(i);
+                fileReplacementLinks.put(sourceFile.getDecodedUrl(), destFile.getUrl());
+            }
+            for (int i = 0; i < sourceCatalogFiles.size(); i++) {
+                ResourceDescriptor sourceFile = sourceCatalogFiles.get(i);
+                ResourceDescriptor destFile = destCatalogFiles.get(i);
                 fileReplacementLinks.put(sourceFile.getDecodedUrl(), destFile.getUrl());
             }
         } else {
@@ -267,7 +364,13 @@ public class ApplicationService {
         resourceService.computeResource(destination, etag, author, json -> {
             Application existing = ProxyUtil.convertToObject(json, Application.class);
 
+            // Same governance rule as putApplication: the source's admin-managed fields never travel through a
+            // copy/move (a user could self-grant them by copying a public app), while an overwrite keeps whatever
+            // an admin granted to the destination itself.
+            prepareAdminManagedFields(application, existing, AdminManagedFieldsWriteMode.INHERIT_ONLY);
+
             verifySchemaRichApp(application, existing);
+            validateCatalogProperties(application);
 
             if (function != null) {
                 if (existing == null || existing.getFunction() == null) {
@@ -299,7 +402,10 @@ public class ApplicationService {
 
             if (isPublicOrReview) {
                 replaceLinksInAppProperties(application, fileReplacementLinks);
+                application.setCatalogProperties(CatalogPropertiesLinkRewriter.rewrite(application.getCatalogProperties(), fileReplacementLinks));
             }
+
+            externalServiceService.encryptSecrets(destination, application);
 
             return ProxyUtil.convertToString(application);
         });
@@ -310,19 +416,34 @@ public class ApplicationService {
                 // source files are copied to read-only deployment bucket for such applications
                 copyFolder(sourceFolder, function.getSourceFolder());
             }
-            for (int i = 0; i < sourceAppFiles.size(); i++) {
-                ResourceDescriptor sourceFile = sourceAppFiles.get(i);
-                ResourceDescriptor destFile = destAppFiles.get(i);
-                if (sourceFile.isFolder()) {
-                    resourceService.copyFolder(sourceFile, destFile, false);
-                } else {
-                    if (!resourceService.copyResource(sourceFile, destFile, null, false)) {
-                        throw new IllegalArgumentException("Can't copy source file: " + source.getUrl()
-                                + " to destination file: " + destFile.getUrl());
-                    }
+            copyResourceFiles(sourceAppFiles, destAppFiles);
+            copyResourceFiles(sourceCatalogFiles, destCatalogFiles);
+        }
+
+        if (applicationSchemaService.getCopyAppBucketOptions(application) == CopyAppBucketOptions.ENABLED) {
+            copyAppFileBucket(source, destination);
+        }
+    }
+
+    private void copyResourceFiles(List<ResourceDescriptor> sourceFiles, List<ResourceDescriptor> destFiles) {
+        for (int i = 0; i < sourceFiles.size(); i++) {
+            ResourceDescriptor sourceFile = sourceFiles.get(i);
+            ResourceDescriptor destFile = destFiles.get(i);
+            if (sourceFile.isFolder()) {
+                resourceService.copyFolder(sourceFile, destFile, false);
+            } else {
+                if (!resourceService.copyResource(sourceFile, destFile, null, false)) {
+                    throw new IllegalArgumentException("Can't copy source file: " + sourceFile.getUrl()
+                            + " to destination file: " + destFile.getUrl());
                 }
             }
         }
+    }
+
+    private void copyAppFileBucket(ResourceDescriptor source, ResourceDescriptor destination) {
+        ResourceDescriptor from = getAppFileBucket(source);
+        ResourceDescriptor to = getAppFileBucket(destination);
+        resourceService.copyFolder(from, to, false);
     }
 
     private static List<ResourceDescriptor> toDestAppFiles(ResourceDescriptor source, ResourceDescriptor dest, List<ResourceDescriptor> sourceAppFiles) {
@@ -456,20 +577,54 @@ public class ApplicationService {
         return controller.getApplicationLogs(application.getFunction());
     }
 
-    private void prepareApplication(ResourceDescriptor resource, Application application) {
-        verifyApplication(resource);
-
-        if (application.getApplicationTypeSchemaId() != null) {
-            if (application.getEndpoint() != null || application.getFunction() != null) {
-                throw new IllegalArgumentException("Endpoint must not be set for custom application");
-            }
-        } else if (application.getEndpoint() == null && application.getFunction() == null) {
-            throw new IllegalArgumentException("Application endpoint or function must be provided");
+    /**
+     * An {@code overridePaths} entry Core cannot render is refused before the application is written,
+     * so the blob never holds config the next config rebuild would drop.
+     */
+    private static void requireRenderableOverridePaths(Application application) {
+        List<ValidationWarning> warnings = new ArrayList<>();
+        ConfigPostProcessor.validateOverridePaths(application, warnings);
+        if (!warnings.isEmpty()) {
+            ValidationWarning warning = warnings.get(0);
+            throw new HttpException(HttpStatus.UNPROCESSABLE_ENTITY, warning.getField() + ": " + warning.getMessage());
         }
+    }
+
+    private void prepareApplication(ResourceDescriptor resource, Application application, boolean preserveForwardAuthToken) {
+        verifyApplication(resource);
+        requireRenderableOverridePaths(application);
+        boolean platformBucket = ResourceDescriptor.PLATFORM_BUCKET.equals(resource.getBucketName());
+        // platform hosts migrated config-file apps (and future API-managed equivalents), which are
+        // inherently endpoint-based; function-type apps have no legitimate reason to live there, and
+        // deleteApplication's function-folder/schema-file cleanup assumes the public/review publish
+        // flow this bucket never goes through.
+        if (platformBucket && application.getFunction() != null) {
+            throw new HttpException(HttpStatus.BAD_REQUEST, "Function-type applications are not supported in the platform bucket");
+        }
+        URI applicationSchemaId = application.getApplicationTypeSchemaId();
+        if (applicationSchemaId != null) {
+            if (application.getEndpoint() != null || application.getFunction() != null || application.getMcp() != null) {
+                throw new IllegalArgumentException("Neither application endpoint, MCP or function must be set for schema based application");
+            }
+            if (configStore.get().getCustomApplicationSchema(applicationSchemaId) == null) {
+                throw new IllegalArgumentException("Application schema is not found by schema id: " + applicationSchemaId);
+            }
+        } else if (application.getEndpoint() == null && application.getFunction() == null
+                && (application.getMcp() == null || application.getMcp().getEndpoint() == null)
+                && !DeploymentEndpointUtil.hasRoutingInterface(application)) {
+            throw new IllegalArgumentException("At least application endpoint, MCP endpoint, function or interface must be provided");
+        }
+        validateCatalogProperties(application);
 
         application.setName(resource.getUrl());
-        application.setUserRoles(null);
-        application.setForwardAuthToken(false);
+        // public-bucket user-published apps must not self-grant userRoles; platform-bucket apps are
+        // admin-managed config equivalents whose access model is userRoles itself, so preserve it.
+        if (!platformBucket) {
+            application.setUserRoles(null);
+        }
+        if (!preserveForwardAuthToken) {
+            application.setForwardAuthToken(false);
+        }
 
         if (application.getReference() == null) {
             application.setReference(ProxyUtil.generateReference());
@@ -525,6 +680,13 @@ public class ApplicationService {
                 throw new IllegalArgumentException("Application function sources must be a valid file folder: " + function.getSourceFolder());
             }
         }
+
+        Application.Mcp mcp = application.getMcp();
+        if (mcp != null) {
+            if (mcp.getEndpoint() == null) {
+                throw new IllegalArgumentException("MCP endpoint must be provided");
+            }
+        }
     }
 
     private Void checkApplications() {
@@ -571,7 +733,7 @@ public class ApplicationService {
 
             // for public/review application source folder is equal to target folder
             // source files are copied to read-only deployment bucket for such applications
-            if (!isPublicOrReview(resource)) {
+            if (!Objects.equals(function.getSourceFolder(), function.getTargetFolder())) {
                 copyFolder(function.getSourceFolder(), function.getTargetFolder());
             }
 
@@ -633,7 +795,7 @@ public class ApplicationService {
 
                 // for public/review application source folder is equal to target folder
                 // source files are copied to read-only deployment bucket for such applications
-                if (!isPublicOrReview(resource)) {
+                if (!Objects.equals(function.getSourceFolder(), function.getTargetFolder())) {
                     deleteFolder(function.getTargetFolder());
                 }
 
@@ -733,36 +895,7 @@ public class ApplicationService {
     }
 
     public static void replaceLinksInAppProperties(Application application, Map<String, String> replacementLinks) {
-        JsonNode customProperties = ProxyUtil.MAPPER.convertValue(application.getApplicationProperties(), JsonNode.class);
-        replaceTextNodes(customProperties, replacementLinks, null, null);
-        Map<String, Object> customPropertiesMap = ProxyUtil.MAPPER.convertValue(customProperties, new TypeReference<>() {
-        });
-        application.setApplicationProperties(customPropertiesMap);
-    }
-
-    private static void replaceTextNodes(JsonNode node, Map<String, String> replacementMap, JsonNode parent, String fieldName) {
-        if (node.isObject()) {
-            node.fields().forEachRemaining(entry -> replaceTextNodes(entry.getValue(), replacementMap, node, entry.getKey()));
-        } else if (node.isArray()) {
-            for (int i = 0; i < node.size(); i++) {
-                JsonNode childNode = node.get(i);
-                if (childNode.isTextual()) {
-                    String decodedUrl = UrlUtil.tryDecodePath(childNode.textValue());
-                    String replacement = replacementMap.get(decodedUrl);
-                    if (replacement != null) {
-                        ((ArrayNode) node).set(i, replacement);
-                    }
-                } else {
-                    replaceTextNodes(childNode, replacementMap, node, String.valueOf(i));
-                }
-            }
-        } else if (node.isTextual()) {
-            String decodedUrl = UrlUtil.tryDecodePath(node.textValue());
-            String replacement = replacementMap.get(decodedUrl);
-            if (replacement != null && parent.isObject()) {
-                ((ObjectNode) parent).put(fieldName, replacement);
-            }
-        }
+        application.setApplicationProperties(CatalogPropertiesLinkRewriter.rewrite(application.getApplicationProperties(), replacementLinks));
     }
 
     private static String createUniqueFileName(ResourceDescriptor sourceDescriptor, Map<String, Integer> fileNamesTaken) {

@@ -1,10 +1,26 @@
 package com.epam.aidial.core.server;
 
+import com.epam.aidial.core.config.Application;
+import com.epam.aidial.core.server.data.FeaturesData;
 import com.epam.aidial.core.server.data.LimitStats;
+import com.epam.aidial.core.server.log.JsonLogCapture;
+import com.epam.aidial.core.server.service.AdminManagedFieldsWriteMode;
+import com.epam.aidial.core.server.service.ApplicationService;
 import com.epam.aidial.core.server.util.ProxyUtil;
+import com.epam.aidial.core.server.util.ResourceDescriptorFactory;
+import com.epam.aidial.core.storage.util.Compression;
+import com.epam.aidial.core.storage.util.EtagHeader;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.sun.net.httpserver.HttpServer;
+import io.vertx.core.http.HttpClient;
+import io.vertx.core.http.HttpClientOptions;
+import io.vertx.core.http.HttpConnection;
 import io.vertx.core.http.HttpMethod;
+import io.vertx.core.http.HttpServerResponse;
+import io.vertx.core.http.RequestOptions;
+import io.vertx.core.json.JsonObject;
 import okhttp3.mockwebserver.MockResponse;
+import okhttp3.mockwebserver.RecordedRequest;
 import org.apache.commons.lang3.mutable.MutableObject;
 import org.apache.hc.client5.http.classic.methods.HttpUriRequest;
 import org.apache.hc.client5.http.classic.methods.HttpUriRequestBase;
@@ -15,15 +31,30 @@ import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.io.OutputStream;
+import java.lang.ref.WeakReference;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 
 @SuppressWarnings("checkstyle:LineLength")
 public class DeploymentPostApiTest extends ResourceBaseTest {
+
+    private static final String CHAT_URI = "/openai/deployments/gpt-3-turbo/chat/completions";
+    private static final String CHAT_COMPLETION_ANSWER = "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion\",\"created\":1,\"model\":\"gpt-35-turbo\","
+            + "\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"message\":{\"role\":\"assistant\",\"content\":\"hi\"}}]}";
 
     @Test
     public void testCollectTokenUsageStats_WhenClientClosesConnection() throws IOException {
@@ -117,6 +148,349 @@ public class DeploymentPostApiTest extends ResourceBaseTest {
                 adapterRef.getValue().stop(0);
             }
         }
+    }
+
+    @Test
+    public void testStreaming_DecompressesGzipResponse() {
+        String responseBody = """
+                data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1687780896,"model":"gpt-35-turbo","choices":[{"index":0,"finish_reason":null,"delta":{"content":"this is a"}}],"usage":null}\r
+                data: {"id":"chatcmpl-2","object":"chat.completion.chunk","created":1687780896,"model":"gpt-35-turbo","choices":[{"index":0,"finish_reason":"stop","delta":{}}],"usage":{"completion_tokens":20,"prompt_tokens":20,"total_tokens":40}}\r
+                data: [DONE]\r
+                """;
+        byte[] gzipped = Compression.compress("gzip", responseBody.getBytes(StandardCharsets.UTF_8));
+
+        try (TestWebServer server = new TestWebServer(4848)) {
+            server.map(HttpMethod.POST, "/chat/completions", request -> {
+                okio.Buffer buffer = new okio.Buffer();
+                buffer.write(gzipped);
+                return new MockResponse()
+                        .setResponseCode(200)
+                        .setHeader("Content-Type", "text/event-stream")
+                        .setHeader("Content-Encoding", "gzip")
+                        .setChunkedBody(buffer, 16);
+            });
+
+            Response response = send(HttpMethod.POST,
+                    "/openai/deployments/gpt-3-turbo/chat/completions", null,
+                    """
+                    {"model":"gpt-3-turbo","stream":true,"messages":[{"role":"user","content":"how are you?"}]}
+                    """,
+                    "content-type", "application/json");
+
+            verify(response, 200);
+            // Without decompression the SSE parser would receive gzip binary and emit nothing;
+            // the decoded event proves the upstream gzip stream was inflated before parsing.
+            assertTrue(response.body().contains("\"content\":\"this is a\""),
+                    "Expected decoded SSE content, but got: " + response.body());
+            // The body delivered to the client is plaintext re-serialized SSE,
+            // so the upstream gzip Content-Encoding header must not leak to the client.
+            assertNull(response.headers().get("Content-Encoding"));
+        }
+    }
+
+    @Test
+    public void testDeploymentFeaturesHeaderSentForChatCompletions() {
+        MutableObject<RecordedRequest> captured = new MutableObject<>();
+        try (TestWebServer server = new TestWebServer(4848)) {
+            server.map(HttpMethod.POST, "/chat/completions", request -> {
+                captured.setValue(request);
+                return TestWebServer.createResponse(200, CHAT_COMPLETION_ANSWER, "Content-Type", "application/json");
+            });
+
+            // a client-supplied value must not survive: the header is set by the core, not forwarded
+            Response response = send(HttpMethod.POST, "/openai/deployments/gpt-3-turbo/chat/completions", null,
+                    "{\"model\":\"gpt-3-turbo\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
+                    "content-type", "application/json", "X-DIAL-DEPLOYMENT-FEATURES", "spoofed");
+
+            verify(response, 200);
+            FeaturesData features = ProxyUtil.convertToObject(
+                    captured.getValue().getHeader("X-DIAL-DEPLOYMENT-FEATURES"), FeaturesData.class);
+            assertNotNull(features);
+            assertTrue(features.isMaxTokensSupported());
+        }
+    }
+
+    @Test
+    public void testDefaultHeadersSentForChatCompletions() {
+        MutableObject<RecordedRequest> captured = new MutableObject<>();
+        try (TestWebServer server = new TestWebServer(4848)) {
+            server.map(HttpMethod.POST, "/chat/completions", request -> {
+                captured.setValue(request);
+                return TestWebServer.createResponse(200, CHAT_COMPLETION_ANSWER, "Content-Type", "application/json");
+            });
+
+            Response response = send(HttpMethod.POST, "/openai/deployments/default-headers-model/chat/completions", null,
+                    "{\"model\":\"default-headers-model\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
+                    "content-type", "application/json");
+
+            verify(response, 200);
+            RecordedRequest upstream = captured.getValue();
+            assertEquals("cache-priority", upstream.getHeader("x-dial-cache-policy"));
+            assertEquals("foo-bar", upstream.getHeader("x-dial-custom-header"));
+            // the anthropicMessages overlay belongs to that interface only
+            assertNull(upstream.getHeader("x-dial-custom-header-2"));
+        }
+    }
+
+    @Test
+    public void testDefaultHeadersDoNotOverrideClientHeaders() {
+        MutableObject<RecordedRequest> captured = new MutableObject<>();
+        try (TestWebServer server = new TestWebServer(4848)) {
+            server.map(HttpMethod.POST, "/chat/completions", request -> {
+                captured.setValue(request);
+                return TestWebServer.createResponse(200, CHAT_COMPLETION_ANSWER, "Content-Type", "application/json");
+            });
+
+            Response response = send(HttpMethod.POST, "/openai/deployments/default-headers-model/chat/completions", null,
+                    "{\"model\":\"default-headers-model\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
+                    "content-type", "application/json", "X-DIAL-CUSTOM-HEADER", "from-client");
+
+            verify(response, 200);
+            RecordedRequest upstream = captured.getValue();
+            // spelled in another case by the client, and still not defaulted over
+            assertEquals("from-client", upstream.getHeader("x-dial-custom-header"));
+            assertEquals("cache-priority", upstream.getHeader("x-dial-cache-policy"));
+        }
+    }
+
+    @Test
+    public void testDefaultHeadersSentForEmbeddings() {
+        String answer = "{\"object\":\"list\",\"model\":\"ada\",\"data\":[],\"usage\":{\"prompt_tokens\":5,\"total_tokens\":5}}";
+        MutableObject<RecordedRequest> captured = new MutableObject<>();
+        try (TestWebServer server = new TestWebServer(4848)) {
+            server.map(HttpMethod.POST, "/chat/completions", request -> {
+                captured.setValue(request);
+                return TestWebServer.createResponse(200, answer, "Content-Type", "application/json");
+            });
+
+            // the pre-interfaces endpoint serves embeddings too, and the deployment-level headers reach it
+            Response response = send(HttpMethod.POST, "/openai/deployments/default-headers-model/embeddings", null,
+                    "{\"input\":\"hello\"}", "content-type", "application/json");
+
+            verify(response, 200);
+            assertEquals("cache-priority", captured.getValue().getHeader("x-dial-cache-policy"));
+            assertEquals("foo-bar", captured.getValue().getHeader("x-dial-custom-header"));
+        }
+    }
+
+    @Test
+    public void testEmbeddings_NotAffectedByUsagePerModelInjection() {
+        String answer = "{\"object\":\"list\",\"model\":\"ada\",\"data\":[{\"object\":\"embedding\",\"index\":0,\"embedding\":[0.1,0.2]}],"
+                + "\"usage\":{\"prompt_tokens\":5,\"total_tokens\":5}}";
+        try (TestWebServer server = new TestWebServer(7001)) {
+            server.map(HttpMethod.POST, "/openai/deployments/ada/embeddings", 200, answer);
+
+            Response response = send(HttpMethod.POST, "/openai/deployments/embedding-ada/embeddings", null,
+                    "{\"input\":\"hello\"}", "content-type", "application/json");
+
+            // /embeddings is out of scope for statistics.usage_per_model injection (issue #1753) -
+            // this shares DeploymentPostController with /chat/completions, so the response must pass
+            // through byte-identical, unaffected by the new buffer-and-rewrite path
+            verify(response, 200, answer);
+        }
+    }
+
+    @Test
+    public void testAutoShareAnnotationCitationAttachment() {
+        // Register a public application that internally calls gpt-3-turbo.
+        // Auto-sharing of annotation citation attachments only activates when the
+        // inner request carries a per-request key, i.e. goes through an application.
+        ApplicationService applicationService = dial.getProxy().getApplicationService();
+        Application app = new Application();
+        app.setEndpoint("http://localhost:4848/app");
+        applicationService.putApplication(
+                ResourceDescriptorFactory.fromPublicUrl("applications/public/annot-test-app"),
+                EtagHeader.ANY, null, app, false, AdminManagedFieldsWriteMode.INHERIT_ONLY);
+
+        // Shared state between the two mock handlers that run sequentially
+        MutableObject<String> citedFileUrl = new MutableObject<>();
+
+        try (TestWebServer server = new TestWebServer(4848)) {
+            // Inner gpt-3-turbo handler: returns annotation whose citation points at the uploaded file.
+            // By the time this handler runs, the outer handler has already set citedFileUrl.
+            server.map(HttpMethod.POST, "/chat/completions", request -> {
+                String body = """
+                        {"id":"id1","object":"chat.completion","created":1,"model":"gpt-35-turbo",
+                         "choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"summary",
+                           "custom_content":{"annotations":[
+                             {"index":0,"body":{"title":"Source","source":{"attachment":{"type":"text/plain","url":"%s"}}}}
+                           ]}
+                         }}],
+                         "usage":{"completion_tokens":5,"prompt_tokens":5,"total_tokens":10}}
+                        """.formatted(citedFileUrl.getValue());
+                return new MockResponse().setResponseCode(200).setBody(body);
+            });
+
+            // Outer application handler: uploads a file, calls gpt-3-turbo,
+            // then verifies it can access the cited file via auto-sharing.
+            server.map(HttpMethod.POST, "/app", request -> {
+                try {
+                    String apiKey = request.getHeader(Proxy.HEADER_API_KEY);
+
+                    // resolve the application's own bucket via per-request key
+                    Response bucketResponse = send(HttpMethod.GET, "/v1/bucket", null, "", "api-key", apiKey);
+                    assertEquals(200, bucketResponse.status());
+                    String appBucket = new JsonObject(bucketResponse.body()).getString("bucket");
+
+                    // upload the file that will be cited in the annotation
+                    String fileUrl = "files/%s/cited/source.txt".formatted(appBucket);
+                    Response upload = upload(HttpMethod.PUT, "/v1/" + fileUrl, null, "cited content", "api-key", apiKey);
+                    assertEquals(200, upload.status());
+                    citedFileUrl.setValue(fileUrl);
+
+                    // call gpt-3-turbo — its response will include the annotation citation
+                    Response nested = send(HttpMethod.POST,
+                            "/openai/deployments/gpt-3-turbo/chat/completions", null,
+                            """
+                            {"model":"gpt-3-turbo","messages":[{"role":"user","content":"Summarize"}]}
+                            """,
+                            "api-key", apiKey,
+                            "content-type", Proxy.HEADER_CONTENT_TYPE_APPLICATION_JSON);
+                    assertEquals(200, nested.status());
+
+                    // the annotation's attachment should now be auto-shared to this per-request key
+                    Response fileResponse = send(HttpMethod.GET, "/v1/" + fileUrl, null, null, "api-key", apiKey);
+                    verify(fileResponse, 200);
+
+                    return new MockResponse().setResponseCode(200).setBody("""
+                            {"id":"id2","object":"chat.completion","created":1,"model":"app",
+                             "choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"ok"}}],
+                             "usage":{"completion_tokens":1,"prompt_tokens":1,"total_tokens":2}}
+                            """);
+                } catch (Throwable e) {
+                    return new MockResponse().setResponseCode(500);
+                }
+            });
+
+            // User sends a chat completion to the application
+            Response response = send(HttpMethod.POST,
+                    "/openai/deployments/applications/public/annot-test-app/chat/completions", null,
+                    """
+                    {"model":"annot-test-app","messages":[{"role":"user","content":"Summarize"}]}
+                    """,
+                    "content-type", Proxy.HEADER_CONTENT_TYPE_APPLICATION_JSON);
+            verify(response, 200);
+        }
+    }
+
+    /**
+     * A client disconnect used to clear the ProxyContext from the request's Vert.x context while the upstream call
+     * was still in flight, so the log lines of its remaining callbacks lost their trace id and user attributes.
+     */
+    @Test
+    public void testLateLogLinesKeepTraceContext_WhenClientClosesConnection() throws IOException {
+        String responseBody = """
+                data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1687780896,"model":"gpt-35-turbo","choices":[{"index":0,"finish_reason":"stop","delta":{"content":"hi"}}],"usage":{"completion_tokens": 1, "prompt_tokens": 1, "total_tokens": 2}}\r
+                data: [DONE]\r
+                """;
+        try (TestWebServer server = new TestWebServer(4848);
+                CloseableHttpClient client = createHttpClient();
+                JsonLogCapture logs = JsonLogCapture.attach(CHAT_URI)) {
+            server.map(HttpMethod.POST, "/chat/completions", request -> {
+                try {
+                    client.close(); // the client goes away while the core is still waiting for the upstream
+                    // answer only once the core has observed the disconnect: closed() flips in the same event-loop
+                    // task that runs the response close handlers, where the ProxyContext used to be cleared
+                    HttpServerResponse response = logs.awaitProxyContext().getResponse();
+                    long deadline = System.currentTimeMillis() + 10_000;
+                    while (!response.closed()) {
+                        if (System.currentTimeMillis() > deadline) {
+                            throw new IllegalStateException("The core did not observe the client disconnect");
+                        }
+                        Thread.sleep(10);
+                    }
+                } catch (IOException | InterruptedException e) {
+                    throw new RuntimeException(e);
+                }
+                return new MockResponse().setResponseCode(200).setChunkedBody(responseBody, 200);
+            });
+            try {
+                client.execute(createHttpUriRequest(), response -> null);
+            } catch (IOException e) {
+                // the client closed its own connection
+            }
+
+            JsonNode beforeDisconnect = logs.await("Connected to origin");
+            JsonNode afterDisconnect = logs.await("Received header from origin");
+
+            String traceId = beforeDisconnect.get("TraceId").asText();
+            assertFalse(traceId.isEmpty());
+            assertEquals(traceId, afterDisconnect.get("TraceId").asText());
+            assertEquals("EPM-RTC-GPT", afterDisconnect.get("Attributes").path("user.project").asText());
+        }
+    }
+
+    /**
+     * Two requests on one keep-alive connection run on the same event loop. Nothing is cleared between them, and
+     * each still sees only its own ProxyContext: the entry lives in the per-request duplicated context.
+     */
+    @Test
+    public void testTraceContextIsScopedPerRequest_OnOneKeepAliveConnection() throws Exception {
+        HttpClient oneConnection = dial.getVertx().createHttpClient(new HttpClientOptions().setMaxPoolSize(1));
+        try (TestWebServer server = new TestWebServer(4848); JsonLogCapture logs = JsonLogCapture.attach(CHAT_URI)) {
+            server.map(HttpMethod.POST, "/chat/completions", 200, CHAT_COMPLETION_ANSWER, "Content-Type", "application/json");
+
+            List<HttpConnection> connections = new ArrayList<>();
+            for (String apiKey : List.of("proxyKey1", "proxyKey2")) {
+                assertEquals(200, sendChatCompletion(oneConnection, apiKey, connections::add));
+            }
+            assertSame(connections.get(0), connections.get(1), "both requests must share one connection");
+
+            List<JsonNode> sent = logs.await("Sent response to client", 2);
+            assertEquals(List.of("EPM-RTC-GPT", "EPM-RTC-RAIL"),
+                    sent.stream().map(line -> line.get("Attributes").path("user.project").asText()).toList());
+            assertNotEquals(sent.get(0).get("TraceId").asText(), sent.get(1).get("TraceId").asText());
+        } finally {
+            oneConnection.close().toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
+        }
+    }
+
+    /**
+     * Without a clear step the ProxyContext must still go away with its request: neither Vert.x (server connection,
+     * client pool) nor the core (timers, caches) may keep it reachable once the request is over. Both the client's
+     * and the upstream connection stay open and idle (keep-alive) during the check: the lifetime of the entry is the
+     * request's, not the connection's.
+     */
+    @Test
+    public void testProxyContextIsReleasedAfterRequest_WhileConnectionsStayAlive() throws Exception {
+        HttpClient keepAliveClient = dial.getVertx().createHttpClient(new HttpClientOptions().setMaxPoolSize(1).setKeepAlive(true));
+        try (TestWebServer server = new TestWebServer(4848); JsonLogCapture logs = JsonLogCapture.attach(CHAT_URI)) {
+            server.map(HttpMethod.POST, "/chat/completions", 200, CHAT_COMPLETION_ANSWER, "Content-Type", "application/json");
+
+            assertEquals(200, sendChatCompletion(keepAliveClient, "proxyKey1"));
+            logs.await("Sent response to client");
+            List<WeakReference<ProxyContext>> seen = logs.proxyContexts();
+            assertFalse(seen.isEmpty());
+
+            long deadline = System.currentTimeMillis() + 10_000;
+            while (seen.stream().anyMatch(ref -> ref.get() != null)) {
+                if (System.currentTimeMillis() > deadline) {
+                    fail("ProxyContext is still reachable after the request ended although nothing cleared it");
+                }
+                System.gc();
+                Thread.sleep(100);
+            }
+        } finally {
+            keepAliveClient.close().toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
+        }
+    }
+
+    private int sendChatCompletion(HttpClient client, String apiKey) throws Exception {
+        return sendChatCompletion(client, apiKey, connection -> { });
+    }
+
+    private int sendChatCompletion(HttpClient client, String apiKey, Consumer<HttpConnection> onConnection) throws Exception {
+        return client.request(new RequestOptions()
+                        .setMethod(HttpMethod.POST)
+                        .setAbsoluteURI("http://127.0.0.1:" + serverPort + CHAT_URI)
+                        .putHeader("api-key", apiKey)
+                        .putHeader("content-type", "application/json"))
+                .compose(request -> {
+                    onConnection.accept(request.connection());
+                    return request.send("{\"model\":\"gpt-3-turbo\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}");
+                })
+                .compose(response -> response.body().map(response.statusCode()))
+                .toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
     }
 
     private static CloseableHttpClient createHttpClient() {

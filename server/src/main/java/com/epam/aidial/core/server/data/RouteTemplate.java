@@ -7,7 +7,48 @@ import java.util.regex.Pattern;
 @Getter
 public enum RouteTemplate {
 
+    // Anthropic API routes.
+    // count_tokens is declared first: both regexes are $-anchored and mutually exclusive today, but
+    // keeping the more specific path ahead of the generic one stays correct if a greedy
+    // /messages/(?<id>...) route is ever added.
+    LLM_MESSAGES_API_COUNT_TOKENS(
+            "^/+anthropic/v1/messages/count_tokens$",
+            "/anthropic/v1/messages/count_tokens"
+    ),
+    LLM_MESSAGES_API(
+            "^/+anthropic/v1/messages$",
+            "/anthropic/v1/messages"
+    ),
+    LLM_ANTHROPIC_MODEL(
+            "^/+anthropic/v1/models/(?<id>.+?)$",
+            "/anthropic/v1/models/{id}"
+    ),
+    LLM_ANTHROPIC_MODELS(
+            "^/+anthropic/v1/models$",
+            "/anthropic/v1/models"
+    ),
+
     // OpenAI API routes
+    LLM_CHAT_COMPLETIONS_API(
+            "^/+openai/v1/chat/completions$",
+            "/openai/v1/chat/completions"
+    ),
+    LLM_RESPONSES_API(
+            "^/+openai/v1/responses$",
+            "/openai/v1/responses"
+    ),
+    LLM_RESPONSES_API_UNVERSIONED(
+            "^/+openai/responses$",
+            "/openai/responses"
+    ),
+    LLM_RESPONSES_API_CANCEL(
+            "^/+openai/v1/responses/(?<id>[^/]+)/cancel$",
+            "/openai/v1/responses/{id}/cancel"
+    ),
+    LLM_RESPONSES_API_BY_ID(
+            "^/+openai/v1/responses/(?<id>[^/]+)$",
+            "/openai/v1/responses/{id}"
+    ),
     POST_DEPLOYMENT(
             "^/+openai/deployments/(?<id>.+?)/(completions|chat/completions|embeddings)$",
             "/openai/deployments/{id}/{action}"
@@ -28,24 +69,6 @@ public enum RouteTemplate {
     MODELS(
             "^/+openai/models$",
             "/openai/models"
-    ),
-
-    ADDON(
-            "^/+openai/addons/(?<id>.+?)$",
-            "/openai/addons/{id}"
-    ),
-    ADDONS(
-            "^/+openai/addons$",
-            "/openai/addons"
-    ),
-
-    ASSISTANT(
-            "^/+openai/assistants/(?<id>.+?)$",
-            "/openai/assistants/{id}"
-    ),
-    ASSISTANTS(
-            "^/+openai/assistants$",
-            "/openai/assistants"
     ),
 
     APPLICATION(
@@ -71,9 +94,90 @@ public enum RouteTemplate {
             "^/v1/(conversations|prompts|applications|toolsets)/(?<bucket>[a-zA-Z0-9]+)/(?<path>.*)$",
             "/v1/{resourceType}/{bucket}/{path}"
     ),
+
+    // API-managed applications/toolsets in the platform bucket — Configuration-API-shaped CRUD via
+    // ConfigResourceController, not the generic RESOURCE route. Registered before RESOURCE in
+    // ControllerSelector (first match wins) since RESOURCE's bucket group structurally also matches
+    // the literal "platform" segment.
+    PLATFORM_APP_TOOLSET_RESOURCE(
+            "^/v1/(applications|toolsets)/(?<bucket>platform)/(?<path>.*)$",
+            "/v1/{resourceType}/platform/{path}"
+    ),
+    PLATFORM_APP_TOOLSET_RESOURCE_METADATA(
+            "^/v1/metadata/(applications|toolsets)/(?<bucket>platform)/(?<path>.*)$",
+            "/v1/metadata/{resourceType}/platform/{path}"
+    ),
+
+    // V2 whole-resource (folder-as-resource) routes.
+    // The {path} is the resource name and may span multiple segments (e.g. /v2/skills/{bucket}/group/name).
+    // The pattern forbids empty segments and a trailing slash (a resource is addressed by name, not as a
+    // folder listing), and reserves "/files/" as the single-file delimiter by refusing to cross it; this
+    // keeps COMPLEX_RESOURCE and COMPLEX_RESOURCE_FILE mutually exclusive regardless of route order.
+    COMPLEX_RESOURCE(
+            "^/v2/skills/(?<bucket>[a-zA-Z0-9]+)/(?<path>[^/](?:[^/]|/(?=[^/])(?!files/))*)$",
+            "/v2/skills/{bucket}/{path}"
+    ),
+    // Single-file operations inside a resource. The {path} segment is the resource name (may contain slashes),
+    // split from {filePath} at the first "/files/"; {filePath} is the relative file path inside the resource
+    // and may itself contain slashes.
+    COMPLEX_RESOURCE_FILE(
+            "^/v2/skills/(?<bucket>[a-zA-Z0-9]+)/(?<path>.+?)/files/(?<filePath>.+)$",
+            "/v2/skills/{bucket}/{path}/files/{filePath}"
+    ),
+    // A DIAL grouping folder, addressed with a trailing slash: create (PUT) / delete (DELETE) / GET -> 400.
+    RESOURCE_FOLDER(
+            "^/v2/skills/(?<bucket>[a-zA-Z0-9]+)/(?<path>[^/](?:[^/]|/(?=[^/]))*)/$",
+            "/v2/skills/{bucket}/{path}/"
+    ),
+    // Metadata: files inside a skill's current version. More specific than the children route, so it must
+    // be registered first. {filePath} is an optional subfolder to scope the listing.
+    COMPLEX_RESOURCE_FILE_METADATA(
+            "^/v2/metadata/skills/(?<bucket>[a-zA-Z0-9]+)/(?<path>.+?)/files(?:/(?<filePath>.*))?$",
+            "/v2/metadata/skills/{bucket}/{path}/files/{filePath}"
+    ),
+    // Metadata: classified, enriched children at a grouping level (empty path lists the bucket root).
+    COMPLEX_RESOURCE_METADATA(
+            "^/v2/metadata/skills/(?<bucket>[a-zA-Z0-9]+)/(?<path>.*)$",
+            "/v2/metadata/skills/{bucket}/{path}"
+    ),
     RESOURCE_METADATA(
             "^/v1/metadata/(conversations|prompts|applications|toolsets)/(?<bucket>[a-zA-Z0-9]+)/(?<path>.*)$",
             "/v1/metadata/{resourceType}/{bucket}/{path}"
+    ),
+
+    CONFIG_RESOURCE(
+            "^/v1/(models|interceptors|translators|roles|keys|routes|schemas|catalog_schemas|settings)/(?<bucket>[a-zA-Z0-9_-]+)/(?<path>.*)$",
+            "/v1/{resourceType}/{bucket}/{path}"
+    ),
+
+    CONFIG_RESOURCE_METADATA(
+            "^/v1/metadata/(models|interceptors|translators|roles|keys|routes|schemas|catalog_schemas|settings)/(?<bucket>[a-zA-Z0-9_-]+)/(?<path>.*)$",
+            "/v1/metadata/{resourceType}/{bucket}/{path}"
+    ),
+
+    CONFIG_HEALTH(
+            "^/v1/admin/health/config$",
+            "/v1/admin/health/config"
+    ),
+
+    ADMIN_FILE_CONFIG(
+            "^/v1/admin/config/file/(?<type>models|interceptors|translators|roles|keys|routes|schemas|catalog_schemas|settings|applications|toolsets)(?:/(?<name>.+))?$",
+            "/v1/admin/config/file/{type}/{name}"
+    ),
+
+    CONFIG_FILE_MIGRATE(
+            "^/v1/admin/config/file/migrate$",
+            "/v1/admin/config/file/migrate"
+    ),
+
+    CONFIG_VALIDATE(
+            "^/v1/admin/validate$",
+            "/v1/admin/validate"
+    ),
+
+    CONFIG_APPLY(
+            "^/v1/admin/apply$",
+            "/v1/admin/apply"
     ),
 
     BUCKET(
@@ -102,10 +206,24 @@ public enum RouteTemplate {
             "^/v1/deployments/(?<id>.+?)/limits$",
             "/v1/deployments/{id}/limits"
     ),
+    DEPLOYMENT_USAGE(
+            "^/v1/deployments/(?<id>.+?)/usage$",
+            "/v1/deployments/{id}/usage"
+    ),
 
     DEPLOYMENT_ROUTES(
             "^/+v1/deployments/(?<id>.+)/route(?<routePath>/.+?)$",
             "/v1/deployments/{id}/route/{routePath}"
+    ),
+
+    DEPLOYMENT_LISTING(
+            "^/+v1/deployments$",
+            "/v1/deployments"
+    ),
+
+    DEPLOYMENT_NAMES(
+            "^/+v1/deployment-names$",
+            "/v1/deployment-names"
     ),
 
     // Operations
@@ -159,6 +277,32 @@ public enum RouteTemplate {
         "/v1/ops/toolset/{operation}"
     ),
 
+    TOOL_SET_REPAIR(
+        "^/v1/ops/toolset/(?<bucket>[a-zA-Z0-9]+)/(?<path>.+)/repair$",
+        "/v1/ops/toolset/{bucket}/{path}/repair"
+    ),
+
+    EXTERNAL_SERVICE_CREDENTIALS(
+        "^/v1/ops/external-service/(signin|signout|credentials|obo-credentials)$",
+        "/v1/ops/external-service/{operation}"
+    ),
+
+    // External-service definition management (admin/app-owner). appId is a lazy group: static app name
+    // or dynamic {bucket}/{path}.
+    EXTERNAL_SERVICES_MANAGEMENT(
+        "^/v1/applications/(?<appId>.+?)/external-services$",
+        "/v1/applications/{appId}/external-services"
+    ),
+    EXTERNAL_SERVICE_MANAGEMENT(
+        "^/v1/applications/(?<appId>.+?)/external-services/(?<id>[^/]+)$",
+        "/v1/applications/{appId}/external-services/{id}"
+    ),
+    // Admin consent for a DIAL-native service: a separate door from sign-in, with its own authorization rule.
+    EXTERNAL_SERVICE_CONSENT(
+        "^/v1/applications/(?<appId>.+?)/external-services/(?<id>[^/]+)/consent$",
+        "/v1/applications/{appId}/external-services/{id}/consent"
+    ),
+
     // Other routes
     CONFIG(
             "^/v1/ops/config/reload$",
@@ -172,9 +316,30 @@ public enum RouteTemplate {
             "^/v1/user/info$",
             "/v1/user/info"
     ),
+    USER_LIMITS(
+            "^/v1/user/limits$",
+            "/v1/user/limits"
+    ),
+    USER_USAGE(
+            "^/v1/user/usage$",
+            "/v1/user/usage"
+    ),
+    // The caller's own offline credentials: status plus the parameters chat needs to start the flow.
+    OFFLINE_CREDENTIALS(
+            "^/v1/user/offline-credentials$",
+            "/v1/user/offline-credentials"
+    ),
+    OFFLINE_CREDENTIALS_OPERATIONS(
+            "^/v1/user/offline-credentials/(signin|signout)$",
+            "/v1/user/offline-credentials/{operation}"
+    ),
     APP_SCHEMAS(
             "^/v1/application_type_schemas/(schemas|schema|meta_schema)$",
             "/v1/application_type_schemas/{operation}"
+    ),
+    CATALOG_SCHEMAS(
+            "^/v1/catalog_schemas/(schemas|schema|meta_schema)$",
+            "/v1/catalog_schemas/{operation}"
     ),
     TOOL_SET(
             "^/+openai/toolsets/(?<id>.+?)$",
@@ -184,13 +349,47 @@ public enum RouteTemplate {
             "^/+openai/toolsets$",
             "/openai/toolsets"
     ),
-    TOOL_SET_PROXY(
+    TOOL_SET_TOOLS(
+            "^/v1/toolset/(?<id>.+?)/tools$",
+            "/v1/toolset/{id}/tools"
+    ),
+    TOOL_SET_ALLOWED_TOOLS(
+            "^/v1/toolset/(?<id>.+?)/allowed-tools$",
+            "/v1/toolset/{id}/allowed-tools"
+    ),
+    TOOL_SET_MCP_PROXY(
             "^/v1/toolset/(?<id>.+?)/mcp$",
             "/v1/toolset/{id}/mcp"
+    ),
+    APPLICATION_MCP_PROXY(
+            "^/v1/deployments/(?<id>.+?)/mcp$",
+            "/v1/deployments/{id}/mcp"
+    ),
+    MCP_RESOURCE(
+            "^/v1/deployments/(?<id>.+?)/mcp/resources$",
+            "/v1/deployments/{id}/mcp/resources"
     ),
     TOOL_SET_PROXY_METADATA(
             "^/\\.well-known/oauth-protected-resource/v1/toolset/(?<id>.+?)/mcp$",
             "/.well-known/oauth-protected-resource/v1/toolset/{id}/mcp"
+    ),
+    APPLICATION_MCP_PROXY_METADATA(
+            "^/\\.well-known/oauth-protected-resource/v1/deployments/(?<id>.+?)/mcp$",
+            "/.well-known/oauth-protected-resource/v1/deployments/{id}/mcp"
+    ),
+    PER_REQUEST_PERMISSION("^/v1/ops/resource/per-request-permissions/(grant|revoke|list)",
+            "/v1/ops/resource/per-request-permissions/{operation}"),
+
+    CLIENT_CHANNEL("^/v1/ops/client-channel/(subscribe|report|unsubscribe|interact)",
+            "/v1/ops/client-channel/{operation}"),
+
+    // Declared last: {id} spans slashes (resource-backed deployments are addressed by their url), so this
+    // template also matches every /v1/deployments/{id}/... path. Path normalization returns the first
+    // matching template, hence the more specific ones must stay ahead of it - as must their routes in
+    // ControllerSelector.
+    DEPLOYMENT_INFO(
+            "^/+v1/deployments/(?<id>.+?)$",
+            "/v1/deployments/{id}"
     );
 
     private final Pattern pattern;

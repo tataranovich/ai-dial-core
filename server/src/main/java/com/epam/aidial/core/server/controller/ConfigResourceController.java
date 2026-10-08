@@ -1,0 +1,2128 @@
+package com.epam.aidial.core.server.controller;
+
+import com.epam.aidial.core.config.Application;
+import com.epam.aidial.core.config.Config;
+import com.epam.aidial.core.config.Deployment;
+import com.epam.aidial.core.config.GlobalSettings;
+import com.epam.aidial.core.config.Interceptor;
+import com.epam.aidial.core.config.Key;
+import com.epam.aidial.core.config.Model;
+import com.epam.aidial.core.config.ResourceAuthSettings;
+import com.epam.aidial.core.config.Role;
+import com.epam.aidial.core.config.Route;
+import com.epam.aidial.core.config.ToolSet;
+import com.epam.aidial.core.config.Translator;
+import com.epam.aidial.core.credentials.service.ResourceAuthSettingsService;
+import com.epam.aidial.core.openapi.annotations.ApiExtension;
+import com.epam.aidial.core.openapi.annotations.ApiHeader;
+import com.epam.aidial.core.openapi.annotations.ApiOperation;
+import com.epam.aidial.core.openapi.annotations.ApiOperations;
+import com.epam.aidial.core.openapi.annotations.ApiParameter;
+import com.epam.aidial.core.openapi.annotations.ApiResponse;
+import com.epam.aidial.core.openapi.annotations.ApiSchema;
+import com.epam.aidial.core.openapi.annotations.OpenApiDescriptions;
+import com.epam.aidial.core.openapi.annotations.ParameterIn;
+import com.epam.aidial.core.server.Proxy;
+import com.epam.aidial.core.server.ProxyContext;
+import com.epam.aidial.core.server.config.ConfigPostProcessor;
+import com.epam.aidial.core.server.config.InvalidEntityRecord;
+import com.epam.aidial.core.server.config.KeyValidator;
+import com.epam.aidial.core.server.config.MergedConfigStore;
+import com.epam.aidial.core.server.config.SecretFieldProcessor;
+import com.epam.aidial.core.server.config.ValidationWarning;
+import com.epam.aidial.core.server.data.ApiKeyData;
+import com.epam.aidial.core.server.data.EntityMetadata;
+import com.epam.aidial.core.server.security.ApiKeyStore;
+import com.epam.aidial.core.server.security.ConfigAuthorizationService;
+import com.epam.aidial.core.server.security.EntityBucketBinding;
+import com.epam.aidial.core.server.security.Operation;
+import com.epam.aidial.core.server.service.AdminManagedFieldsWriteMode;
+import com.epam.aidial.core.server.service.ApplicationService;
+import com.epam.aidial.core.server.service.CatalogSchemaService;
+import com.epam.aidial.core.server.service.ResourceAuthStatusEnricher;
+import com.epam.aidial.core.server.service.ToolSetService;
+import com.epam.aidial.core.server.service.config.ConfigEntityCodec;
+import com.epam.aidial.core.server.util.ProxyUtil;
+import com.epam.aidial.core.server.util.ResourceDescriptorFactory;
+import com.epam.aidial.core.server.util.UpstreamExtraDataMerger;
+import com.epam.aidial.core.server.validation.CatalogSchemaValidationException;
+import com.epam.aidial.core.server.validation.ValidationUtil;
+import com.epam.aidial.core.server.vertx.AsyncTaskExecutor;
+import com.epam.aidial.core.storage.data.ResourceItemMetadata;
+import com.epam.aidial.core.storage.exception.ResourceNotFoundException;
+import com.epam.aidial.core.storage.http.HttpException;
+import com.epam.aidial.core.storage.http.HttpStatus;
+import com.epam.aidial.core.storage.resource.ResourceDescriptor;
+import com.epam.aidial.core.storage.resource.ResourceTypes;
+import com.epam.aidial.core.storage.service.LockService;
+import com.epam.aidial.core.storage.service.ResourceService;
+import com.epam.aidial.core.storage.util.EtagHeader;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.vertx.core.Future;
+import io.vertx.core.buffer.Buffer;
+import io.vertx.core.http.HttpHeaders;
+import io.vertx.core.http.HttpMethod;
+import jakarta.validation.ConstraintViolationException;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.tuple.Pair;
+
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.function.BiFunction;
+
+import static com.epam.aidial.core.server.service.config.ConfigEntityCodec.BLOB_MAPPER;
+
+/**
+ * Controller for the {@code /v1/{type}/{bucket}/{path}} CONFIG_RESOURCE route — gates on
+ * the {@link EntityBucketBinding} allowlist and {@link ConfigAuthorizationService}, then
+ * dispatches GET to per-type read handlers and PUT/DELETE for models, interceptors, roles,
+ * keys, routes, schemas, and the settings singleton. POST is universally 405 with
+ * {@code Allow: GET, PUT, DELETE}. PUT is a pure upsert honoring RFC 7232
+ * {@code If-None-Match: *} (create-only gate, 412 if exists) and {@code If-Match: <etag>}
+ * (412 on mismatch). Per-bucket listings live on the sibling
+ * {@link com.epam.aidial.core.server.data.RouteTemplate#CONFIG_RESOURCE_METADATA} route.
+ */
+@Slf4j
+public class ConfigResourceController implements Controller {
+
+    private static final String SETTINGS_SINGLETON_NAME = "global";
+    private static final String ALLOW_HEADER = "GET, PUT, DELETE";
+
+    private final ProxyContext context;
+    private final ConfigAuthorizationService authorizationService;
+    private final MergedConfigStore mergedConfigStore;
+    private final ResourceService resourceService;
+    private final AsyncTaskExecutor taskExecutor;
+    private final SecretFieldProcessor secretFieldProcessor;
+    private final boolean softValidation;
+    private final ApiKeyStore apiKeyStore;
+    private final LockService lockService;
+    private final ApplicationService applicationService;
+    private final ToolSetService toolSetService;
+    private final CatalogSchemaService catalogSchemaService;
+    private final ResourceAuthSettingsService resourceAuthSettingsService;
+    private final String entityType;
+    private final String bucket;
+    private final String path;
+
+    public ConfigResourceController(Proxy proxy,
+                                    ProxyContext context,
+                                    String entityType,
+                                    String bucket,
+                                    String path) {
+        this.context = context;
+        this.authorizationService = proxy.getConfigAuthService();
+        this.mergedConfigStore = (MergedConfigStore) proxy.getConfigStore();
+        this.resourceService = proxy.getResourceService();
+        this.taskExecutor = proxy.getTaskExecutor();
+        this.secretFieldProcessor = mergedConfigStore.getSecretFieldProcessor();
+        this.softValidation = mergedConfigStore.isSoftValidation();
+        this.apiKeyStore = proxy.getApiKeyStore();
+        this.lockService = proxy.getLockService();
+        this.applicationService = proxy.getApplicationService();
+        this.toolSetService = proxy.getToolSetService();
+        this.catalogSchemaService = proxy.getCatalogSchemaService();
+        this.resourceAuthSettingsService = proxy.getResourceAuthSettingsService();
+        this.entityType = entityType;
+        this.bucket = bucket;
+        this.path = path;
+    }
+
+    @Override
+    @ApiOperations({
+            // Models
+            @ApiOperation(
+                    method = "GET",
+                    path = "/v1/models/{bucket}/{path}",
+                    operationId = "getModelByPath",
+                    tags = {"Models"},
+                    parameters = {
+                            @ApiParameter(name = "bucket", in = ParameterIn.PATH, required = true, description = OpenApiDescriptions.BUCKET),
+                            @ApiParameter(name = "path", in = ParameterIn.PATH, required = true, description = "Model name"),
+                            @ApiParameter(name = "If-None-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_MATCH)
+                    },
+                    responses = {
+                            @ApiResponse(code = 200, description = "Success", body = @ApiSchema(allOf = {Model.class, EntityMetadata.class}),
+                                    headers = {
+                                            @ApiHeader(name = "ETag", description = "Entity tag for the model", required = true)
+                                    }),
+                            @ApiResponse(code = 304),
+                            @ApiResponse(code = 400),
+                            @ApiResponse(code = 403),
+                            @ApiResponse(code = 404),
+                            @ApiResponse(code = 405),
+                            @ApiResponse(code = 412),
+                            @ApiResponse(code = 500)
+                    },
+                    extensions = { 
+                            @ApiExtension(name = "x-preview", value = "true") 
+                    }
+            ),
+            @ApiOperation(
+                    method = "PUT",
+                    path = "/v1/models/{bucket}/{path}",
+                    operationId = "saveModel",
+                    requestBody = @ApiSchema(implementation = Model.class),
+                    tags = {"Models"},
+                    parameters = {
+                            @ApiParameter(name = "bucket", in = ParameterIn.PATH, required = true, description = OpenApiDescriptions.BUCKET),
+                            @ApiParameter(name = "path", in = ParameterIn.PATH, required = true, description = "Model name"),
+                            @ApiParameter(name = "If-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_MATCH),
+                            @ApiParameter(name = "If-None-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_NONE_MATCH)
+                    },
+                    responses = {
+                            @ApiResponse(code = 200, description = "Success", body = @ApiSchema(implementation = ConfigWriteResponse.class),
+                                    headers = {
+                                            @ApiHeader(name = "ETag", description = "Entity tag for the saved model", required = true)
+                                    }),
+                            @ApiResponse(code = 400),
+                            @ApiResponse(code = 403),
+                            @ApiResponse(code = 404),
+                            @ApiResponse(code = 405),
+                            @ApiResponse(code = 412),
+                            @ApiResponse(code = 422),
+                            @ApiResponse(code = 500)
+                    },
+                    extensions = { 
+                            @ApiExtension(name = "x-preview", value = "true") 
+                    }
+            ),
+            @ApiOperation(
+                    method = "DELETE",
+                    path = "/v1/models/{bucket}/{path}",
+                    operationId = "deleteModel",
+                    tags = {"Models"},
+                    parameters = {
+                            @ApiParameter(name = "bucket", in = ParameterIn.PATH, required = true, description = OpenApiDescriptions.BUCKET),
+                            @ApiParameter(name = "path", in = ParameterIn.PATH, required = true, description = "Model name"),
+                            @ApiParameter(name = "If-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_MATCH)
+                    },
+                    responses = {
+                            @ApiResponse(code = 204, description = "Success"),
+                            @ApiResponse(code = 400),
+                            @ApiResponse(code = 403),
+                            @ApiResponse(code = 404),
+                            @ApiResponse(code = 405),
+                            @ApiResponse(code = 412),
+                            @ApiResponse(code = 500)
+                    },
+                    extensions = { 
+                            @ApiExtension(name = "x-preview", value = "true") 
+                    }
+            ),
+            // Interceptors
+            @ApiOperation(
+                    method = "GET",
+                    path = "/v1/interceptors/{bucket}/{path}",
+                    operationId = "getInterceptor",
+                    tags = {"Interceptors"},
+                    parameters = {
+                            @ApiParameter(name = "bucket", in = ParameterIn.PATH, required = true, description = OpenApiDescriptions.BUCKET),
+                            @ApiParameter(name = "path", in = ParameterIn.PATH, required = true, description = "Interceptor name"),
+                            @ApiParameter(name = "If-None-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_MATCH)
+                    },
+                    responses = {
+                            @ApiResponse(code = 200, description = "Success", body = @ApiSchema(allOf = {Interceptor.class, EntityMetadata.class}),
+                                    headers = {
+                                            @ApiHeader(name = "ETag", description = "Entity tag for the interceptor", required = true)
+                                    }),
+                            @ApiResponse(code = 304),
+                            @ApiResponse(code = 400),
+                            @ApiResponse(code = 403),
+                            @ApiResponse(code = 404),
+                            @ApiResponse(code = 405),
+                            @ApiResponse(code = 412),
+                            @ApiResponse(code = 500)
+                    },
+                    extensions = { 
+                            @ApiExtension(name = "x-preview", value = "true") 
+                    }
+            ),
+            @ApiOperation(
+                    method = "PUT",
+                    path = "/v1/interceptors/{bucket}/{path}",
+                    operationId = "saveInterceptor",
+                    requestBody = @ApiSchema(implementation = Interceptor.class),
+                    tags = {"Interceptors"},
+                    parameters = {
+                            @ApiParameter(name = "bucket", in = ParameterIn.PATH, required = true, description = OpenApiDescriptions.BUCKET),
+                            @ApiParameter(name = "path", in = ParameterIn.PATH, required = true, description = "Interceptor name"),
+                            @ApiParameter(name = "If-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_MATCH),
+                            @ApiParameter(name = "If-None-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_NONE_MATCH)
+                    },
+                    responses = {
+                            @ApiResponse(code = 200, description = "Success", body = @ApiSchema(implementation = ConfigWriteResponse.class),
+                                    headers = {
+                                            @ApiHeader(name = "ETag", description = "Entity tag for the saved interceptor", required = true)
+                                    }),
+                            @ApiResponse(code = 400),
+                            @ApiResponse(code = 403),
+                            @ApiResponse(code = 404),
+                            @ApiResponse(code = 405),
+                            @ApiResponse(code = 412),
+                            @ApiResponse(code = 422),
+                            @ApiResponse(code = 500)
+                    },
+                    extensions = { 
+                            @ApiExtension(name = "x-preview", value = "true") 
+                    }
+            ),
+            @ApiOperation(
+                    method = "DELETE",
+                    path = "/v1/interceptors/{bucket}/{path}",
+                    operationId = "deleteInterceptor",
+                    tags = {"Interceptors"},
+                    parameters = {
+                            @ApiParameter(name = "bucket", in = ParameterIn.PATH, required = true, description = OpenApiDescriptions.BUCKET),
+                            @ApiParameter(name = "path", in = ParameterIn.PATH, required = true, description = "Interceptor name"),
+                            @ApiParameter(name = "If-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_MATCH)
+                    },
+                    responses = {
+                            @ApiResponse(code = 204, description = "Success"),
+                            @ApiResponse(code = 400),
+                            @ApiResponse(code = 403),
+                            @ApiResponse(code = 404),
+                            @ApiResponse(code = 405),
+                            @ApiResponse(code = 412),
+                            @ApiResponse(code = 500)
+                    },
+                    extensions = { 
+                            @ApiExtension(name = "x-preview", value = "true") 
+                    }
+            ),
+            // Translators
+            @ApiOperation(
+                    method = "GET",
+                    path = "/v1/translators/{bucket}/{path}",
+                    operationId = "getTranslator",
+                    tags = {"Translators"},
+                    parameters = {
+                            @ApiParameter(name = "bucket", in = ParameterIn.PATH, required = true, description = OpenApiDescriptions.BUCKET),
+                            @ApiParameter(name = "path", in = ParameterIn.PATH, required = true, description = "Translator name"),
+                            @ApiParameter(name = "If-None-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_MATCH)
+                    },
+                    responses = {
+                            @ApiResponse(code = 200, description = "Success", body = @ApiSchema(allOf = {Translator.class, EntityMetadata.class}),
+                                    headers = {
+                                            @ApiHeader(name = "ETag", description = "Entity tag for the translator", required = true)
+                                    }),
+                            @ApiResponse(code = 304),
+                            @ApiResponse(code = 400),
+                            @ApiResponse(code = 403),
+                            @ApiResponse(code = 404),
+                            @ApiResponse(code = 405),
+                            @ApiResponse(code = 412),
+                            @ApiResponse(code = 500)
+                    },
+                    extensions = {
+                            @ApiExtension(name = "x-preview", value = "true")
+                    }
+            ),
+            @ApiOperation(
+                    method = "PUT",
+                    path = "/v1/translators/{bucket}/{path}",
+                    operationId = "saveTranslator",
+                    requestBody = @ApiSchema(implementation = Translator.class),
+                    tags = {"Translators"},
+                    parameters = {
+                            @ApiParameter(name = "bucket", in = ParameterIn.PATH, required = true, description = OpenApiDescriptions.BUCKET),
+                            @ApiParameter(name = "path", in = ParameterIn.PATH, required = true, description = "Translator name"),
+                            @ApiParameter(name = "If-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_MATCH),
+                            @ApiParameter(name = "If-None-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_NONE_MATCH)
+                    },
+                    responses = {
+                            @ApiResponse(code = 200, description = "Success", body = @ApiSchema(implementation = ConfigWriteResponse.class),
+                                    headers = {
+                                            @ApiHeader(name = "ETag", description = "Entity tag for the saved translator", required = true)
+                                    }),
+                            @ApiResponse(code = 400),
+                            @ApiResponse(code = 403),
+                            @ApiResponse(code = 404),
+                            @ApiResponse(code = 405),
+                            @ApiResponse(code = 412),
+                            @ApiResponse(code = 422),
+                            @ApiResponse(code = 500)
+                    },
+                    extensions = {
+                            @ApiExtension(name = "x-preview", value = "true")
+                    }
+            ),
+            @ApiOperation(
+                    method = "DELETE",
+                    path = "/v1/translators/{bucket}/{path}",
+                    operationId = "deleteTranslator",
+                    tags = {"Translators"},
+                    parameters = {
+                            @ApiParameter(name = "bucket", in = ParameterIn.PATH, required = true, description = OpenApiDescriptions.BUCKET),
+                            @ApiParameter(name = "path", in = ParameterIn.PATH, required = true, description = "Translator name"),
+                            @ApiParameter(name = "If-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_MATCH)
+                    },
+                    responses = {
+                            @ApiResponse(code = 204, description = "Success"),
+                            @ApiResponse(code = 400),
+                            @ApiResponse(code = 403),
+                            @ApiResponse(code = 404),
+                            @ApiResponse(code = 405),
+                            @ApiResponse(code = 412),
+                            @ApiResponse(code = 500)
+                    },
+                    extensions = {
+                            @ApiExtension(name = "x-preview", value = "true")
+                    }
+            ),
+            // Roles
+            @ApiOperation(
+                    method = "GET",
+                    path = "/v1/roles/{bucket}/{path}",
+                    operationId = "getRole",
+                    tags = {"Roles"},
+                    parameters = {
+                            @ApiParameter(name = "bucket", in = ParameterIn.PATH, required = true, description = OpenApiDescriptions.BUCKET),
+                            @ApiParameter(name = "path", in = ParameterIn.PATH, required = true, description = "Role name"),
+                            @ApiParameter(name = "If-None-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_MATCH)
+                    },
+                    responses = {
+                            @ApiResponse(code = 200, description = "Success", body = @ApiSchema(allOf = {Role.class, EntityMetadata.class}),
+                                    headers = {
+                                            @ApiHeader(name = "ETag", description = "Entity tag for the role", required = true)
+                                    }),
+                            @ApiResponse(code = 304),
+                            @ApiResponse(code = 400),
+                            @ApiResponse(code = 403),
+                            @ApiResponse(code = 404),
+                            @ApiResponse(code = 405),
+                            @ApiResponse(code = 412),
+                            @ApiResponse(code = 500)
+                    },
+                    extensions = { 
+                            @ApiExtension(name = "x-preview", value = "true") 
+                    }
+            ),
+            @ApiOperation(
+                    method = "PUT",
+                    path = "/v1/roles/{bucket}/{path}",
+                    operationId = "saveRole",
+                    requestBody = @ApiSchema(implementation = Role.class),
+                    tags = {"Roles"},
+                    parameters = {
+                            @ApiParameter(name = "bucket", in = ParameterIn.PATH, required = true, description = OpenApiDescriptions.BUCKET),
+                            @ApiParameter(name = "path", in = ParameterIn.PATH, required = true, description = "Role name"),
+                            @ApiParameter(name = "If-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_MATCH),
+                            @ApiParameter(name = "If-None-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_NONE_MATCH)
+                    },
+                    responses = {
+                            @ApiResponse(code = 200, description = "Success", body = @ApiSchema(implementation = ConfigWriteResponse.class),
+                                    headers = {
+                                            @ApiHeader(name = "ETag", description = "Entity tag for the saved role", required = true)
+                                    }),
+                            @ApiResponse(code = 400),
+                            @ApiResponse(code = 403),
+                            @ApiResponse(code = 404),
+                            @ApiResponse(code = 405),
+                            @ApiResponse(code = 412),
+                            @ApiResponse(code = 422),
+                            @ApiResponse(code = 500)
+                    },
+                    extensions = { 
+                            @ApiExtension(name = "x-preview", value = "true") 
+                    }
+            ),
+            @ApiOperation(
+                    method = "DELETE",
+                    path = "/v1/roles/{bucket}/{path}",
+                    operationId = "deleteRole",
+                    tags = {"Roles"},
+                    parameters = {
+                            @ApiParameter(name = "bucket", in = ParameterIn.PATH, required = true, description = OpenApiDescriptions.BUCKET),
+                            @ApiParameter(name = "path", in = ParameterIn.PATH, required = true, description = "Role name"),
+                            @ApiParameter(name = "If-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_MATCH)
+                    },
+                    responses = {
+                            @ApiResponse(code = 204, description = "Success"),
+                            @ApiResponse(code = 400),
+                            @ApiResponse(code = 403),
+                            @ApiResponse(code = 404),
+                            @ApiResponse(code = 405),
+                            @ApiResponse(code = 412),
+                            @ApiResponse(code = 500)
+                    },
+                    extensions = { 
+                            @ApiExtension(name = "x-preview", value = "true") 
+                    }
+            ),
+            // Keys
+            @ApiOperation(
+                    method = "GET",
+                    path = "/v1/keys/{bucket}/{path}",
+                    operationId = "getKey",
+                    tags = {"Keys"},
+                    parameters = {
+                            @ApiParameter(name = "bucket", in = ParameterIn.PATH, required = true, description = OpenApiDescriptions.BUCKET),
+                            @ApiParameter(name = "path", in = ParameterIn.PATH, required = true, description = "Key name"),
+                            @ApiParameter(name = "If-None-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_NONE_MATCH)
+                    },
+                    responses = {
+                            @ApiResponse(code = 200, description = "Success", body = @ApiSchema(allOf = {Key.class, EntityMetadata.class}),
+                                    headers = {
+                                            @ApiHeader(name = "ETag", description = "Entity tag for the key", required = true)
+                                    }),
+                            @ApiResponse(code = 304),
+                            @ApiResponse(code = 400),
+                            @ApiResponse(code = 403),
+                            @ApiResponse(code = 404),
+                            @ApiResponse(code = 405),
+                            @ApiResponse(code = 412),
+                            @ApiResponse(code = 500)
+                    },
+                    extensions = { 
+                            @ApiExtension(name = "x-preview", value = "true") 
+                    }
+            ),
+            @ApiOperation(
+                    method = "PUT",
+                    path = "/v1/keys/{bucket}/{path}",
+                    operationId = "saveKey",
+                    requestBody = @ApiSchema(implementation = Key.class),
+                    tags = {"Keys"},
+                    parameters = {
+                            @ApiParameter(name = "bucket", in = ParameterIn.PATH, required = true, description = OpenApiDescriptions.BUCKET),
+                            @ApiParameter(name = "path", in = ParameterIn.PATH, required = true, description = "Key name"),
+                            @ApiParameter(name = "If-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_MATCH),
+                            @ApiParameter(name = "If-None-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_NONE_MATCH)
+                    },
+                    responses = {
+                            @ApiResponse(code = 200, description = "Success", body = @ApiSchema(implementation = ConfigWriteResponse.class),
+                                    headers = {
+                                            @ApiHeader(name = "ETag", description = "Entity tag for the saved key", required = true)
+                                    }),
+                            @ApiResponse(code = 400),
+                            @ApiResponse(code = 403),
+                            @ApiResponse(code = 404),
+                            @ApiResponse(code = 405),
+                            @ApiResponse(code = 412),
+                            @ApiResponse(code = 422),
+                            @ApiResponse(code = 500)
+                    },
+                    extensions = { 
+                            @ApiExtension(name = "x-preview", value = "true") 
+                    }
+            ),
+            @ApiOperation(
+                    method = "DELETE",
+                    path = "/v1/keys/{bucket}/{path}",
+                    operationId = "deleteKey",
+                    tags = {"Keys"},
+                    parameters = {
+                            @ApiParameter(name = "bucket", in = ParameterIn.PATH, required = true, description = OpenApiDescriptions.BUCKET),
+                            @ApiParameter(name = "path", in = ParameterIn.PATH, required = true, description = "Key name"),
+                            @ApiParameter(name = "If-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_MATCH)
+                    },
+                    responses = {
+                            @ApiResponse(code = 204, description = "Success"),
+                            @ApiResponse(code = 400),
+                            @ApiResponse(code = 403),
+                            @ApiResponse(code = 404),
+                            @ApiResponse(code = 405),
+                            @ApiResponse(code = 412),
+                            @ApiResponse(code = 500)
+                    },
+                    extensions = { 
+                            @ApiExtension(name = "x-preview", value = "true") 
+                    }
+            ),
+            // Routes
+            @ApiOperation(
+                    method = "GET",
+                    path = "/v1/routes/{bucket}/{path}",
+                    operationId = "getRoute",
+                    tags = {"Routes"},
+                    parameters = {
+                            @ApiParameter(name = "bucket", in = ParameterIn.PATH, required = true, description = OpenApiDescriptions.BUCKET),
+                            @ApiParameter(name = "path", in = ParameterIn.PATH, required = true, description = "Route name"),
+                            @ApiParameter(name = "If-None-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_NONE_MATCH)
+                    },
+                    responses = {
+                            @ApiResponse(code = 200, description = "Success", body = @ApiSchema(allOf = {Route.class, EntityMetadata.class}),
+                                    headers = {
+                                            @ApiHeader(name = "ETag", description = "Entity tag for the route", required = true)
+                                    }),
+                            @ApiResponse(code = 304),
+                            @ApiResponse(code = 400),
+                            @ApiResponse(code = 403),
+                            @ApiResponse(code = 404),
+                            @ApiResponse(code = 405),
+                            @ApiResponse(code = 412),
+                            @ApiResponse(code = 500)
+                    },
+                    extensions = { 
+                            @ApiExtension(name = "x-preview", value = "true") 
+                    }
+            ),
+            @ApiOperation(
+                    method = "PUT",
+                    path = "/v1/routes/{bucket}/{path}",
+                    operationId = "saveRoute",
+                    requestBody = @ApiSchema(implementation = Route.class),
+                    tags = {"Routes"},
+                    parameters = {
+                            @ApiParameter(name = "bucket", in = ParameterIn.PATH, required = true, description = OpenApiDescriptions.BUCKET),
+                            @ApiParameter(name = "path", in = ParameterIn.PATH, required = true, description = "Route name"),
+                            @ApiParameter(name = "If-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_MATCH),
+                            @ApiParameter(name = "If-None-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_NONE_MATCH)
+                    },
+                    responses = {
+                            @ApiResponse(code = 200, description = "Success", body = @ApiSchema(implementation = ConfigWriteResponse.class),
+                                    headers = {
+                                            @ApiHeader(name = "ETag", description = "Entity tag for the saved route", required = true)
+                                    }),
+                            @ApiResponse(code = 400),
+                            @ApiResponse(code = 403),
+                            @ApiResponse(code = 404),
+                            @ApiResponse(code = 405),
+                            @ApiResponse(code = 412),
+                            @ApiResponse(code = 422),
+                            @ApiResponse(code = 500)
+                    },
+                    extensions = { 
+                            @ApiExtension(name = "x-preview", value = "true") 
+                    }
+            ),
+            @ApiOperation(
+                    method = "DELETE",
+                    path = "/v1/routes/{bucket}/{path}",
+                    operationId = "deleteRoute",
+                    tags = {"Routes"},
+                    parameters = {
+                            @ApiParameter(name = "bucket", in = ParameterIn.PATH, required = true, description = OpenApiDescriptions.BUCKET),
+                            @ApiParameter(name = "path", in = ParameterIn.PATH, required = true, description = "Route name"),
+                            @ApiParameter(name = "If-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_MATCH)
+                    },
+                    responses = {
+                            @ApiResponse(code = 204, description = "Success"),
+                            @ApiResponse(code = 400),
+                            @ApiResponse(code = 403),
+                            @ApiResponse(code = 404),
+                            @ApiResponse(code = 405),
+                            @ApiResponse(code = 412),
+                            @ApiResponse(code = 500)
+                    },
+                    extensions = { 
+                            @ApiExtension(name = "x-preview", value = "true") 
+                    }
+            ),
+            // Schemas
+            @ApiOperation(
+                    method = "GET",
+                    path = "/v1/schemas/{bucket}/{path}",
+                    operationId = "getSchema",
+                    tags = {"Schemas"},
+                    parameters = {
+                            @ApiParameter(name = "bucket", in = ParameterIn.PATH, required = true, description = OpenApiDescriptions.BUCKET),
+                            @ApiParameter(name = "path", in = ParameterIn.PATH, required = true, description = OpenApiDescriptions.SCHEMA_ID),
+                            @ApiParameter(name = "If-None-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_NONE_MATCH)
+                    },
+                    responses = {
+                            @ApiResponse(code = 200, description = "Success", body = @ApiSchema(allOfSchemaRefs = {"ApplicationTypeSchema"}, allOf = {EntityMetadata.class}),
+                                    headers = {
+                                            @ApiHeader(name = "ETag", description = "Entity tag for the schema", required = true)
+                                    }
+                            ),
+                            @ApiResponse(code = 304),
+                            @ApiResponse(code = 400),
+                            @ApiResponse(code = 403),
+                            @ApiResponse(code = 404),
+                            @ApiResponse(code = 405),
+                            @ApiResponse(code = 412),
+                            @ApiResponse(code = 500)
+                    },
+                    extensions = { 
+                            @ApiExtension(name = "x-preview", value = "true") 
+                    }
+            ),
+            @ApiOperation(
+                    method = "PUT",
+                    path = "/v1/schemas/{bucket}/{path}",
+                    operationId = "saveSchema",
+                    tags = {"Schemas"},
+                    requestBody = @ApiSchema(schemaRef = "ApplicationTypeSchema"),
+                    parameters = {
+                            @ApiParameter(name = "bucket", in = ParameterIn.PATH, required = true, description = OpenApiDescriptions.BUCKET),
+                            @ApiParameter(name = "path", in = ParameterIn.PATH, required = true, description = OpenApiDescriptions.SCHEMA_ID),
+                            @ApiParameter(name = "If-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_MATCH),
+                            @ApiParameter(name = "If-None-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_NONE_MATCH)
+                    },
+                    responses = {
+                            @ApiResponse(code = 200, description = "Success", body = @ApiSchema(implementation = ConfigWriteResponse.class),
+                                    headers = {
+                                            @ApiHeader(name = "ETag", description = "Entity tag for the saved schema", required = true)
+                                    }),
+                            @ApiResponse(code = 400),
+                            @ApiResponse(code = 403),
+                            @ApiResponse(code = 404),
+                            @ApiResponse(code = 405),
+                            @ApiResponse(code = 412),
+                            @ApiResponse(code = 422),
+                            @ApiResponse(code = 500)
+                    },
+                    extensions = { 
+                            @ApiExtension(name = "x-preview", value = "true") 
+                    }
+            ),
+            @ApiOperation(
+                    method = "DELETE",
+                    path = "/v1/schemas/{bucket}/{path}",
+                    operationId = "deleteSchema",
+                    tags = {"Schemas"},
+                    parameters = {
+                            @ApiParameter(name = "bucket", in = ParameterIn.PATH, required = true, description = OpenApiDescriptions.BUCKET),
+                            @ApiParameter(name = "path", in = ParameterIn.PATH, required = true, description = OpenApiDescriptions.SCHEMA_ID),
+                            @ApiParameter(name = "If-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_MATCH)
+                    },
+                    responses = {
+                            @ApiResponse(code = 204, description = "Success"),
+                            @ApiResponse(code = 400),
+                            @ApiResponse(code = 403),
+                            @ApiResponse(code = 404),
+                            @ApiResponse(code = 405),
+                            @ApiResponse(code = 412),
+                            @ApiResponse(code = 500)
+                    },
+                    extensions = { 
+                            @ApiExtension(name = "x-preview", value = "true") 
+                    }
+            ),
+            // Catalog Schemas
+            @ApiOperation(
+                    method = "GET",
+                    path = "/v1/catalog_schemas/{bucket}/{path}",
+                    operationId = "getCatalogSchemaResource",
+                    tags = {"Catalog"},
+                    parameters = {
+                            @ApiParameter(name = "bucket", in = ParameterIn.PATH, required = true, description = OpenApiDescriptions.BUCKET),
+                            @ApiParameter(name = "path", in = ParameterIn.PATH, required = true, description = OpenApiDescriptions.SCHEMA_ID),
+                            @ApiParameter(name = "If-None-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_NONE_MATCH)
+                    },
+                    responses = {
+                            @ApiResponse(code = 200, description = "Success", body = @ApiSchema(allOfSchemaRefs = {"CatalogSchema"}, allOf = {EntityMetadata.class}),
+                                    headers = {
+                                            @ApiHeader(name = "ETag", description = "Entity tag for the catalog schema", required = true)
+                                    }
+                            ),
+                            @ApiResponse(code = 304),
+                            @ApiResponse(code = 400),
+                            @ApiResponse(code = 403),
+                            @ApiResponse(code = 404),
+                            @ApiResponse(code = 405),
+                            @ApiResponse(code = 412),
+                            @ApiResponse(code = 500)
+                    },
+                    extensions = {
+                            @ApiExtension(name = "x-preview", value = "true")
+                    }
+            ),
+            @ApiOperation(
+                    method = "PUT",
+                    path = "/v1/catalog_schemas/{bucket}/{path}",
+                    operationId = "saveCatalogSchemaResource",
+                    tags = {"Catalog"},
+                    requestBody = @ApiSchema(schemaRef = "CatalogSchema"),
+                    parameters = {
+                            @ApiParameter(name = "bucket", in = ParameterIn.PATH, required = true, description = OpenApiDescriptions.BUCKET),
+                            @ApiParameter(name = "path", in = ParameterIn.PATH, required = true, description = OpenApiDescriptions.SCHEMA_ID),
+                            @ApiParameter(name = "If-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_MATCH),
+                            @ApiParameter(name = "If-None-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_NONE_MATCH)
+                    },
+                    responses = {
+                            @ApiResponse(code = 200, description = "Success", body = @ApiSchema(implementation = ConfigWriteResponse.class),
+                                    headers = {
+                                            @ApiHeader(name = "ETag", description = "Entity tag for the saved catalog schema", required = true)
+                                    }),
+                            @ApiResponse(code = 400),
+                            @ApiResponse(code = 403),
+                            @ApiResponse(code = 404),
+                            @ApiResponse(code = 405),
+                            @ApiResponse(code = 412),
+                            @ApiResponse(code = 422),
+                            @ApiResponse(code = 500)
+                    },
+                    extensions = {
+                            @ApiExtension(name = "x-preview", value = "true")
+                    }
+            ),
+            @ApiOperation(
+                    method = "DELETE",
+                    path = "/v1/catalog_schemas/{bucket}/{path}",
+                    operationId = "deleteCatalogSchemaResource",
+                    tags = {"Catalog"},
+                    parameters = {
+                            @ApiParameter(name = "bucket", in = ParameterIn.PATH, required = true, description = OpenApiDescriptions.BUCKET),
+                            @ApiParameter(name = "path", in = ParameterIn.PATH, required = true, description = OpenApiDescriptions.SCHEMA_ID),
+                            @ApiParameter(name = "If-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_MATCH)
+                    },
+                    responses = {
+                            @ApiResponse(code = 204, description = "Success"),
+                            @ApiResponse(code = 400),
+                            @ApiResponse(code = 403),
+                            @ApiResponse(code = 404),
+                            @ApiResponse(code = 405),
+                            @ApiResponse(code = 412),
+                            @ApiResponse(code = 500)
+                    },
+                    extensions = {
+                            @ApiExtension(name = "x-preview", value = "true")
+                    }
+            ),
+            // Global Settings
+            @ApiOperation(
+                    method = "GET",
+                    path = "/v1/settings/{bucket}/{path}",
+                    operationId = "getGlobalSettings",
+                    tags = {"Global Settings"},
+                    parameters = {
+                            @ApiParameter(name = "bucket", in = ParameterIn.PATH, required = true, description = OpenApiDescriptions.BUCKET),
+                            @ApiParameter(name = "path", in = ParameterIn.PATH, required = true, description = "Must be 'global'"),
+                            @ApiParameter(name = "If-None-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_NONE_MATCH)
+                    },
+                    responses = {
+                            @ApiResponse(code = 200, description = "Success", body = @ApiSchema(allOf = {GlobalSettings.class, EntityMetadata.class})),
+                            @ApiResponse(code = 304),
+                            @ApiResponse(code = 400),
+                            @ApiResponse(code = 403),
+                            @ApiResponse(code = 404),
+                            @ApiResponse(code = 405),
+                            @ApiResponse(code = 412),
+                            @ApiResponse(code = 500)
+                    },
+                    extensions = { 
+                            @ApiExtension(name = "x-preview", value = "true") 
+                    }
+            ),
+            @ApiOperation(
+                    method = "PUT",
+                    path = "/v1/settings/{bucket}/{path}",
+                    operationId = "saveGlobalSettings",
+                    requestBody = @ApiSchema(implementation = GlobalSettings.class),
+                    tags = {"Global Settings"},
+                    parameters = {
+                            @ApiParameter(name = "bucket", in = ParameterIn.PATH, required = true, description = OpenApiDescriptions.BUCKET),
+                            @ApiParameter(name = "path", in = ParameterIn.PATH, required = true, description = "Must be 'global'"),
+                            @ApiParameter(name = "If-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_MATCH),
+                            @ApiParameter(name = "If-None-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_NONE_MATCH)
+                    },
+                    responses = {
+                            @ApiResponse(code = 200, description = "Success", body = @ApiSchema(implementation = ConfigWriteResponse.class),
+                                    headers = {
+                                            @ApiHeader(name = "ETag", description = "Entity tag for the saved settings", required = true)
+                                    }),
+                            @ApiResponse(code = 400),
+                            @ApiResponse(code = 403),
+                            @ApiResponse(code = 404),
+                            @ApiResponse(code = 405),
+                            @ApiResponse(code = 412),
+                            @ApiResponse(code = 422),
+                            @ApiResponse(code = 500)
+                    },
+                    extensions = { 
+                            @ApiExtension(name = "x-preview", value = "true") 
+                    }
+            ),
+            @ApiOperation(
+                    method = "DELETE",
+                    path = "/v1/settings/{bucket}/{path}",
+                    operationId = "deleteGlobalSettings",
+                    tags = {"Global Settings"},
+                    parameters = {
+                            @ApiParameter(name = "bucket", in = ParameterIn.PATH, required = true, description = OpenApiDescriptions.BUCKET),
+                            @ApiParameter(name = "path", in = ParameterIn.PATH, required = true, description = "Must be 'global'"),
+                            @ApiParameter(name = "If-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_MATCH)
+                    },
+                    responses = {
+                            @ApiResponse(code = 204, description = "Success"),
+                            @ApiResponse(code = 400),
+                            @ApiResponse(code = 403),
+                            @ApiResponse(code = 404),
+                            @ApiResponse(code = 405),
+                            @ApiResponse(code = 412),
+                            @ApiResponse(code = 500)
+                    },
+                    extensions = {
+                            @ApiExtension(name = "x-preview", value = "true")
+                    }
+            ),
+            // Applications (platform bucket only — this is a distinct, admin-only, config-managed
+            // contract from ResourceController's generic /v1/applications/{bucket}/{application_path};
+            // the literal "platform" segment here (rather than a {bucket} template) is deliberate so
+            // this operation doesn't collide with — or silently duplicate — that one in the generated
+            // spec, since OpenAPI can't express two different contracts for one shared path template.
+            @ApiOperation(
+                    method = "GET",
+                    path = "/v1/applications/platform/{path}",
+                    operationId = "getPlatformApplication",
+                    tags = {"Applications"},
+                    parameters = {
+                            @ApiParameter(name = "path", in = ParameterIn.PATH, required = true, description = "Application name"),
+                            @ApiParameter(name = "If-None-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_MATCH)
+                    },
+                    responses = {
+                            @ApiResponse(code = 200, description = "Success", body = @ApiSchema(allOf = {Application.class, EntityMetadata.class}),
+                                    headers = {
+                                            @ApiHeader(name = "ETag", description = "Entity tag for the application", required = true)
+                                    }),
+                            @ApiResponse(code = 304),
+                            @ApiResponse(code = 400),
+                            @ApiResponse(code = 403),
+                            @ApiResponse(code = 404),
+                            @ApiResponse(code = 405),
+                            @ApiResponse(code = 412),
+                            @ApiResponse(code = 500)
+                    },
+                    extensions = {
+                            @ApiExtension(name = "x-preview", value = "true")
+                    }
+            ),
+            @ApiOperation(
+                    method = "PUT",
+                    path = "/v1/applications/platform/{path}",
+                    operationId = "savePlatformApplication",
+                    requestBody = @ApiSchema(implementation = Application.class),
+                    tags = {"Applications"},
+                    parameters = {
+                            @ApiParameter(name = "path", in = ParameterIn.PATH, required = true, description = "Application name"),
+                            @ApiParameter(name = "If-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_MATCH),
+                            @ApiParameter(name = "If-None-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_NONE_MATCH)
+                    },
+                    responses = {
+                            @ApiResponse(code = 200, description = "Success", body = @ApiSchema(implementation = ConfigWriteResponse.class),
+                                    headers = {
+                                            @ApiHeader(name = "ETag", description = "Entity tag for the saved application", required = true)
+                                    }),
+                            @ApiResponse(code = 400),
+                            @ApiResponse(code = 403),
+                            @ApiResponse(code = 404),
+                            @ApiResponse(code = 405),
+                            @ApiResponse(code = 412),
+                            @ApiResponse(code = 422),
+                            @ApiResponse(code = 500)
+                    },
+                    extensions = {
+                            @ApiExtension(name = "x-preview", value = "true")
+                    }
+            ),
+            @ApiOperation(
+                    method = "DELETE",
+                    path = "/v1/applications/platform/{path}",
+                    operationId = "deletePlatformApplication",
+                    tags = {"Applications"},
+                    parameters = {
+                            @ApiParameter(name = "path", in = ParameterIn.PATH, required = true, description = "Application name"),
+                            @ApiParameter(name = "If-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_MATCH)
+                    },
+                    responses = {
+                            @ApiResponse(code = 204, description = "Success"),
+                            @ApiResponse(code = 400),
+                            @ApiResponse(code = 403),
+                            @ApiResponse(code = 404),
+                            @ApiResponse(code = 405),
+                            @ApiResponse(code = 412),
+                            @ApiResponse(code = 500)
+                    },
+                    extensions = {
+                            @ApiExtension(name = "x-preview", value = "true")
+                    }
+            ),
+            // Toolsets (platform bucket only — same rationale as Applications above)
+            @ApiOperation(
+                    method = "GET",
+                    path = "/v1/toolsets/platform/{path}",
+                    operationId = "getPlatformToolSet",
+                    tags = {"Toolsets"},
+                    parameters = {
+                            @ApiParameter(name = "path", in = ParameterIn.PATH, required = true, description = "Toolset name"),
+                            @ApiParameter(name = "If-None-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_MATCH)
+                    },
+                    responses = {
+                            @ApiResponse(code = 200, description = "Success", body = @ApiSchema(allOf = {ToolSet.class, EntityMetadata.class}),
+                                    headers = {
+                                            @ApiHeader(name = "ETag", description = "Entity tag for the toolset", required = true)
+                                    }),
+                            @ApiResponse(code = 304),
+                            @ApiResponse(code = 400),
+                            @ApiResponse(code = 403),
+                            @ApiResponse(code = 404),
+                            @ApiResponse(code = 405),
+                            @ApiResponse(code = 412),
+                            @ApiResponse(code = 500)
+                    },
+                    extensions = {
+                            @ApiExtension(name = "x-preview", value = "true")
+                    }
+            ),
+            @ApiOperation(
+                    method = "PUT",
+                    path = "/v1/toolsets/platform/{path}",
+                    operationId = "savePlatformToolSet",
+                    requestBody = @ApiSchema(implementation = ToolSet.class),
+                    tags = {"Toolsets"},
+                    parameters = {
+                            @ApiParameter(name = "path", in = ParameterIn.PATH, required = true, description = "Toolset name"),
+                            @ApiParameter(name = "If-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_MATCH),
+                            @ApiParameter(name = "If-None-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_NONE_MATCH)
+                    },
+                    responses = {
+                            @ApiResponse(code = 200, description = "Success", body = @ApiSchema(implementation = ConfigWriteResponse.class),
+                                    headers = {
+                                            @ApiHeader(name = "ETag", description = "Entity tag for the saved toolset", required = true)
+                                    }),
+                            @ApiResponse(code = 400),
+                            @ApiResponse(code = 403),
+                            @ApiResponse(code = 404),
+                            @ApiResponse(code = 405),
+                            @ApiResponse(code = 412),
+                            @ApiResponse(code = 422),
+                            @ApiResponse(code = 500)
+                    },
+                    extensions = {
+                            @ApiExtension(name = "x-preview", value = "true")
+                    }
+            ),
+            @ApiOperation(
+                    method = "DELETE",
+                    path = "/v1/toolsets/platform/{path}",
+                    operationId = "deletePlatformToolSet",
+                    tags = {"Toolsets"},
+                    parameters = {
+                            @ApiParameter(name = "path", in = ParameterIn.PATH, required = true, description = "Toolset name"),
+                            @ApiParameter(name = "If-Match", in = ParameterIn.HEADER, description = OpenApiDescriptions.IF_MATCH)
+                    },
+                    responses = {
+                            @ApiResponse(code = 204, description = "Success"),
+                            @ApiResponse(code = 400),
+                            @ApiResponse(code = 403),
+                            @ApiResponse(code = 404),
+                            @ApiResponse(code = 405),
+                            @ApiResponse(code = 412),
+                            @ApiResponse(code = 500)
+                    },
+                    extensions = {
+                            @ApiExtension(name = "x-preview", value = "true")
+                    }
+            )
+    })
+    public Future<?> handle() throws Exception {
+        if (!EntityBucketBinding.isAllowed(entityType, bucket)) {
+            // Body-less 404 — must be indistinguishable from "entity not found" so an unauthenticated
+            // probe cannot tell from the response whether the (type, bucket) pair is invalid or
+            // merely empty. See 04-security-and-audit.md §1.2.
+            context.respond(HttpStatus.NOT_FOUND);
+            return Future.succeededFuture();
+        }
+
+        HttpMethod method = context.getRequest().method();
+        Operation operation = (method == HttpMethod.GET || method == HttpMethod.HEAD)
+                ? Operation.READ
+                : Operation.WRITE;
+        if (!authorizationService.isAuthorized(context, entityType, path, bucket, operation)) {
+            context.respond(HttpStatus.FORBIDDEN, "Forbidden");
+            return Future.succeededFuture();
+        }
+
+        if (method == HttpMethod.GET || method == HttpMethod.HEAD) {
+            return handleGet();
+        }
+        if ((method == HttpMethod.PUT || method == HttpMethod.DELETE)
+                && !ConfigPostProcessor.ENTITY_NAME_PATTERN.matcher(path == null ? "" : path).matches()) {
+            context.respond(HttpStatus.BAD_REQUEST,
+                    "Invalid entity name segment: must match " + ConfigPostProcessor.ENTITY_NAME_PATTERN.pattern());
+            return Future.succeededFuture();
+        }
+        // TOOL_SET names are further constrained than ENTITY_NAME_PATTERN: the merged-config rebuild
+        // validates them with ConfigPostProcessor.isValidToolSetKey (processToolSets) and silently
+        // drops non-conforming ones. Reject such names up front on both PUT and DELETE — same as the
+        // ENTITY_NAME_PATTERN gate above — so a PUT can't create a blob that serves until the next
+        // rebuild and then vanishes (200-on-PUT / 404-on-GET orphan). Applications aren't key-validated
+        // by the rebuild, so they stay on ENTITY_NAME_PATTERN only.
+        if (resourceType() == ResourceTypes.TOOL_SET
+                && (method == HttpMethod.PUT || method == HttpMethod.DELETE)
+                && !ConfigPostProcessor.isValidToolSetKey(path == null ? "" : path)) {
+            context.respond(HttpStatus.BAD_REQUEST,
+                    "Invalid toolset name segment: must match " + ConfigPostProcessor.resourceKeyPattern());
+            return Future.succeededFuture();
+        }
+        if (resourceType() == ResourceTypes.GLOBAL_SETTINGS) {
+            // Singleton has its own write surface: PUT-upsert + idempotent DELETE; POST is 405.
+            if (method == HttpMethod.PUT) {
+                return handleSettingsPut();
+            }
+            if (method == HttpMethod.DELETE) {
+                return handleSettingsDelete();
+            }
+            return respondMethodNotAllowed();
+        }
+        if (resourceType() == ResourceTypes.APPLICATION || resourceType() == ResourceTypes.TOOL_SET) {
+            // Applications/toolsets own real write-time business logic (atomic compute-based writes,
+            // function lifecycle bookkeeping, admin-managed-field inheritance, external-service/
+            // authSettings secret handling, credential purge on delete) that ApplicationService/
+            // ToolSetService already implement — delegate rather than duplicate the raw-blob path.
+            if (method == HttpMethod.PUT) {
+                return handleAppOrToolSetPut();
+            }
+            if (method == HttpMethod.DELETE) {
+                return handleAppOrToolSetDelete();
+            }
+            return respondMethodNotAllowed();
+        }
+        if (method == HttpMethod.PUT) {
+            return handlePut();
+        }
+        if (method == HttpMethod.DELETE) {
+            return handleDelete();
+        }
+
+        return respondMethodNotAllowed();
+    }
+
+    private Future<?> handleGet() {
+        Config config = context.getConfig();
+        boolean admin = authorizationService.isAdmin(context);
+        // Per-entity GET is blob-only (slice U.1): only canonical-ID lookups resolve here.
+        // File-sourced entries are inspected via /v1/admin/config/file/{type}[/{name}].
+        // Slice U.4: secret fields drop on response via @JsonProperty(WRITE_ONLY) — there is no
+        // ?reveal_secrets=true reveal flow and no security-admin tier.
+        return switch (resourceType()) {
+            case MODEL -> handleSingleGetFromBlob(ResourceTypes.MODEL,
+                    (key, model) -> projectItem(model, key));
+            case INTERCEPTOR -> handleSingleGetFromBlob(ResourceTypes.INTERCEPTOR,
+                    (key, interceptor) -> projectItem(interceptor, key));
+            case TRANSLATOR -> handleSingleGetFromBlob(ResourceTypes.TRANSLATOR,
+                    (key, translator) -> projectItem(translator, key));
+            case ROLE -> handleSingleGetFromBlob(ResourceTypes.ROLE,
+                    (key, role) -> projectItem(role, key));
+            case PROJECT_KEY -> handleSingleGet(
+                    config.getKeys(), ResourceTypes.PROJECT_KEY,
+                    (key, value) -> projectItem(value, key));
+            case ROUTE -> handleSingleGet(
+                    config.getRoutes(), ResourceTypes.ROUTE,
+                    (key, route) -> projectItem(route, key));
+            case APP_TYPE_SCHEMA -> handleSingleGetFromBlob(ResourceTypes.APP_TYPE_SCHEMA,
+                    (schemaId, node) -> projectSchemaItem(schemaId, (JsonNode) node));
+            case CATALOG_SCHEMA -> handleSingleGetFromBlob(ResourceTypes.CATALOG_SCHEMA,
+                    (schemaId, node) -> projectSchemaItem(schemaId, (JsonNode) node));
+            // Blob-sourced, so secrets arrive encrypted (deserializeBlob does not decrypt). The hint has to be
+            // derived from plaintext or it describes ciphertext, so decrypt first — only for a caller that will
+            // actually be shown the hint.
+            case APPLICATION -> handleSingleGetFromBlob(ResourceTypes.APPLICATION,
+                    (key, application) -> {
+                        Application entity = (Application) application;
+                        new ResourceAuthStatusEnricher(context, resourceAuthSettingsService)
+                                .enrichApplication(path, entity.getExternalServices());
+                        if (admin) {
+                            applicationService.decryptExternalServiceSecretsForResponse(
+                                    descriptorFor(ResourceTypes.APPLICATION), entity);
+                        }
+                        return redactExternalServiceSecrets(projectItem(entity, key), admin);
+                    });
+            case TOOL_SET -> handleSingleGetFromBlob(ResourceTypes.TOOL_SET,
+                    (key, toolSet) -> {
+                        ToolSet entity = (ToolSet) toolSet;
+                        new ResourceAuthStatusEnricher(context, resourceAuthSettingsService).enrichToolSet(path, entity);
+                        if (admin) {
+                            toolSetService.decryptAuthSettingsForResponse(
+                                    descriptorFor(ResourceTypes.TOOL_SET), entity);
+                        }
+                        return redactAuthSettingsSecrets(projectItem(entity, key), admin);
+                    });
+            case GLOBAL_SETTINGS -> handleSettingsGet(config);
+            default -> respondMethodNotAllowed();
+        };
+    }
+
+    /**
+     * Per-entity GET for {@code PROJECT_KEY}/{@code ROUTE} only — these two types still key
+     * {@code Config}'s in-memory map by canonical id (never migrated to short-name keying), so
+     * file-sourced entries never share a key with a blob-sourced one and this lookup can safely
+     * stay in-memory.
+     */
+    private <T> Future<?> handleSingleGet(Map<String, T> source,
+                                          ResourceTypes resourceType,
+                                          BiFunction<String, T, ObjectNode> projector) {
+        Map<String, InvalidEntityRecord> invalid = mergedConfigStore.getInvalidEntities()
+                .getOrDefault(resourceType, Map.of());
+        boolean admin = authorizationService.isAdmin(context);
+
+        if (path == null || path.isEmpty()) {
+            // Per-entity URL with empty name is not a listing surface — listings live on
+            // /v1/metadata/{type}/{bucket}/.
+            context.respond(HttpStatus.NOT_FOUND);
+            return Future.succeededFuture();
+        }
+        // Per-entity GET is blob-only (U.1): MergedConfigStore keys API entries by canonical ID
+        // ("models/platform/gpt-4"); file-sourced entries are not addressable here. Operators
+        // inspect file entries via /v1/admin/config/file/{type}[/{name}] — see FileConfigController.
+        T item = source.get(canonicalId());
+        if (item != null) {
+            // RFC 7232 If-None-Match: emit 304 only when the entity has a blob-backed ETag and the
+            // client-supplied tag matches.
+            final T matchedItem = item;
+            final String matched = canonicalId();
+            return respondNotModifiedIfMatched(matched)
+                    .onSuccess(notModified -> {
+                        if (!notModified) {
+                            context.respond(HttpStatus.OK, projector.apply(matched, matchedItem));
+                        }
+                    })
+                    .onFailure(this::handleWriteError);
+        }
+        InvalidEntityRecord invalidRecord = invalid.get(canonicalId());
+        if (invalidRecord != null) {
+            context.respond(HttpStatus.OK, projectInvalidItem(invalidRecord, admin));
+            return Future.succeededFuture();
+        }
+        context.respond(HttpStatus.NOT_FOUND);
+        return Future.succeededFuture();
+    }
+
+    /**
+     * Per-entity GET for locally-keyed types ({@code MODEL}, {@code INTERCEPTOR}, {@code ROLE},
+     * {@code APPLICATION}, {@code TOOL_SET}, {@code APP_TYPE_SCHEMA}, {@code CATALOG_SCHEMA}) —
+     * these types key {@code Config}'s in-memory map by a local identifier (short name or
+     * {@code $id}), the same key a file-sourced entry for the same logical entity already uses, so
+     * the map can no longer tell a genuinely blob-managed entity apart from a file-only one sharing
+     * that key. This reads blob storage directly by descriptor instead — the same pattern PUT/DELETE
+     * already use for these types — so this endpoint only ever serves entities that actually exist
+     * in the {@code platform} bucket. {@code Config}'s map stays purely a runtime-resolution
+     * structure.
+     */
+    private Future<?> handleSingleGetFromBlob(ResourceTypes resourceType, BiFunction<String, Object, ObjectNode> projector) {
+        if (path == null || path.isEmpty()) {
+            context.respond(HttpStatus.NOT_FOUND);
+            return Future.succeededFuture();
+        }
+        ResourceDescriptor descriptor = descriptorFor(resourceType);
+        boolean admin = authorizationService.isAdmin(context);
+        EtagHeader etag = ProxyUtil.etag(context.getRequest());
+
+        taskExecutor.submit(() -> {
+            // getResourceWithMetadata validates the conditional header itself (throws the
+            // appropriate HttpException for If-None-Match/If-Match), so a 304/412 short-circuits
+            // here before any decrypt work runs.
+            Pair<ResourceItemMetadata, String> existing = resourceService.getResourceWithMetadata(descriptor, etag);
+            if (existing == null) {
+                return null;
+            }
+            Object entity;
+            try {
+                entity = deserializeBlob(resourceType, existing.getValue());
+            } catch (HttpException e) {
+                // Malformed blob — fall through to the invalid-entity store so the caller sees
+                // status=invalid rather than a 500.
+                return null;
+            }
+            return Pair.of(existing.getKey().getEtag(), projector.apply(path, entity));
+        }).onSuccess(result -> {
+            Map<String, InvalidEntityRecord> invalid = mergedConfigStore.getInvalidEntities()
+                    .getOrDefault(resourceType, Map.of());
+            InvalidEntityRecord invalidRecord = invalid.get(canonicalId());
+            if (result == null) {
+                if (invalidRecord != null) {
+                    context.respond(HttpStatus.OK, projectInvalidItem(invalidRecord, admin));
+                } else {
+                    context.respond(HttpStatus.NOT_FOUND);
+                }
+                return;
+            }
+            if (invalidRecord != null) {
+                context.putHeader(HttpHeaders.ETAG, result.getKey())
+                        .respond(HttpStatus.OK, projectInvalidItem(invalidRecord, admin));
+                return;
+            }
+            context.putHeader(HttpHeaders.ETAG, result.getKey())
+                    .respond(HttpStatus.OK, result.getValue());
+        }).onFailure(this::handleWriteError);
+
+        return Future.succeededFuture();
+    }
+
+    /**
+     * Deserializes a blob body for {@link #handleSingleGetFromBlob}. No decryption is performed:
+     * secret fields on entity types are {@code @JsonProperty(WRITE_ONLY)} and are therefore
+     * suppressed by Jackson on serialization regardless of their content; APPLICATION and TOOL_SET
+     * secrets are additionally redacted by the projector ({@link #redactExternalServiceSecrets}/
+     * {@link #redactAuthSettingsSecrets}).
+     */
+    private Object deserializeBlob(ResourceTypes type, String body) {
+        return switch (type) {
+            case APP_TYPE_SCHEMA, CATALOG_SCHEMA -> {
+                try {
+                    yield BLOB_MAPPER.readTree(body);
+                } catch (JsonProcessingException e) {
+                    throw new HttpException(HttpStatus.INTERNAL_SERVER_ERROR,
+                            "Stored schema is malformed at " + locationOf(e));
+                }
+            }
+            default -> {
+                try {
+                    yield ConfigEntityCodec.treeToEntity(BLOB_MAPPER.readTree(body), entityClassFor(entityType));
+                } catch (JsonProcessingException e) {
+                    throw new HttpException(HttpStatus.INTERNAL_SERVER_ERROR,
+                            "Stored entity is malformed at " + locationOf(e));
+                }
+            }
+        };
+    }
+
+    /**
+     * Emits a {@code 304 Not Modified} if the matched entity's stored blob has an ETag
+     * that matches the client's {@code If-None-Match} header. The blob-metadata fetch
+     * runs on the blocking executor to keep the Vert.x event loop unblocked; the response is
+     * written back on the event loop via the future-chain completion.
+     */
+    private Future<Boolean> respondNotModifiedIfMatched(String matchedKey) {
+        ResourceDescriptor descriptor = singleEntityDescriptor();
+        if (descriptor == null) {
+            return Future.succeededFuture(false);
+        }
+        EtagHeader etag = ProxyUtil.etag(context.getRequest());
+        return taskExecutor.<HttpException>submit(() -> {
+            ResourceItemMetadata meta = resourceService.getResourceMetadata(descriptor);
+            if (meta == null || meta.getEtag() == null) {
+                return null;
+            }
+            try {
+                etag.validate(meta.getEtag());
+            } catch (HttpException e) {
+                if (e.getStatus() == HttpStatus.NOT_MODIFIED) {
+                    return e;
+                }
+                // Other status codes (e.g. If-Match failure) are not surfaced here — GET ignores
+                // If-Match per RFC 7232; only If-None-Match drives 304/200 on GET.
+            }
+            return null;
+        }).map(notModified -> {
+            if (notModified != null) {
+                context.respond(notModified);
+                return true;
+            }
+            return false;
+        });
+    }
+
+    /**
+     * Returns a single-entity {@link ResourceDescriptor} for the current request, or {@code null}
+     * when the entity type cannot be mapped or the {@code path} is empty/folder-like. Used by
+     * the GET 304 path to fetch blob metadata.
+     */
+    private ResourceDescriptor singleEntityDescriptor() {
+        if (path == null || path.isEmpty() || path.endsWith("/")) {
+            return null;
+        }
+        return descriptorFor(resourceType());
+    }
+
+    /**
+     * Builds a {@link ResourceDescriptor} for the given type using the controller's {@code path},
+     * mapping each type to its fixed (bucket, location) pair. Returns {@code null} for types not
+     * served by the per-entity surface (e.g. {@code GLOBAL_SETTINGS} uses its own handlers).
+     */
+    private ResourceDescriptor descriptorFor(ResourceTypes type) {
+        return switch (type) {
+            case MODEL -> ResourceDescriptorFactory.fromDecoded(ResourceTypes.MODEL,
+                    ResourceDescriptor.PLATFORM_BUCKET, ResourceDescriptor.PLATFORM_LOCATION, path);
+            case INTERCEPTOR -> ResourceDescriptorFactory.fromDecoded(ResourceTypes.INTERCEPTOR,
+                    ResourceDescriptor.PLATFORM_BUCKET, ResourceDescriptor.PLATFORM_LOCATION, path);
+            case TRANSLATOR -> ResourceDescriptorFactory.fromDecoded(ResourceTypes.TRANSLATOR,
+                    ResourceDescriptor.PLATFORM_BUCKET, ResourceDescriptor.PLATFORM_LOCATION, path);
+            case ROLE -> ResourceDescriptorFactory.fromDecoded(ResourceTypes.ROLE,
+                    ResourceDescriptor.PLATFORM_BUCKET, ResourceDescriptor.PLATFORM_LOCATION, path);
+            case PROJECT_KEY -> ResourceDescriptorFactory.fromDecoded(ResourceTypes.PROJECT_KEY,
+                    ResourceDescriptor.PLATFORM_BUCKET, ResourceDescriptor.PLATFORM_LOCATION, path);
+            case ROUTE -> ResourceDescriptorFactory.fromDecoded(ResourceTypes.ROUTE,
+                    ResourceDescriptor.PLATFORM_BUCKET, ResourceDescriptor.PLATFORM_LOCATION, path);
+            case APP_TYPE_SCHEMA -> ResourceDescriptorFactory.fromDecoded(ResourceTypes.APP_TYPE_SCHEMA,
+                    ResourceDescriptor.PLATFORM_BUCKET, ResourceDescriptor.PLATFORM_LOCATION, path);
+            case CATALOG_SCHEMA -> ResourceDescriptorFactory.fromDecoded(ResourceTypes.CATALOG_SCHEMA,
+                    ResourceDescriptor.PLATFORM_BUCKET, ResourceDescriptor.PLATFORM_LOCATION, path);
+            case APPLICATION -> ResourceDescriptorFactory.fromDecoded(ResourceTypes.APPLICATION,
+                    ResourceDescriptor.PLATFORM_BUCKET, ResourceDescriptor.PLATFORM_LOCATION, path);
+            case TOOL_SET -> ResourceDescriptorFactory.fromDecoded(ResourceTypes.TOOL_SET,
+                    ResourceDescriptor.PLATFORM_BUCKET, ResourceDescriptor.PLATFORM_LOCATION, path);
+            default -> null;
+        };
+    }
+
+    private String canonicalId() {
+        return entityType + "/" + bucket + "/" + path;
+    }
+
+    private Future<?> handleSettingsGet(Config config) {
+        if (path == null || path.isEmpty()) {
+            // Per-entity URL with empty name is not a listing surface (see handleSingleGet).
+            context.respond(HttpStatus.NOT_FOUND);
+            return Future.succeededFuture();
+        }
+        if (!SETTINGS_SINGLETON_NAME.equals(path)) {
+            context.respond(HttpStatus.NOT_FOUND);
+            return Future.succeededFuture();
+        }
+        // Blob-only (U.1): the per-entity endpoint reflects the API blob; when no blob is present
+        // it returns 404. File-defined or schema-default values are projected via
+        // /v1/admin/config/file/settings/global.
+        if (!mergedConfigStore.isSettingsFromApi()) {
+            context.respond(HttpStatus.NOT_FOUND);
+            return Future.succeededFuture();
+        }
+        ObjectNode body = ProxyUtil.MAPPER.createObjectNode();
+        body.set("globalInterceptors", ProxyUtil.MAPPER.valueToTree(config.getGlobalInterceptors()));
+        body.set("retriableErrorCodes", ProxyUtil.MAPPER.valueToTree(config.getRetriableErrorCodes()));
+        body.set("rateLimitSchedule", ProxyUtil.MAPPER.valueToTree(config.getRateLimitSchedule()));
+        body.put("name", SETTINGS_SINGLETON_NAME);
+        body.put("status", "valid");
+        context.respond(HttpStatus.OK, body);
+        return Future.succeededFuture();
+    }
+
+    private Future<?> handleSettingsPut() {
+        if (!SETTINGS_SINGLETON_NAME.equals(path)) {
+            context.respond(HttpStatus.NOT_FOUND);
+            return Future.succeededFuture();
+        }
+        ResourceDescriptor descriptor = ResourceDescriptorFactory.fromDecoded(
+                ResourceTypes.GLOBAL_SETTINGS, ResourceDescriptor.PLATFORM_BUCKET,
+                ResourceDescriptor.PLATFORM_LOCATION, SETTINGS_SINGLETON_NAME);
+        EtagHeader etag = ProxyUtil.etag(context.getRequest());
+
+        context.getRequest().body().compose(body -> {
+            JsonNode requestNode = parseJsonBody(body);
+            if (!requestNode.isObject()) {
+                throw new HttpException(HttpStatus.BAD_REQUEST, "Request body must be a JSON object");
+            }
+            // Deserialize through the typed GlobalSettings POJO so unknown fields are dropped and types
+            // are validated; re-serialize so the blob is canonical (locked field set, no extras).
+            GlobalSettings settings = ConfigEntityCodec.treeToEntity(requestNode, GlobalSettings.class);
+            // BLOB_MAPPER (unlike the file-config load path) does not run bean validation, so
+            // GlobalSettings' constraints (rateLimitSchedule's @ValidTimezone/@Pattern, no-null
+            // elements in globalInterceptors/retriableErrorCodes) need an explicit check here.
+            ValidationUtil.validate(settings);
+            String blobBody = ConfigEntityCodec.serializeForBlob(settings);
+            String author = context.getUserDisplayName();
+            return taskExecutor.submit(() -> lockService.underBucketLocks(MergedConfigStore.ADMIN_BUCKET_LOCATIONS, () -> {
+                // RFC 7232 conditional headers must be honored on the singleton too: read prior
+                // metadata, validate If-None-Match/If-Match, then persist with ANY so the blob
+                // layer doesn't re-validate against a stale snapshot.
+                ResourceItemMetadata existing = resourceService.getResourceMetadata(descriptor);
+                etag.validate(existing == null ? null : existing.getEtag());
+                ResourceItemMetadata meta = resourceService.putResource(
+                        descriptor, blobBody, EtagHeader.ANY, author, false);
+                mergedConfigStore.applySettingsWrite(settings);
+                return meta;
+            }));
+        }).onSuccess(meta -> context.putHeader(HttpHeaders.ETAG, meta.getEtag())
+                .respond(HttpStatus.OK, createNameEnvelope(SETTINGS_SINGLETON_NAME)))
+                .onFailure(this::handleWriteError);
+
+        return Future.succeededFuture();
+    }
+
+    private Future<?> handleSettingsDelete() {
+        if (!SETTINGS_SINGLETON_NAME.equals(path)) {
+            context.respond(HttpStatus.NOT_FOUND);
+            return Future.succeededFuture();
+        }
+        ResourceDescriptor descriptor = ResourceDescriptorFactory.fromDecoded(
+                ResourceTypes.GLOBAL_SETTINGS, ResourceDescriptor.PLATFORM_BUCKET,
+                ResourceDescriptor.PLATFORM_LOCATION, SETTINGS_SINGLETON_NAME);
+        EtagHeader etag = ProxyUtil.etag(context.getRequest());
+
+        taskExecutor.submit(() -> lockService.underBucketLocks(MergedConfigStore.ADMIN_BUCKET_LOCATIONS, () -> {
+            // Idempotent on bare DELETE — deleteResource returns false when the blob is absent and
+            // both outcomes collapse to 204 since the post-state (no API blob) is identical.
+            // If-Match passes through to deleteResource which throws 412 on mismatch.
+            resourceService.deleteResource(descriptor, etag, false);
+            mergedConfigStore.applySettingsDelete();
+            return true;
+        })).onSuccess(v -> context.respond(HttpStatus.NO_CONTENT)).onFailure(this::handleWriteError);
+
+        return Future.succeededFuture();
+    }
+
+    /**
+     * PUT-upsert for {@code APPLICATION}/{@code TOOL_SET} in the {@code platform} bucket. Delegates
+     * to {@link ApplicationService#putApplication} / {@link ToolSetService#putToolSet} — they own
+     * the atomic compute-based write, function lifecycle bookkeeping, admin-managed-field
+     * inheritance, and secret encryption (unchanged; both services already derive the encryption
+     * {@code BucketInfo} from the resource descriptor's own bucket, so {@code platform} needs no
+     * special-casing there). After the write, the entity is re-fetched with secrets decrypted so
+     * {@link MergedConfigStore#applyEntityWrite} receives a fully-decrypted entity, matching what
+     * the rebuild-time materialization loop produces.
+     */
+    private Future<?> handleAppOrToolSetPut() {
+        if (path == null || path.isEmpty() || path.endsWith("/")) {
+            context.respond(HttpStatus.BAD_REQUEST, "Resource name must not be empty or a folder");
+            return Future.succeededFuture();
+        }
+        ResourceTypes type = resourceType();
+        ResourceDescriptor descriptor = descriptorFor(type);
+        EtagHeader etag = ProxyUtil.etag(context.getRequest());
+        String author = context.getUserDisplayName();
+
+        context.getRequest().body().compose(body -> {
+            JsonNode requestNode = parseJsonBody(body);
+            if (!requestNode.isObject()) {
+                throw new HttpException(HttpStatus.BAD_REQUEST, "Request body must be a JSON object");
+            }
+            return taskExecutor.submit(() -> lockService.underBucketLocks(MergedConfigStore.ADMIN_BUCKET_LOCATIONS, () -> {
+                rejectDuplicateDeploymentId(type, path);
+                // The platform bucket requires explicit admin access for every operation (see
+                // AdminRoleAuthorizationService), not just an admin-AND-public-bucket combination like
+                // ResourceController's adminPublicWrite — so, same as AdminApplyController's bulk apply,
+                // this path is always admin context and may preserve forwardAuthToken.
+                Object decrypted = switch (type) {
+                    case APPLICATION -> {
+                        Application application = ConfigEntityCodec.treeToEntity(requestNode, Application.class);
+                        applicationService.putApplication(descriptor, etag, author, application, true, AdminManagedFieldsWriteMode.AUTHORITATIVE);
+                        yield applicationService.getApplicationWithDecryptedSecrets(descriptor).getValue();
+                    }
+                    case TOOL_SET  -> {
+                        ToolSet toolSet = ConfigEntityCodec.treeToEntity(requestNode, ToolSet.class);
+                        toolSetService.putToolSet(descriptor, etag, author, toolSet, true);
+                        yield toolSetService.getToolSetWithDecryptedAuthSettings(descriptor).getValue();
+                    }
+                    default -> throw new IllegalArgumentException("Unexpected resource type: " + type);
+                };
+                mergedConfigStore.applyEntityWrite(type, MergedConfigStore.resolveMapKeyFor(descriptor), decrypted);
+                return resourceService.getResourceMetadata(descriptor);
+            }));
+        }).onSuccess(meta -> context.putHeader(HttpHeaders.ETAG, meta.getEtag())
+                .respond(HttpStatus.OK, createNameEnvelope(path)))
+                .onFailure(this::handleWriteError);
+
+        return Future.succeededFuture();
+    }
+
+    /**
+     * DELETE for {@code APPLICATION}/{@code TOOL_SET} in the {@code platform} bucket. Delegates to
+     * {@link ApplicationService#deleteApplication} / {@link ToolSetService#deleteToolset} for the
+     * same reason as the PUT path — credential purge and (for applications) the active-function
+     * delete guard live there, not in this controller's generic raw-blob delete.
+     */
+    private Future<?> handleAppOrToolSetDelete() {
+        ResourceTypes type = resourceType();
+        ResourceDescriptor descriptor = descriptorFor(type);
+        EtagHeader etag = ProxyUtil.etag(context.getRequest());
+
+        taskExecutor.submit(() -> lockService.underBucketLocks(MergedConfigStore.ADMIN_BUCKET_LOCATIONS, () -> {
+            switch (type) {
+                case APPLICATION -> applicationService.deleteApplication(descriptor, etag);
+                case TOOL_SET -> {
+                    boolean deleted = toolSetService.deleteToolset(context, descriptor, etag);
+                    if (!deleted) {
+                        throw new HttpException(HttpStatus.NOT_FOUND, "Resource not found: " + descriptor.getUrl());
+                    }
+                }
+                default -> throw new IllegalArgumentException("Unexpected resource type: " + type);
+            }
+            mergedConfigStore.applyEntityDelete(type, MergedConfigStore.resolveMapKeyFor(descriptor));
+            return true;
+        })).onSuccess(v -> context.respond(HttpStatus.NO_CONTENT)).onFailure(this::handleWriteError);
+
+        return Future.succeededFuture();
+    }
+
+    /**
+     * PUT-upsert: creates the entity when no prior blob exists, updates it otherwise.
+     * Honors RFC 7232 {@code If-None-Match: *} (412 if the entity already exists) and
+     * {@code If-Match: <etag>} (412 on mismatch) via {@link EtagHeader#validate(String)}. Both
+     * arms call {@link MergedConfigStore#applyEntityWrite} uniformly (partial-update fast path).
+     */
+    private Future<?> handlePut() {
+        WriteSpec spec = prepareWrite();
+        if (spec == null) {
+            return Future.succeededFuture();
+        }
+        ResourceDescriptor descriptor = spec.descriptor();
+        EtagHeader etag = ProxyUtil.etag(context.getRequest());
+        String author = context.getUserDisplayName();
+
+        context.getRequest().body().compose(body -> {
+            JsonNode requestNode = parseJsonBody(body);
+            return taskExecutor.submit(() -> lockService.underBucketLocks(MergedConfigStore.ADMIN_BUCKET_LOCATIONS, () -> {
+                // The admin-write lock alone serializes all writes to admin-only types
+                // cluster-wide (these types are never written by non-admin paths), so the
+                // per-resource lock is redundant here. See 02-architecture.md §4.4.
+                // Read existing blob first — both to validate conditional headers and to drive
+                // preserve-on-omit when secrets are involved. One combined fetch (metadata +
+                // body) saves a Redis/blob round-trip. Returns null when no blob exists
+                // (file-sourced entries don't show up here; the union with file entries is
+                // reapplied via applyEntityWrite below).
+                Pair<ResourceItemMetadata, String> existingPair =
+                        resourceService.getResourceWithMetadata(descriptor, EtagHeader.ANY);
+                ResourceItemMetadata existing = existingPair == null ? null : existingPair.getLeft();
+                String existingBody = existingPair == null ? null : existingPair.getRight();
+                // Honor If-Match / If-None-Match: * before the write — yields RFC-compliant 412
+                // PRECONDITION_FAILED. Bare PUT (no conditional header) passes through and the
+                // write proceeds as an upsert.
+                etag.validate(existing == null ? null : existing.getEtag());
+
+                String blobBody;
+                Key keyEntity = null;
+                String oldSecret = null;
+                Object entity = null;
+                Map<String, String> putEventMetadata = null;
+                if (spec.entityClass() == null) {
+                    ResourceTypes schemaType = resourceType();
+                    if (schemaType == ResourceTypes.APP_TYPE_SCHEMA || schemaType == ResourceTypes.CATALOG_SCHEMA) {
+                        putEventMetadata = buildSchemaEventMetadata(schemaType, requestNode, existingBody);
+                    }
+                    blobBody = requestNode.toString();
+                } else {
+                    if (!requestNode.isObject()) {
+                        throw new HttpException(HttpStatus.BAD_REQUEST,
+                                "Request body must be a JSON object");
+                    }
+                    JsonNode source;
+                    if (spec.hasEncryptedFields() && existingBody != null) {
+                        // Update arm with secret fields — preserve omitted/sentinel-masked
+                        // ciphertext from the prior blob (see SecretFieldProcessor).
+                        JsonNode existingBlobNode;
+                        try {
+                            existingBlobNode = BLOB_MAPPER.readTree(existingBody);
+                        } catch (JsonProcessingException e) {
+                            // Don't echo getOriginalMessage() — the stored blob can carry
+                            // ciphertext or other content we don't want to surface verbatim.
+                            throw new HttpException(HttpStatus.INTERNAL_SERVER_ERROR,
+                                    "Stored entity is malformed at " + locationOf(e));
+                        }
+                        if (spec.isKey()) {
+                            // Recover the prior plaintext secret so a rotation can revoke the old
+                            // auth bearer (FINDING #2). Deliberately non-fatal: a corrupt prior blob
+                            // must NOT abort the rotation — the new secret is authoritative and any
+                            // stale entry is cleaned at the next full rebuild.
+                            try {
+                                Key prior = BLOB_MAPPER.treeToValue(existingBlobNode, Key.class);
+                                secretFieldProcessor.decryptFields(prior, descriptor);
+                                oldSecret = prior.getKey();
+                            } catch (Exception e) {
+                                log.warn("Could not recover prior key secret for rotation at {}; "
+                                        + "proceeding with new secret as authoritative", descriptor.getUrl());
+                            }
+                        }
+                        source = secretFieldProcessor.mergePreservingOmittedSecrets(
+                                existingBlobNode, requestNode, spec.entityClass());
+                    } else {
+                        // Create arm (no prior blob) or no encrypted fields — use the request
+                        // body verbatim. SecretFieldProcessor encryptFields below will handle
+                        // any plaintext secrets.
+                        source = requestNode;
+                    }
+                    entity = ConfigEntityCodec.treeToEntity(source, spec.entityClass());
+                    if (entity instanceof Model m) {
+                        checkModel(m);
+                    } else if (entity instanceof Interceptor interceptor) {
+                        checkOverridePaths(interceptor);
+                    } else if (entity instanceof Translator t) {
+                        checkTranslator(t);
+                    }
+                    ResourceTypes writeType = resourceType();
+                    if (writeType == ResourceTypes.MODEL || writeType == ResourceTypes.INTERCEPTOR) {
+                        rejectDuplicateDeploymentId(writeType, path);
+                    }
+                    if (spec.isKey()) {
+                        keyEntity = (Key) entity;
+                        validateKeyForApiWrite(keyEntity);
+                        rejectDuplicateKeySecret(keyEntity, oldSecret, requestNode, descriptor);
+                    }
+                    if (spec.hasEncryptedFields()) {
+                        secretFieldProcessor.encryptFields(entity, descriptor);
+                    }
+                    blobBody = ConfigEntityCodec.serializeForBlob(entity);
+                }
+                // Conditional headers were already validated above; persist with ANY so the
+                // blob layer doesn't re-validate against a stale snapshot.
+                ResourceItemMetadata meta = resourceService.putResource(
+                        descriptor, blobBody, EtagHeader.ANY, author, false, putEventMetadata);
+                // Decrypt-in-place after blob put. PUT-upsert can produce a mixed
+                // plaintext/ciphertext entity (preserve-on-omit on the update arm); decryptValue
+                // is idempotent on plaintext and restores ciphertext fields to plaintext,
+                // yielding a fully-decrypted entity for applyEntityWrite to put into the merged
+                // Config (read-after-write parity).
+                if (entity != null && spec.hasEncryptedFields()) {
+                    secretFieldProcessor.decryptFields(entity, descriptor);
+                }
+                if (keyEntity != null) {
+                    // Capture after the decrypt above: on preserve-on-omit the merged Key.key
+                    // holds the prior ciphertext until then, and ApiKeyStore is indexed by
+                    // plaintext (see ApiKeyStore.addOrUpdateKey).
+                    String keySecret = keyEntity.getKey();
+                    apiKeyStore.addOrUpdateKey(keySecret, apiKeyData(keyEntity));
+                    if (oldSecret != null && !oldSecret.isBlank() && !oldSecret.equals(keySecret)) {
+                        apiKeyStore.removeKey(oldSecret);
+                    }
+                }
+                ResourceTypes writeType = typeOf(descriptor);
+                String mapKey = putEventMetadata != null
+                        ? putEventMetadata.get("$id")
+                        : MergedConfigStore.resolveMapKeyFor(descriptor);
+                mergedConfigStore.applyEntityWrite(writeType, mapKey,
+                        entity != null ? entity : requestNode);
+                return meta;
+            }));
+        }).onSuccess(meta -> context.putHeader(HttpHeaders.ETAG, meta.getEtag())
+                .respond(HttpStatus.OK, createNameEnvelope(path)))
+                .onFailure(this::handleWriteError);
+
+        return Future.succeededFuture();
+    }
+
+    private Map<String, String> buildSchemaEventMetadata(ResourceTypes schemaType, JsonNode requestNode,
+                                                         String existingBody) {
+        String newSchemaId = MergedConfigStore.extractSchemaId(requestNode);
+        if (newSchemaId == null || newSchemaId.isBlank()) {
+            throw new HttpException(HttpStatus.BAD_REQUEST,
+                    "Schema body must contain a non-blank $id field");
+        }
+        // isUpdate is existingBody != null, not oldSchemaId != null: an existing-but-unparseable
+        // blob must still fail closed on the immutability check below, not fall through to the
+        // create-time uniqueness check.
+        String oldSchemaId = null;
+        if (existingBody != null) {
+            try {
+                oldSchemaId = MergedConfigStore.extractSchemaId(
+                        BLOB_MAPPER.readTree(existingBody));
+            } catch (Exception e) {
+                // Leave oldSchemaId null — the immutability check below fails closed on the mismatch.
+            }
+        }
+        Map<String, String> schemaMap = MergedConfigStore.getSchemaMapOf(mergedConfigStore.get(), schemaType);
+        String error = MergedConfigStore.validateSchemaId(schemaMap, existingBody != null, newSchemaId, oldSchemaId);
+        if (error != null) {
+            throw new HttpException(HttpStatus.CONFLICT, error);
+        }
+        return Map.of("$id", newSchemaId);
+    }
+
+    private Future<?> handleDelete() {
+        WriteSpec spec = prepareWrite();
+        if (spec == null) {
+            return Future.succeededFuture();
+        }
+        ResourceDescriptor descriptor = spec.descriptor();
+        EtagHeader etag = ProxyUtil.etag(context.getRequest());
+
+        taskExecutor.submit(() -> lockService.underBucketLocks(MergedConfigStore.ADMIN_BUCKET_LOCATIONS, () -> {
+            // Pre-read + delete must run under the same lock so the secret extracted for
+            // apiKeyStore.removeKey matches the secret in the blob being deleted (no race
+            // with a concurrent PUT swapping the key). The admin-write lock alone provides
+            // this — admin-only types are never written by non-admin paths, and all admin
+            // writes serialize cluster-wide on this lock. See 02-architecture.md §4.4.
+            ResourceTypes deleteType = typeOf(descriptor);
+            boolean isSchema = deleteType == ResourceTypes.APP_TYPE_SCHEMA
+                    || deleteType == ResourceTypes.CATALOG_SCHEMA;
+            String deletedSecret = null;
+            String deletedSchemaId = null;
+            if (spec.isKey()) {
+                String existing = resourceService.getResource(descriptor, EtagHeader.ANY, false);
+                if (existing != null) {
+                    try {
+                        JsonNode node = BLOB_MAPPER.readTree(existing);
+                        Key key = BLOB_MAPPER.treeToValue(node, Key.class);
+                        secretFieldProcessor.decryptFields(key, descriptor);
+                        deletedSecret = key.getKey();
+                    } catch (Exception e) {
+                        // Corrupt blob or decrypt failure. Fall back to the in-memory snapshot
+                        // so the DELETE ordering invariant (apiKeyStore.removeKey BEFORE the
+                        // new merged Config becomes visible) is preserved — otherwise the live
+                        // secret remains authenticatable until the next full rebuild.
+                        log.warn("Could not extract key secret from blob, falling back to "
+                                + "in-memory snapshot: {}", e.getMessage());
+                        String canonicalId = "keys/" + descriptor.getBucketName() + "/" + descriptor.getName();
+                        Config snapshot = mergedConfigStore.get();
+                        if (snapshot != null) {
+                            Key inMemory = snapshot.getKeys().get(canonicalId);
+                            if (inMemory != null && StringUtils.isNotBlank(inMemory.getKey())) {
+                                deletedSecret = inMemory.getKey();
+                            }
+                        }
+                        if (deletedSecret == null) {
+                            throw new HttpException(HttpStatus.INTERNAL_SERVER_ERROR,
+                                    "Stored key entity is unreadable and no in-memory snapshot is available; "
+                                            + "delete aborted to preserve auth-store ordering");
+                        }
+                    }
+                }
+            } else if (isSchema) {
+                String existing = resourceService.getResource(descriptor, EtagHeader.ANY, false);
+                if (existing != null) {
+                    try {
+                        deletedSchemaId = MergedConfigStore.extractSchemaId(
+                                BLOB_MAPPER.readTree(existing));
+                    } catch (Exception e) {
+                        // Treat as no $id — applyEntityDelete will be skipped and the next
+                        // rebuild will clean up any stale entry.
+                    }
+                }
+            }
+            Map<String, String> deleteEventMetadata = deletedSchemaId != null
+                    ? Map.of("$id", deletedSchemaId) : null;
+            boolean deleted = resourceService.deleteResource(descriptor, etag, false, deleteEventMetadata);
+            if (!deleted) {
+                throw new HttpException(HttpStatus.NOT_FOUND,
+                        "Resource not found: " + descriptor.getUrl());
+            }
+            if (deletedSecret != null) {
+                apiKeyStore.removeKey(deletedSecret);
+            }
+            if (isSchema) {
+                // No $id could be recovered (blob missing, corrupt, or already gone) — the blob
+                // delete above already succeeded; skip the in-memory removal rather than calling
+                // the schema-throwing resolveMapKeyFor fallback. The next full rebuild cleans up
+                // any stale in-memory entry.
+                if (deletedSchemaId != null) {
+                    mergedConfigStore.applyEntityDelete(deleteType, deletedSchemaId);
+                }
+            } else {
+                mergedConfigStore.applyEntityDelete(deleteType, MergedConfigStore.resolveMapKeyFor(descriptor));
+            }
+            return true;
+        })).onSuccess(v -> context.respond(HttpStatus.NO_CONTENT)).onFailure(this::handleWriteError);
+
+        return Future.succeededFuture();
+    }
+
+    private static ResourceTypes typeOf(ResourceDescriptor descriptor) {
+        // prepareWrite() always builds descriptors with a ResourceTypes constant — see below;
+        // ResourceDescriptor exposes the wider ResourceType interface so the cast is required here.
+        return (ResourceTypes) descriptor.getType();
+    }
+
+    /**
+     * Rejects a MODEL/INTERCEPTOR/APPLICATION/TOOL_SET write whose short name is already claimed
+     * by a different deployment (of any of those four types) in the live merged Config — the
+     * partial-update-path counterpart of {@code ConfigPostProcessor.skipOnDuplicate}, which only
+     * runs during a full rebuild. See {@link ConfigPostProcessor#isDeploymentIdTakenByAnotherDeploymentType}.
+     */
+    private void rejectDuplicateDeploymentId(ResourceTypes type, String shortName) {
+        Config snapshot = mergedConfigStore.get();
+        if (snapshot == null) {
+            return;
+        }
+        if (ConfigPostProcessor.isDeploymentIdTakenByAnotherDeploymentType(snapshot, type, shortName)) {
+            throw new HttpException(HttpStatus.CONFLICT,
+                    "Deployment ID '" + shortName + "' is already used by a different entity");
+        }
+    }
+
+    /**
+     * Rejects a key write whose secret is already used by a different key entity — ApiKeyStore
+     * indexes keys by plaintext secret, so a duplicate would collapse the two entities' auth.
+     *
+     * <p>The {@code requestNode.hasNonNull("key")} guard is load-bearing: on an omitted-key
+     * update, {@code keyEntity.getKey()} still holds ciphertext (merged from the raw blob before
+     * decryption) while {@code oldSecret} is plaintext, so without this guard every unrelated-field
+     * update would look like a secret change.
+     */
+    private void rejectDuplicateKeySecret(Key keyEntity, String oldSecret, JsonNode requestNode,
+                                          ResourceDescriptor descriptor) {
+        if (!requestNode.hasNonNull("key")) {
+            return;
+        }
+        Config snapshot = mergedConfigStore.get();
+        if (snapshot == null) {
+            return;
+        }
+        String error = KeyValidator.validateSecretNotTaken(snapshot,
+                MergedConfigStore.resolveMapKeyFor(descriptor), keyEntity, oldSecret);
+        if (error != null) {
+            throw new HttpException(HttpStatus.CONFLICT, error);
+        }
+    }
+
+    private static ApiKeyData apiKeyData(Key key) {
+        ApiKeyData data = new ApiKeyData();
+        data.setOriginalKey(key);
+        return data;
+    }
+
+    private static void validateKeyForApiWrite(Key key) {
+        String error = KeyValidator.validateRequiredFields(key);
+        if (error != null) {
+            throw new HttpException(HttpStatus.BAD_REQUEST, error);
+        }
+    }
+
+    /**
+     * Validate the write target and return its spec. Returns {@code null} after writing the
+     * appropriate 4xx response when the request can't proceed — callers short-circuit on null.
+     */
+    private WriteSpec prepareWrite() {
+        if (path == null || path.isEmpty() || path.endsWith("/")) {
+            context.respond(HttpStatus.BAD_REQUEST, "Resource name must not be empty or a folder");
+            return null;
+        }
+        ResourceTypes type = resourceType();
+        ResourceDescriptor descriptor = descriptorFor(type);
+        if (descriptor == null) {
+            respondMethodNotAllowed();
+            return null;
+        }
+        return switch (type) {
+            case MODEL -> new WriteSpec(descriptor, Model.class, true, false);
+            case INTERCEPTOR -> new WriteSpec(descriptor, Interceptor.class, false, false);
+            case TRANSLATOR -> new WriteSpec(descriptor, Translator.class, false, false);
+            case ROLE -> new WriteSpec(descriptor, Role.class, false, false);
+            case PROJECT_KEY -> new WriteSpec(descriptor, Key.class, true, true);
+            case ROUTE -> new WriteSpec(descriptor, Route.class, true, false);
+            case APP_TYPE_SCHEMA -> new WriteSpec(descriptor, null, false, false);
+            case CATALOG_SCHEMA -> new WriteSpec(descriptor, null, false, false);
+            default -> {
+                respondMethodNotAllowed();
+                yield null;
+            }
+        };
+    }
+
+
+    private static JsonNode parseJsonBody(Buffer body) {
+        String text = body == null ? "" : body.toString(StandardCharsets.UTF_8);
+        if (text.isBlank()) {
+            throw new HttpException(HttpStatus.BAD_REQUEST, "Request body must not be empty");
+        }
+        try {
+            return BLOB_MAPPER.readTree(text);
+        } catch (JsonProcessingException e) {
+            // getOriginalMessage() echoes the offending token verbatim, which can include
+            // submitted credentials (Key.key, Upstream.key, etc.). Surface only the location.
+            throw new HttpException(HttpStatus.BAD_REQUEST, "Invalid JSON at " + locationOf(e));
+        }
+    }
+
+    private void handleWriteError(Throwable error) {
+        if (error instanceof HttpException exception) {
+            context.respond(exception);
+        } else if (error instanceof ResourceNotFoundException notFound) {
+            // ApplicationService/ToolSetService signal a missing entity via this unchecked exception
+            // rather than HttpException (unlike the raw-blob path this controller otherwise uses).
+            context.respond(HttpStatus.NOT_FOUND, notFound.getMessage());
+        } else if (error instanceof ConstraintViolationException constraintViolationException) {
+            context.respond(HttpStatus.BAD_REQUEST, constraintViolationException.getMessage());
+        } else if (error instanceof IllegalArgumentException ex) {
+            context.respond(HttpStatus.BAD_REQUEST, ex.getMessage());
+        } else {
+            context.respond(HttpStatus.INTERNAL_SERVER_ERROR, error.getMessage());
+        }
+    }
+
+    /**
+     * Collects override-path and cross-reference warnings for Model writes. Override-path errors
+     * always abort with HTTP 422; cross-reference warnings alone may proceed in soft mode, with the
+     * next merged-config rebuild recording the entity in {@link MergedConfigStore#getInvalidEntities()}.
+     */
+    private void checkModel(Model entity) {
+        validateCatalogProperties(entity);
+        List<ValidationWarning> warnings = new ArrayList<>();
+        ConfigPostProcessor.validateOverridePaths(entity, warnings);
+        boolean invalidOverridePaths = !warnings.isEmpty();
+        Config snapshot = mergedConfigStore.get();
+        if (snapshot != null) {
+            ConfigPostProcessor.validateCrossReferences(entity, snapshot, warnings);
+            UpstreamExtraDataMerger.validateNoOverlap(entity);
+        }
+        if (warnings.isEmpty()) {
+            return;
+        }
+        if (softValidation && !invalidOverridePaths) {
+            log.warn("Soft-mode cross-ref warnings for model '{}': {}", path, warnings);
+            return;
+        }
+        rejectWithValidationWarnings(warnings);
+    }
+
+    /**
+     * Structural check for {@code catalog_schema_id}/{@code catalog_properties} on a Model write.
+     * Always enforced, unlike {@link #checkModel}'s cross-reference soft-mode allowance.
+     */
+    private void validateCatalogProperties(Model entity) {
+        try {
+            catalogSchemaService.validate(entity);
+        } catch (CatalogSchemaValidationException e) {
+            throw new HttpException(HttpStatus.BAD_REQUEST, "Catalog properties validation failed: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Structural check for Translator writes. Without this, a translator missing {@code in} would
+     * reach the blob store before {@link MergedConfigStore#applyEntityWrite} rejects it, leaving a
+     * written-but-invalid blob and a misleading response — see
+     * {@link ConfigPostProcessor#validateTranslator}. Always enforced, unlike {@link #checkModel}'s
+     * soft-mode allowance: this is a self-contained structural defect, not a reference that a later
+     * write could still resolve.
+     */
+    private void checkTranslator(Translator entity) {
+        List<ValidationWarning> warnings = new ArrayList<>();
+        ConfigPostProcessor.validateTranslator(path, entity, warnings);
+        if (warnings.isEmpty()) {
+            return;
+        }
+        rejectWithValidationWarnings(warnings);
+    }
+
+    /**
+     * Structural check for a deployment write: an {@code overridePaths} entry Core cannot render is
+     * rejected before the blob is written, exactly as {@link #checkTranslator} rejects a translator the
+     * rebuild would refuse. Always enforced, unlike {@link #checkModel}'s soft-mode allowance.
+     */
+    private void checkOverridePaths(Deployment entity) {
+        List<ValidationWarning> warnings = new ArrayList<>();
+        ConfigPostProcessor.validateOverridePaths(entity, warnings);
+        if (warnings.isEmpty()) {
+            return;
+        }
+        rejectWithValidationWarnings(warnings);
+    }
+
+    private void rejectWithValidationWarnings(List<ValidationWarning> warnings) {
+        ObjectNode body = ProxyUtil.MAPPER.createObjectNode();
+        ArrayNode arr = body.putArray("validationWarnings");
+        for (ValidationWarning warning : warnings) {
+            ObjectNode w = arr.addObject();
+            w.put("field", warning.getField());
+            w.put("message", warning.getMessage());
+        }
+        throw new HttpException(HttpStatus.UNPROCESSABLE_ENTITY, body.toString());
+    }
+
+    private static String locationOf(JsonProcessingException e) {
+        return e.getLocation() == null
+                ? "unknown location"
+                : "line " + e.getLocation().getLineNr() + ", column " + e.getLocation().getColumnNr();
+    }
+
+    private ObjectNode createNameEnvelope(String name) {
+        ObjectNode body = ProxyUtil.MAPPER.createObjectNode();
+        body.put("name", name);
+        return body;
+    }
+
+    private ObjectNode projectItem(Object item, String name) {
+        // Default MAPPER respects @JsonProperty(WRITE_ONLY) on @EncryptedField fields, so secrets
+        // simply drop from the response. There is no plaintext-reveal path (slice U.4 retired
+        // the ?reveal_secrets=true / security-admin reveal flow).
+        ObjectNode node = ProxyUtil.MAPPER.valueToTree(item);
+        node.put("name", name);
+        node.put("status", "valid");
+        return node;
+    }
+
+    /**
+     * {@code Application}/{@code ToolSet} secrets ({@code ResourceAuthSettings.clientSecret}/
+     * {@code codeVerifier}) are not {@code @EncryptedField}-annotated, so — unlike models — they
+     * are held <strong>decrypted</strong> in the merged {@link Config} for internal routing use.
+     * {@code @JsonProperty(WRITE_ONLY)} is not an option here: {@code ApplicationService}/
+     * {@code ToolSetService} persist through the plain {@code MAPPER} (not {@code BLOB_MAPPER}'s
+     * {@code @EncryptedField}-aware override), so WRITE_ONLY would also drop the field from the
+     * blob write itself. Redact on the {@link ObjectNode} snapshot {@link #projectItem} already
+     * produces instead — a fresh copy, so this never mutates the live {@link Config} entity.
+     *
+     * <p>{@code revealHint} replaces the removed secret with its {@code client_secret_hint}; admins only.</p>
+     */
+    private static void redactSecretFields(JsonNode authSettings, boolean revealHint) {
+        if (authSettings instanceof ObjectNode settings) {
+            JsonNode clientSecret = settings.remove(ResourceAuthSettings.CLIENT_SECRET_FIELD);
+            settings.remove(ResourceAuthSettings.CODE_VERIFIER_FIELD);
+            // Drop unconditionally first: the hint is this method's to emit, never the projected node's.
+            settings.remove(ResourceAuthSettings.CLIENT_SECRET_HINT_FIELD);
+            if (revealHint && clientSecret != null && clientSecret.isTextual()) {
+                String hint = ResourceAuthSettings.hintFor(clientSecret.textValue());
+                if (hint != null) {
+                    settings.put(ResourceAuthSettings.CLIENT_SECRET_HINT_FIELD, hint);
+                }
+            }
+        }
+    }
+
+    private static ObjectNode redactAuthSettingsSecrets(ObjectNode node, boolean admin) {
+        redactSecretFields(node.get("auth_settings"), admin);
+        return node;
+    }
+
+    private static ObjectNode redactExternalServiceSecrets(ObjectNode node, boolean admin) {
+        JsonNode externalServices = node.get("external_services");
+        if (externalServices != null && externalServices.isObject()) {
+            externalServices.forEach(service -> redactSecretFields(service.get("auth_settings"), admin));
+        }
+        return node;
+    }
+
+    private ObjectNode projectSchemaItem(String name, JsonNode schema) {
+        ObjectNode node = ProxyUtil.MAPPER.createObjectNode();
+        if (schema.isObject()) {
+            node.setAll((ObjectNode) schema);
+        } else {
+            node.set("schema", schema);
+        }
+        node.put("name", name);
+        node.put("status", "valid");
+        return node;
+    }
+
+    private ObjectNode projectInvalidItem(InvalidEntityRecord record, boolean admin) {
+        ObjectNode node = ProxyUtil.MAPPER.createObjectNode();
+        Class<?> entityClass = entityClassFor(entityType);
+        // Invalid blobs may not have been decrypted (decryption_error reason) so the raw payload may
+        // still contain ENC[...] envelopes. Drop encrypted fields entirely so ciphertext never leaks.
+        ObjectNode payload = entityClass == null
+                ? (record.getPayload() instanceof ObjectNode raw ? raw.deepCopy() : null)
+                : SecretFieldProcessor.stripEncryptedFields(record.getPayload(), entityClass);
+        if (payload != null) {
+            node.setAll(payload);
+        }
+        node.put("name", record.getSimpleName());
+        node.put("status", "invalid");
+        if (admin) {
+            ArrayNode warnings = node.putArray("validationWarnings");
+            for (ValidationWarning warning : record.getValidationWarnings()) {
+                ObjectNode w = warnings.addObject();
+                w.put("field", warning.getField());
+                w.put("message", warning.getMessage());
+            }
+        }
+        return node;
+    }
+
+    private static Class<?> entityClassFor(String entityType) {
+        return switch (ResourceTypes.of(entityType)) {
+            case MODEL -> Model.class;
+            case INTERCEPTOR -> Interceptor.class;
+            case TRANSLATOR -> Translator.class;
+            case ROLE -> Role.class;
+            case PROJECT_KEY -> Key.class;
+            case ROUTE -> Route.class;
+            case APPLICATION -> Application.class;
+            case TOOL_SET -> ToolSet.class;
+            default -> null;
+        };
+    }
+
+    private ResourceTypes resourceType() {
+        return ResourceTypes.of(entityType);
+    }
+
+    private Future<?> respondMethodNotAllowed() {
+        context.putHeader("Allow", ALLOW_HEADER);
+        context.respond(HttpStatus.METHOD_NOT_ALLOWED, "Not implemented");
+        return Future.succeededFuture();
+    }
+
+    private record WriteSpec(
+            ResourceDescriptor descriptor,
+            Class<?> entityClass,        // null for schemas (raw JSON-string body)
+            boolean hasEncryptedFields,
+            boolean isKey
+    ) {}
+
+    public record ConfigWriteResponse(String name) {}
+}

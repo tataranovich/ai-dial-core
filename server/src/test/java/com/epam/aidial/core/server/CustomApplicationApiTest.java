@@ -1,14 +1,32 @@
 package com.epam.aidial.core.server;
 
 import com.epam.aidial.core.config.Application;
+import com.epam.aidial.core.config.ResourceAccessType;
+import com.epam.aidial.core.server.data.ApiKeyData;
+import com.epam.aidial.core.server.data.AutoSharedData;
 import com.epam.aidial.core.server.data.InvitationLink;
+import com.epam.aidial.core.server.util.JsonUtil;
 import com.epam.aidial.core.server.util.ProxyUtil;
 import com.epam.aidial.core.server.util.ResourceDescriptorFactory;
 import com.epam.aidial.core.storage.resource.ResourceDescriptor;
 import com.epam.aidial.core.storage.util.EtagHeader;
+import com.fasterxml.jackson.databind.JsonNode;
 import io.vertx.core.http.HttpMethod;
+import io.vertx.core.json.JsonObject;
+import okhttp3.mockwebserver.MockResponse;
+import org.apache.hc.client5.http.classic.methods.HttpUriRequest;
+import org.apache.hc.client5.http.classic.methods.HttpUriRequestBase;
+import org.apache.hc.core5.http.io.entity.StringEntity;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
+
+import java.io.IOException;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -54,6 +72,7 @@ public class CustomApplicationApiTest extends ResourceBaseTest {
                 "reference": "@ignore",
                 "forward_auth_token":false,
                 "defaults": {},
+                "responses_defaults": {},
                 "interceptors": [],
                 "description_keywords": [],
                 "max_retry_attempts" : 1,
@@ -92,6 +111,104 @@ public class CustomApplicationApiTest extends ResourceBaseTest {
                 }
                 """, "If-None-Match", "*");
         verify(response, 200);
+
+        response = send(HttpMethod.PUT, "/v1/applications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/unknown-app-schema-case", null, """
+                {
+                "display_name": "My Custom Application",
+                "display_version": "1.0",
+                "icon_url": "http://application1/icon.svg",
+                "applicationTypeSchemaId": "http://unknown/schema/id",
+                "description": "My Custom Application Description"
+                }
+                """);
+        verify(response, 400);
+
+        // verify custom app creation fails if dependency is unknown
+        response = send(HttpMethod.PUT, "/v1/applications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/my-custom-application", null, """
+                {
+                "endpoint": "http://application1/v1/completions",
+                "display_name": "My Custom Application",
+                "display_version": "1.0",
+                "icon_url": "http://application1/icon.svg",
+                "description": "My Custom Application Description",
+                "dependencies": ["unknown-app"]
+                }
+                """);
+        verify(response, 400);
+
+        response = send(HttpMethod.GET, "/v1/bucket", null, "", "authorization", "admin");
+        String adminBucket = new JsonObject(response.body()).getString("bucket");
+
+        // verify custom app creation fails if interceptor is unknown
+        response = send(HttpMethod.PUT, "/v1/applications/%s/my-custom-application".formatted(adminBucket), null, """
+                {
+                "endpoint": "http://application1/v1/completions",
+                "display_name": "My Custom Application",
+                "display_version": "1.0",
+                "icon_url": "http://application1/icon.svg",
+                "description": "My Custom Application Description",
+                "interceptors": ["unknown-interceptor"]
+                }
+                """, "authorization", "admin");
+        verify(response, 400);
+
+        response = send(HttpMethod.PUT, "/v1/applications/%s/my-custom-application".formatted(adminBucket), null, """
+                {
+                "endpoint": "http://application1/v1/completions",
+                "display_name": "My Custom Application",
+                "display_version": "1.0",
+                "icon_url": "http://application1/icon.svg",
+                "description": "My Custom Application Description",
+                "interceptors": ["interceptor1"]
+                }
+                """, "authorization", "admin");
+        verify(response, 200);
+
+    }
+
+    @Test
+    void testRawApplicationGetEnrichesStatusStripsSecretsAndIgnoresInjectedStatus() {
+        // The PUT body injects a bogus user_level_auth_status: it must be ignored (READ_ONLY), never persisted.
+        Response put = send(HttpMethod.PUT,
+                "/v1/applications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/ext-svc-app", null, """
+                {
+                "endpoint": "http://application1/v1/completions",
+                "display_name": "Ext Svc App",
+                "external_services": {
+                  "salesforce": {
+                    "display_name": "Salesforce",
+                    "auth_settings": {
+                      "authentication_type": "OAUTH",
+                      "client_id": "test-client-id",
+                      "client_secret": "test-client-secret",
+                      "authorization_endpoint": "http://localhost:9876/authorize",
+                      "token_endpoint": "http://localhost:9876/token",
+                      "redirect_uri": "http://localhost:3000/auth/signin",
+                      "user_level_auth_status": "SIGNED_IN"
+                    }
+                  }
+                }
+                }
+                """);
+        verify(put, 200);
+
+        Response get = send(HttpMethod.GET,
+                "/v1/applications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/ext-svc-app", null, "");
+        verify(get, 200);
+
+        JsonObject authSettings = new JsonObject(get.body())
+                .getJsonObject("external_services")
+                .getJsonObject("salesforce")
+                .getJsonObject("auth_settings");
+        // secret-bearing fields stripped on the raw resource GET (mirrors toolset clearAuthSettings)
+        Assertions.assertNull(authSettings.getString("client_secret"));
+        Assertions.assertNull(authSettings.getString("code_verifier"));
+        // non-secret metadata preserved
+        assertEquals("test-client-id", authSettings.getString("client_id"));
+        assertEquals("http://localhost:9876/token", authSettings.getString("token_endpoint"));
+        // status enriched per-user (parity with toolset raw GET) AND not overridable via PUT: the injected
+        // SIGNED_IN is dropped (READ_ONLY); the computed status for the not-signed-in caller is SIGNED_OUT.
+        assertEquals("SIGNED_OUT", authSettings.getString("user_level_auth_status"));
     }
 
     @Test
@@ -232,6 +349,7 @@ public class CustomApplicationApiTest extends ResourceBaseTest {
                  "configuration_endpoint": "http://application1/configuration"
                  },
                 "defaults": {},
+                "responses_defaults": {},
                 "interceptors": [],
                 "description_keywords":[],
                 "max_retry_attempts" : 1,
@@ -347,6 +465,7 @@ public class CustomApplicationApiTest extends ResourceBaseTest {
                    "forward_auth_token" : false,
                    "features" : { },
                    "defaults" : { },
+                   "responses_defaults" : { },
                    "interceptors" : [ ],
                    "description_keywords" : [ ],
                    "max_retry_attempts" : 1,
@@ -413,7 +532,8 @@ public class CustomApplicationApiTest extends ResourceBaseTest {
                     "action": "ADD",
                     "sourceUrl" : "applications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/my-custom-application",
                     "targetUrl" : "applications/public/folder/my-custom-application",
-                    "reviewUrl" : "applications/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/my-custom-application"
+                    "reviewUrl" : "applications/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhEstv1KXNzCiw693js8BLmo/my-custom-application",
+                    "publishCredentials" : false
                    } ],
                    "resourceTypes" : [ "APPLICATION" ],
                    "rules" : [ {
@@ -441,102 +561,283 @@ public class CustomApplicationApiTest extends ResourceBaseTest {
         Response response = send(HttpMethod.GET, "/openai/applications");
         verifyJson(response, 200, """
                 {
-                    "data":[
-                        {
-                            "id":"app",
-                            "application":"app",
-                            "display_name":"10k",
-                            "icon_url":"http://localhost:7001/logo10k.png",
-                            "description":"Some description of the application for testing",
-                            "reference":"app",
-                            "owner":"organization-owner",
-                            "object":"application",
-                            "status":"succeeded",
-                            "created_at":1672534800,
-                            "updated_at":1672534800,
-                            "features":{
-                                "rate":true,
-                                "tokenize":false,
-                                "truncate_prompt":false,
-                                "configuration":true,
-                                "system_prompt":false,
-                                "tools":false,
-                                "seed":false,
-                                "url_attachments":false,
-                                "folder_attachments":false,
-                                "allow_resume": true,
-                                "accessible_by_per_request_key": true,
-                                "content_parts": false,
-                                "temperature" : true,
-                                "addons" : true,
-                                "cache" : false,
-                                "auto_caching" : false,
-                                "parallel_tool_calls" : true
-                                },
-                            "defaults":{},
-                            "description_keywords":[],
-                            "max_retry_attempts" : 1,
-                            "routes" : { }
-                        }, {
-                             "id" : "app-route",
-                             "application" : "app-route",
-                             "display_name" : "10k",
-                             "icon_url" : "http://localhost:7001/logo10k.png",
-                             "description" : "Some description of the application for testing",
-                             "reference" : "app-route",
-                             "owner" : "organization-owner",
-                             "object" : "application",
-                             "status" : "succeeded",
-                             "created_at" : 1672534800,
-                             "updated_at" : 1672534800,
-                             "features" : {
-                               "rate" : true,
-                               "tokenize" : false,
-                               "truncate_prompt" : false,
-                               "configuration" : true,
-                               "system_prompt" : false,
-                               "tools" : false,
-                               "seed" : false,
-                               "url_attachments" : false,
-                               "folder_attachments" : false,
-                               "allow_resume" : true,
-                               "accessible_by_per_request_key" : true,
-                               "content_parts" : false,
-                               "temperature" : true,
-                               "addons" : true,
-                               "cache" : false,
-                               "auto_caching" : false,
-                               "parallel_tool_calls" : true
-                             },
-                             "defaults" : { },
-                             "description_keywords" : [ ],
-                             "max_retry_attempts" : 1,
-                             "routes" : {
-                               "index-search" : {
-                                 "name" : null,
-                                 "userRoles" : null,
-                                 "response" : null,
-                                 "rewritePath" : true,
-                                 "paths" : [ "/v1/index(/[^/]+)*$" ],
-                                 "methods" : [ "DELETE", "POST", "PUT" ],
-                                 "upstreams" : [ {
-                                   "endpoint" : "http://localhost:4848",
-                                   "extraData" : null,
-                                   "weight" : 1,
-                                   "tier" : 0
-                                 } ],
-                                 "maxRetryAttempts" : 1,
-                                 "order" : 2147483647,
-                                 "permissions" : [ ],
-                                 "attachmentPaths" : {
-                                   "requestBody" : [ "@.attachments[*].url" ],
-                                   "responseBody" : [ "@.result.attachedFiles" ]
-                                 }
-                               }
-                             }
-                           }
-                    ],
-                    "object":"list"
+                  "data" : [ {
+                    "id" : "app",
+                    "application" : "app",
+                    "display_name" : "10k",
+                    "icon_url" : "http://localhost:7001/logo10k.png",
+                    "description" : "Some description of the application for testing",
+                    "reference" : "app",
+                    "owner" : "organization-owner",
+                    "object" : "application",
+                    "status" : "succeeded",
+                    "created_at" : 1672534800,
+                    "updated_at" : 1672534800,
+                    "features" : {
+                      "rate" : true,
+                      "tokenize" : false,
+                      "truncate_prompt" : false,
+                      "configuration" : true,
+                      "system_prompt" : false,
+                      "tools" : false,
+                      "seed" : false,
+                      "url_attachments" : false,
+                      "folder_attachments" : false,
+                      "allow_resume" : true,
+                      "accessible_by_per_request_key" : true,
+                      "content_parts" : false,
+                      "temperature" : true,
+                      "cache" : false,
+                      "auto_caching" : false,
+                      "parallel_tool_calls" : true,
+                      "assistant_attachments_in_request" : false,
+                      "mcp" : false,
+                      "chat_completion" : true,
+                      "responses_api" : false,
+                      "max_tokens_supported" : true,
+                      "max_completion_tokens_supported" : false,
+                      "custom_temperature_supported" : true,
+                      "skills_supported" : false,
+                      "reasoning_efforts" : [ ]
+                    },
+                    "defaults" : { },
+                    "responses_defaults" : { },
+                    "description_keywords" : [ ],
+                    "max_retry_attempts" : 1,
+                    "interface_configs" : {
+                      "openaiChatCompletions" : {
+                        "features" : {
+                          "rate" : true,
+                          "tokenize" : false,
+                          "truncate_prompt" : false,
+                          "configuration" : true,
+                          "system_prompt" : false,
+                          "tools" : false,
+                          "seed" : false,
+                          "url_attachments" : false,
+                          "folder_attachments" : false,
+                          "allow_resume" : true,
+                          "accessible_by_per_request_key" : true,
+                          "content_parts" : false,
+                          "temperature" : true,
+                          "cache" : false,
+                          "auto_caching" : false,
+                          "parallel_tool_calls" : true,
+                          "assistant_attachments_in_request" : false,
+                          "mcp" : false,
+                          "chat_completion" : true,
+                          "responses_api" : false,
+                          "max_tokens_supported" : true,
+                          "max_completion_tokens_supported" : false,
+                          "custom_temperature_supported" : true,
+                          "skills_supported" : false,
+                          "reasoning_efforts" : [ ]
+                        },
+                        "defaults" : { },
+                        "default_headers" : { }
+                      }
+                    },
+                    "routes" : { },
+                    "viewer_url" : "http://some-host",
+                    "editor_url" : "http://some-host"
+                  }, {
+                    "id" : "app-route",
+                    "application" : "app-route",
+                    "display_name" : "10k",
+                    "icon_url" : "http://localhost:7001/logo10k.png",
+                    "description" : "Some description of the application for testing",
+                    "reference" : "app-route",
+                    "owner" : "organization-owner",
+                    "object" : "application",
+                    "status" : "succeeded",
+                    "created_at" : 1672534800,
+                    "updated_at" : 1672534800,
+                    "features" : {
+                      "rate" : true,
+                      "tokenize" : false,
+                      "truncate_prompt" : false,
+                      "configuration" : true,
+                      "system_prompt" : false,
+                      "tools" : false,
+                      "seed" : false,
+                      "url_attachments" : false,
+                      "folder_attachments" : false,
+                      "allow_resume" : true,
+                      "accessible_by_per_request_key" : true,
+                      "content_parts" : false,
+                      "temperature" : true,
+                      "cache" : false,
+                      "auto_caching" : false,
+                      "parallel_tool_calls" : true,
+                      "assistant_attachments_in_request" : false,
+                      "mcp" : false,
+                      "chat_completion" : true,
+                      "responses_api" : false,
+                      "max_tokens_supported" : true,
+                      "max_completion_tokens_supported" : false,
+                      "custom_temperature_supported" : true,
+                      "skills_supported" : false,
+                      "reasoning_efforts" : [ ]
+                    },
+                    "defaults" : { },
+                    "responses_defaults" : { },
+                    "description_keywords" : [ ],
+                    "max_retry_attempts" : 1,
+                    "interface_configs" : {
+                      "openaiChatCompletions" : {
+                        "features" : {
+                          "rate" : true,
+                          "tokenize" : false,
+                          "truncate_prompt" : false,
+                          "configuration" : true,
+                          "system_prompt" : false,
+                          "tools" : false,
+                          "seed" : false,
+                          "url_attachments" : false,
+                          "folder_attachments" : false,
+                          "allow_resume" : true,
+                          "accessible_by_per_request_key" : true,
+                          "content_parts" : false,
+                          "temperature" : true,
+                          "cache" : false,
+                          "auto_caching" : false,
+                          "parallel_tool_calls" : true,
+                          "assistant_attachments_in_request" : false,
+                          "mcp" : false,
+                          "chat_completion" : true,
+                          "responses_api" : false,
+                          "max_tokens_supported" : true,
+                          "max_completion_tokens_supported" : false,
+                          "custom_temperature_supported" : true,
+                          "skills_supported" : false,
+                          "reasoning_efforts" : [ ]
+                        },
+                        "defaults" : { },
+                        "default_headers" : { }
+                      }
+                    },
+                    "routes" : {
+                      "index-search" : {
+                        "rewritePath" : true,
+                        "paths" : [ "/v1/index(/[^/]+)*$" ],
+                        "methods" : [ "DELETE", "POST", "PUT" ],
+                        "maxRetryAttempts" : 1,
+                        "order" : 2147483647,
+                        "permissions" : [ ],
+                        "attachmentPaths" : {
+                          "requestBody" : [ "@.attachments[*].url" ],
+                          "responseBody" : [ "@.result.attachedFiles" ]
+                        }
+                      }
+                    }
+                  }, {
+                    "id" : "app-responses",
+                    "application" : "app-responses",
+                    "display_name" : "App with Responses API",
+                    "reference" : "app-responses",
+                    "owner" : "organization-owner",
+                    "object" : "application",
+                    "status" : "succeeded",
+                    "created_at" : 1672534800,
+                    "updated_at" : 1672534800,
+                    "features" : {
+                      "rate" : false,
+                      "tokenize" : false,
+                      "truncate_prompt" : false,
+                      "configuration" : false,
+                      "system_prompt" : true,
+                      "tools" : false,
+                      "seed" : false,
+                      "url_attachments" : false,
+                      "folder_attachments" : false,
+                      "allow_resume" : true,
+                      "accessible_by_per_request_key" : true,
+                      "content_parts" : false,
+                      "temperature" : true,
+                      "cache" : false,
+                      "auto_caching" : false,
+                      "parallel_tool_calls" : true,
+                      "assistant_attachments_in_request" : false,
+                      "mcp" : false,
+                      "chat_completion" : true,
+                      "responses_api" : true,
+                      "max_tokens_supported" : true,
+                      "max_completion_tokens_supported" : false,
+                      "custom_temperature_supported" : true,
+                      "skills_supported" : false,
+                      "reasoning_efforts" : [ ]
+                    },
+                    "defaults" : { },
+                    "responses_defaults" : { },
+                    "description_keywords" : [ ],
+                    "max_retry_attempts" : 1,
+                    "interface_configs" : {
+                      "openaiChatCompletions" : {
+                        "features" : {
+                          "rate" : false,
+                          "tokenize" : false,
+                          "truncate_prompt" : false,
+                          "configuration" : false,
+                          "system_prompt" : true,
+                          "tools" : false,
+                          "seed" : false,
+                          "url_attachments" : false,
+                          "folder_attachments" : false,
+                          "allow_resume" : true,
+                          "accessible_by_per_request_key" : true,
+                          "content_parts" : false,
+                          "temperature" : true,
+                          "cache" : false,
+                          "auto_caching" : false,
+                          "parallel_tool_calls" : true,
+                          "assistant_attachments_in_request" : false,
+                          "mcp" : false,
+                          "chat_completion" : true,
+                          "responses_api" : false,
+                          "max_tokens_supported" : true,
+                          "max_completion_tokens_supported" : false,
+                          "custom_temperature_supported" : true,
+                          "skills_supported" : false,
+                          "reasoning_efforts" : [ ]
+                        },
+                        "defaults" : { },
+                        "default_headers" : { }
+                      },
+                      "openaiResponses" : {
+                        "features" : {
+                          "rate" : false,
+                          "tokenize" : false,
+                          "truncate_prompt" : false,
+                          "configuration" : false,
+                          "system_prompt" : true,
+                          "tools" : false,
+                          "seed" : false,
+                          "url_attachments" : false,
+                          "folder_attachments" : false,
+                          "allow_resume" : true,
+                          "accessible_by_per_request_key" : true,
+                          "content_parts" : false,
+                          "temperature" : true,
+                          "cache" : false,
+                          "auto_caching" : false,
+                          "parallel_tool_calls" : true,
+                          "assistant_attachments_in_request" : false,
+                          "mcp" : false,
+                          "chat_completion" : false,
+                          "responses_api" : true,
+                          "max_tokens_supported" : true,
+                          "max_completion_tokens_supported" : false,
+                          "custom_temperature_supported" : true,
+                          "skills_supported" : false,
+                          "reasoning_efforts" : [ ]
+                        },
+                        "defaults" : { },
+                        "default_headers" : { }
+                      }
+                    },
+                    "routes" : { }
+                  } ],
+                  "object" : "list"
                 }
                 """);
 
@@ -583,14 +884,58 @@ public class CustomApplicationApiTest extends ResourceBaseTest {
                         "accessible_by_per_request_key": true,
                         "content_parts": false,
                         "temperature" : true,
-                        "addons" : true,
                         "cache" : false,
                         "auto_caching" : false,
-                        "parallel_tool_calls" : true
+                        "parallel_tool_calls" : true,
+                        "assistant_attachments_in_request": false,
+                        "mcp" : false,
+                        "chat_completion" : true,
+                        "responses_api" : false,
+                        "max_tokens_supported": true,
+                        "max_completion_tokens_supported": false,
+                        "custom_temperature_supported": true,
+                        "skills_supported": false,
+                        "reasoning_efforts": []
                     },
                     "defaults":{},
+                    "responses_defaults":{},
                     "description_keywords":[],
                     "max_retry_attempts" : 1,
+                    "interface_configs" : {
+                      "openaiChatCompletions" : {
+                        "features" : {
+                          "rate" : true,
+                          "tokenize" : false,
+                          "truncate_prompt" : false,
+                          "configuration" : true,
+                          "system_prompt" : true,
+                          "tokenize" : false,
+                          "truncate_prompt" : false,
+                          "tools" : false,
+                          "seed" : false,
+                          "url_attachments" : false,
+                          "folder_attachments" : false,
+                          "allow_resume" : true,
+                          "accessible_by_per_request_key" : true,
+                          "content_parts" : false,
+                          "temperature" : true,
+                          "cache" : false,
+                          "auto_caching" : false,
+                          "parallel_tool_calls" : true,
+                          "assistant_attachments_in_request" : false,
+                          "mcp" : false,
+                          "chat_completion" : true,
+                          "responses_api" : false,
+                          "max_tokens_supported" : true,
+                          "max_completion_tokens_supported" : false,
+                          "custom_temperature_supported" : true,
+                          "skills_supported" : false,
+                          "reasoning_efforts" : [ ]
+                        },
+                        "defaults" : { },
+                        "default_headers" : { }
+                      }
+                    },
                     "owner" : "EPM-RTC-GPT",
                     "created_at" : "@ignore",
                     "updated_at" : "@ignore",
@@ -602,140 +947,361 @@ public class CustomApplicationApiTest extends ResourceBaseTest {
         response = send(HttpMethod.GET, "/openai/applications");
         verifyJsonNotExact(response, 200, """
                 {
-                    "data":[
-                        {
-                            "id":"app",
-                            "application":"app",
-                            "display_name":"10k",
-                            "icon_url":"http://localhost:7001/logo10k.png",
-                            "description":"Some description of the application for testing",
-                            "reference":"app",
-                            "owner":"organization-owner",
-                            "object":"application",
-                            "status":"succeeded",
-                            "created_at":1672534800,
-                            "updated_at":1672534800,
-                            "features":{
-                                "rate":true,
-                                "tokenize":false,
-                                "truncate_prompt":false,
-                                "configuration":true,
-                                "system_prompt":false,
-                                "tools":false,
-                                "seed":false,
-                                "url_attachments":false,
-                                "folder_attachments":false,
-                                "allow_resume": true,
-                                "accessible_by_per_request_key": true,
-                                "content_parts": false,
-                                "temperature" : true,
-                                "addons" : true,
-                                "cache" : false,
-                                "auto_caching" : false,
-                                "parallel_tool_calls" : true
-                                },
-                            "defaults":{},
-                            "description_keywords":[],
-                            "max_retry_attempts" : 1,
-                            "routes" : { }
+                  "data" : [ {
+                    "id" : "app",
+                    "application" : "app",
+                    "display_name" : "10k",
+                    "icon_url" : "http://localhost:7001/logo10k.png",
+                    "description" : "Some description of the application for testing",
+                    "reference" : "app",
+                    "owner" : "organization-owner",
+                    "object" : "application",
+                    "status" : "succeeded",
+                    "created_at" : 1672534800,
+                    "updated_at" : 1672534800,
+                    "features" : {
+                      "rate" : true,
+                      "tokenize" : false,
+                      "truncate_prompt" : false,
+                      "configuration" : true,
+                      "system_prompt" : false,
+                      "tools" : false,
+                      "seed" : false,
+                      "url_attachments" : false,
+                      "folder_attachments" : false,
+                      "allow_resume" : true,
+                      "accessible_by_per_request_key" : true,
+                      "content_parts" : false,
+                      "temperature" : true,
+                      "cache" : false,
+                      "auto_caching" : false,
+                      "parallel_tool_calls" : true,
+                      "assistant_attachments_in_request" : false,
+                      "mcp" : false,
+                      "chat_completion" : true,
+                      "responses_api" : false,
+                      "max_tokens_supported" : true,
+                      "max_completion_tokens_supported" : false,
+                      "custom_temperature_supported" : true,
+                      "skills_supported" : false,
+                      "reasoning_efforts" : [ ]
+                    },
+                    "defaults" : { },
+                    "responses_defaults" : { },
+                    "description_keywords" : [ ],
+                    "max_retry_attempts" : 1,
+                    "interface_configs" : {
+                      "openaiChatCompletions" : {
+                        "features" : {
+                          "rate" : true,
+                          "tokenize" : false,
+                          "truncate_prompt" : false,
+                          "configuration" : true,
+                          "system_prompt" : false,
+                          "tools" : false,
+                          "seed" : false,
+                          "url_attachments" : false,
+                          "folder_attachments" : false,
+                          "allow_resume" : true,
+                          "accessible_by_per_request_key" : true,
+                          "content_parts" : false,
+                          "temperature" : true,
+                          "cache" : false,
+                          "auto_caching" : false,
+                          "parallel_tool_calls" : true,
+                          "assistant_attachments_in_request" : false,
+                          "mcp" : false,
+                          "chat_completion" : true,
+                          "responses_api" : false,
+                          "max_tokens_supported" : true,
+                          "max_completion_tokens_supported" : false,
+                          "custom_temperature_supported" : true,
+                          "skills_supported" : false,
+                          "reasoning_efforts" : [ ]
                         },
-                        {
-                            "id" : "app-route",
-                            "application" : "app-route",
-                            "display_name" : "10k",
-                            "icon_url" : "http://localhost:7001/logo10k.png",
-                            "description" : "Some description of the application for testing",
-                            "reference" : "app-route",
-                            "owner" : "organization-owner",
-                            "object" : "application",
-                            "status" : "succeeded",
-                            "created_at" : 1672534800,
-                            "updated_at" : 1672534800,
-                            "features" : {
-                              "rate" : true,
-                              "tokenize" : false,
-                              "truncate_prompt" : false,
-                              "configuration" : true,
-                              "system_prompt" : false,
-                              "tools" : false,
-                              "seed" : false,
-                              "url_attachments" : false,
-                              "folder_attachments" : false,
-                              "allow_resume" : true,
-                              "accessible_by_per_request_key" : true,
-                              "content_parts" : false,
-                              "temperature" : true,
-                              "addons" : true,
-                              "cache" : false,
-                              "auto_caching" : false,
-                              "parallel_tool_calls" : true
-                            },
-                            "defaults" : { },
-                            "description_keywords" : [ ],
-                            "max_retry_attempts" : 1,
-                            "routes" : {
-                              "index-search" : {
-                                "name" : null,
-                                "userRoles" : null,
-                                "response" : null,
-                                "rewritePath" : true,
-                                "paths" : [ "/v1/index(/[^/]+)*$" ],
-                                "methods" : [ "DELETE", "POST", "PUT" ],
-                                "upstreams" : [ {
-                                  "endpoint" : "http://localhost:4848",
-                                  "extraData" : null,
-                                  "weight" : 1,
-                                  "tier" : 0
-                                } ],
-                                "maxRetryAttempts" : 1,
-                                "order" : 2147483647,
-                                "permissions" : [ ],
-                                "attachmentPaths" : {
-                                  "requestBody" : [ "@.attachments[*].url" ],
-                                  "responseBody" : [ "@.result.attachedFiles" ]
-                                }
-                              }
-                            }
+                        "defaults" : { },
+                        "default_headers" : { }
+                      }
+                    },
+                    "routes" : { },
+                    "viewer_url" : "http://some-host",
+                    "editor_url" : "http://some-host"
+                  }, {
+                    "id" : "app-route",
+                    "application" : "app-route",
+                    "display_name" : "10k",
+                    "icon_url" : "http://localhost:7001/logo10k.png",
+                    "description" : "Some description of the application for testing",
+                    "reference" : "app-route",
+                    "owner" : "organization-owner",
+                    "object" : "application",
+                    "status" : "succeeded",
+                    "created_at" : 1672534800,
+                    "updated_at" : 1672534800,
+                    "features" : {
+                      "rate" : true,
+                      "tokenize" : false,
+                      "truncate_prompt" : false,
+                      "configuration" : true,
+                      "system_prompt" : false,
+                      "tools" : false,
+                      "seed" : false,
+                      "url_attachments" : false,
+                      "folder_attachments" : false,
+                      "allow_resume" : true,
+                      "accessible_by_per_request_key" : true,
+                      "content_parts" : false,
+                      "temperature" : true,
+                      "cache" : false,
+                      "auto_caching" : false,
+                      "parallel_tool_calls" : true,
+                      "assistant_attachments_in_request" : false,
+                      "mcp" : false,
+                      "chat_completion" : true,
+                      "responses_api" : false,
+                      "max_tokens_supported" : true,
+                      "max_completion_tokens_supported" : false,
+                      "custom_temperature_supported" : true,
+                      "skills_supported" : false,
+                      "reasoning_efforts" : [ ]
+                    },
+                    "defaults" : { },
+                    "responses_defaults" : { },
+                    "description_keywords" : [ ],
+                    "max_retry_attempts" : 1,
+                    "interface_configs" : {
+                      "openaiChatCompletions" : {
+                        "features" : {
+                          "rate" : true,
+                          "tokenize" : false,
+                          "truncate_prompt" : false,
+                          "configuration" : true,
+                          "system_prompt" : false,
+                          "tools" : false,
+                          "seed" : false,
+                          "url_attachments" : false,
+                          "folder_attachments" : false,
+                          "allow_resume" : true,
+                          "accessible_by_per_request_key" : true,
+                          "content_parts" : false,
+                          "temperature" : true,
+                          "cache" : false,
+                          "auto_caching" : false,
+                          "parallel_tool_calls" : true,
+                          "assistant_attachments_in_request" : false,
+                          "mcp" : false,
+                          "chat_completion" : true,
+                          "responses_api" : false,
+                          "max_tokens_supported" : true,
+                          "max_completion_tokens_supported" : false,
+                          "custom_temperature_supported" : true,
+                          "skills_supported" : false,
+                          "reasoning_efforts" : [ ]
                         },
-                        {
-                            "id" : "applications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/my-custom-application",
-                            "application" : "applications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/my-custom-application",
-                            "display_name" : "My Custom Application",
-                            "display_version" : "1.0",
-                            "icon_url" : "http://application1/icon.svg",
-                            "description" : "My Custom Application Description",
-                            "reference": "@ignore",
-                            "object" : "application",
-                            "status" : "succeeded",
-                            "features" : {
-                              "rate" : true,
-                              "tokenize" : false,
-                              "truncate_prompt" : false,
-                              "configuration" : true,
-                              "system_prompt" : true,
-                              "tools" : false,
-                              "seed" : false,
-                              "url_attachments" : false,
-                              "folder_attachments" : false,
-                              "allow_resume": true,
-                              "accessible_by_per_request_key": true,
-                              "content_parts": false,
-                              "temperature" : true,
-                              "addons" : true,
-                              "cache" : false,
-                              "auto_caching" : false,
-                              "parallel_tool_calls" : true
-                            },
-                            "defaults" : { },
-                            "description_keywords":[],
-                            "max_retry_attempts" : 1,
-                            "owner" : "EPM-RTC-GPT",
-                            "created_at" : "@ignore",
-                            "updated_at" : "@ignore",
-                            "routes" : { }
-                          }
-                    ],
-                    "object":"list"
+                        "defaults" : { },
+                        "default_headers" : { }
+                      }
+                    },
+                    "routes" : {
+                      "index-search" : {
+                        "rewritePath" : true,
+                        "paths" : [ "/v1/index(/[^/]+)*$" ],
+                        "methods" : [ "DELETE", "POST", "PUT" ],
+                        "maxRetryAttempts" : 1,
+                        "order" : 2147483647,
+                        "permissions" : [ ],
+                        "attachmentPaths" : {
+                          "requestBody" : [ "@.attachments[*].url" ],
+                          "responseBody" : [ "@.result.attachedFiles" ]
+                        }
+                      }
+                    }
+                  }, {
+                    "id" : "app-responses",
+                    "application" : "app-responses",
+                    "display_name" : "App with Responses API",
+                    "reference" : "app-responses",
+                    "owner" : "organization-owner",
+                    "object" : "application",
+                    "status" : "succeeded",
+                    "created_at" : 1672534800,
+                    "updated_at" : 1672534800,
+                    "features" : {
+                      "rate" : false,
+                      "tokenize" : false,
+                      "truncate_prompt" : false,
+                      "configuration" : false,
+                      "system_prompt" : true,
+                      "tools" : false,
+                      "seed" : false,
+                      "url_attachments" : false,
+                      "folder_attachments" : false,
+                      "allow_resume" : true,
+                      "accessible_by_per_request_key" : true,
+                      "content_parts" : false,
+                      "temperature" : true,
+                      "cache" : false,
+                      "auto_caching" : false,
+                      "parallel_tool_calls" : true,
+                      "assistant_attachments_in_request" : false,
+                      "mcp" : false,
+                      "chat_completion" : true,
+                      "responses_api" : true,
+                      "max_tokens_supported" : true,
+                      "max_completion_tokens_supported" : false,
+                      "custom_temperature_supported" : true,
+                      "skills_supported" : false,
+                      "reasoning_efforts" : [ ]
+                    },
+                    "defaults" : { },
+                    "responses_defaults" : { },
+                    "description_keywords" : [ ],
+                    "max_retry_attempts" : 1,
+                    "interface_configs" : {
+                      "openaiChatCompletions" : {
+                        "features" : {
+                          "rate" : false,
+                          "tokenize" : false,
+                          "truncate_prompt" : false,
+                          "configuration" : false,
+                          "system_prompt" : true,
+                          "tools" : false,
+                          "seed" : false,
+                          "url_attachments" : false,
+                          "folder_attachments" : false,
+                          "allow_resume" : true,
+                          "accessible_by_per_request_key" : true,
+                          "content_parts" : false,
+                          "temperature" : true,
+                          "cache" : false,
+                          "auto_caching" : false,
+                          "parallel_tool_calls" : true,
+                          "assistant_attachments_in_request" : false,
+                          "mcp" : false,
+                          "chat_completion" : true,
+                          "responses_api" : false,
+                          "max_tokens_supported" : true,
+                          "max_completion_tokens_supported" : false,
+                          "custom_temperature_supported" : true,
+                          "skills_supported" : false,
+                          "reasoning_efforts" : [ ]
+                        },
+                        "defaults" : { },
+                        "default_headers" : { }
+                      },
+                      "openaiResponses" : {
+                        "features" : {
+                          "rate" : false,
+                          "tokenize" : false,
+                          "truncate_prompt" : false,
+                          "configuration" : false,
+                          "system_prompt" : true,
+                          "tools" : false,
+                          "seed" : false,
+                          "url_attachments" : false,
+                          "folder_attachments" : false,
+                          "allow_resume" : true,
+                          "accessible_by_per_request_key" : true,
+                          "content_parts" : false,
+                          "temperature" : true,
+                          "cache" : false,
+                          "auto_caching" : false,
+                          "parallel_tool_calls" : true,
+                          "assistant_attachments_in_request" : false,
+                          "mcp" : false,
+                          "chat_completion" : false,
+                          "responses_api" : true,
+                          "max_tokens_supported" : true,
+                          "max_completion_tokens_supported" : false,
+                          "custom_temperature_supported" : true,
+                          "skills_supported" : false,
+                          "reasoning_efforts" : [ ]
+                        },
+                        "defaults" : { },
+                        "default_headers" : { }
+                      }
+                    },
+                    "routes" : { }
+                  }, {
+                    "id" : "applications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/my-custom-application",
+                    "application" : "applications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/my-custom-application",
+                    "display_name" : "My Custom Application",
+                    "display_version" : "1.0",
+                    "icon_url" : "http://application1/icon.svg",
+                    "description" : "My Custom Application Description",
+                    "reference" : "@ignore",
+                    "owner" : "EPM-RTC-GPT",
+                    "object" : "application",
+                    "status" : "succeeded",
+                    "created_at" : "@ignore",
+                    "updated_at" : "@ignore",
+                    "features" : {
+                      "rate" : true,
+                      "tokenize" : false,
+                      "truncate_prompt" : false,
+                      "configuration" : true,
+                      "system_prompt" : true,
+                      "tools" : false,
+                      "seed" : false,
+                      "url_attachments" : false,
+                      "folder_attachments" : false,
+                      "allow_resume" : true,
+                      "accessible_by_per_request_key" : true,
+                      "content_parts" : false,
+                      "temperature" : true,
+                      "cache" : false,
+                      "auto_caching" : false,
+                      "parallel_tool_calls" : true,
+                      "assistant_attachments_in_request" : false,
+                      "mcp" : false,
+                      "chat_completion" : true,
+                      "responses_api" : false,
+                      "max_tokens_supported" : true,
+                      "max_completion_tokens_supported" : false,
+                      "custom_temperature_supported" : true,
+                      "skills_supported" : false,
+                      "reasoning_efforts" : [ ]
+                    },
+                    "defaults" : { },
+                    "responses_defaults" : { },
+                    "description_keywords" : [ ],
+                    "max_retry_attempts" : 1,
+                    "interface_configs" : {
+                      "openaiChatCompletions" : {
+                        "features" : {
+                          "rate" : true,
+                          "tokenize" : false,
+                          "truncate_prompt" : false,
+                          "configuration" : true,
+                          "system_prompt" : true,
+                          "tools" : false,
+                          "seed" : false,
+                          "url_attachments" : false,
+                          "folder_attachments" : false,
+                          "allow_resume" : true,
+                          "accessible_by_per_request_key" : true,
+                          "content_parts" : false,
+                          "temperature" : true,
+                          "cache" : false,
+                          "auto_caching" : false,
+                          "parallel_tool_calls" : true,
+                          "assistant_attachments_in_request" : false,
+                          "mcp" : false,
+                          "chat_completion" : true,
+                          "responses_api" : false,
+                          "max_tokens_supported" : true,
+                          "max_completion_tokens_supported" : false,
+                          "custom_temperature_supported" : true,
+                          "skills_supported" : false,
+                          "reasoning_efforts" : [ ]
+                        },
+                        "defaults" : { },
+                        "default_headers" : { }
+                      }
+                    },
+                    "routes" : { }
+                  } ],
+                  "object" : "list"
                 }
                 """);
     }
@@ -803,6 +1369,7 @@ public class CustomApplicationApiTest extends ResourceBaseTest {
                 "reference": "@ignore",
                 "forward_auth_token": false,
                 "defaults": {},
+                "responses_defaults": {},
                 "interceptors": [],
                 "description_keywords": [],
                 "max_retry_attempts" : 1,
@@ -829,6 +1396,7 @@ public class CustomApplicationApiTest extends ResourceBaseTest {
                 "reference": "@ignore",
                 "forward_auth_token": false,
                 "defaults": {},
+                "responses_defaults": {},
                 "interceptors": [],
                 "description_keywords": [],
                 "max_retry_attempts" : 1,
@@ -877,6 +1445,7 @@ public class CustomApplicationApiTest extends ResourceBaseTest {
                 "reference": "@ignore",
                 "forward_auth_token": false,
                 "defaults": {},
+                "responses_defaults": {},
                 "interceptors": [],
                 "description_keywords": [],
                 "max_retry_attempts" : 1,
@@ -944,6 +1513,7 @@ public class CustomApplicationApiTest extends ResourceBaseTest {
                   "reference": "@ignore",
                   "forward_auth_token" : false,
                   "defaults" : { },
+                  "responses_defaults" : { },
                   "interceptors" : [ ],
                   "description_keywords" : [ ],
                   "max_retry_attempts" : 1,
@@ -960,6 +1530,211 @@ public class CustomApplicationApiTest extends ResourceBaseTest {
                   "routes" : { }
                 }
                 """);
+
+        response = send(HttpMethod.GET, "/openai/applications/applications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/test_app_files", null, "");
+        verifyJsonNotExact(response, 200, """
+                {
+                  "id" : "applications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/test_app_files",
+                  "application" : "applications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/test_app_files",
+                  "display_name" : "test_app",
+                  "icon_url" : "https://mydial.somewhere.com/app-icon.svg",
+                  "description" : "My application description",
+                  "reference" : "@ignore",
+                  "owner" : "EPM-RTC-GPT",
+                  "object" : "application",
+                  "status" : "succeeded",
+                  "created_at" : "@ignore",
+                  "updated_at" : "@ignore",
+                  "features" : {
+                    "rate" : false,
+                    "tokenize" : false,
+                    "truncate_prompt" : false,
+                    "configuration" : false,
+                    "system_prompt" : true,
+                    "tools" : false,
+                    "seed" : false,
+                    "url_attachments" : false,
+                    "folder_attachments" : false,
+                    "allow_resume" : true,
+                    "accessible_by_per_request_key" : true,
+                    "content_parts" : false,
+                    "temperature" : true,
+                    "cache" : false,
+                    "auto_caching" : false,
+                    "parallel_tool_calls" : true,
+                    "assistant_attachments_in_request" : false,
+                    "mcp" : true,
+                    "chat_completion" : true,
+                    "responses_api" : false,
+                    "max_tokens_supported" : true,
+                    "max_completion_tokens_supported" : false,
+                    "custom_temperature_supported" : true,
+                    "skills_supported" : false,
+                    "reasoning_efforts" : [ ]
+                  },
+                  "defaults" : { },
+                  "responses_defaults" : { },
+                  "description_keywords" : [ ],
+                  "max_retry_attempts" : 1,
+                  "interface_configs" : {
+                    "openaiChatCompletions" : {
+                      "features" : {
+                        "rate" : false,
+                        "tokenize" : false,
+                        "truncate_prompt" : false,
+                        "configuration" : false,
+                        "system_prompt" : true,
+                        "tools" : false,
+                        "seed" : false,
+                        "url_attachments" : false,
+                        "folder_attachments" : false,
+                        "allow_resume" : true,
+                        "accessible_by_per_request_key" : true,
+                        "content_parts" : false,
+                        "temperature" : true,
+                        "cache" : false,
+                        "auto_caching" : false,
+                        "parallel_tool_calls" : true,
+                        "assistant_attachments_in_request" : false,
+                        "mcp" : false,
+                        "chat_completion" : true,
+                        "responses_api" : false,
+                        "max_tokens_supported" : true,
+                        "max_completion_tokens_supported" : false,
+                        "custom_temperature_supported" : true,
+                        "skills_supported" : false,
+                        "reasoning_efforts" : [ ]
+                      },
+                      "defaults" : { },
+                      "default_headers" : { }
+                    }
+                  },
+                  "application_properties" : {
+                    "property1" : "test property1"
+                  },
+                  "application_type_schema_id" : "https://mydial.somewhere.com/custom_application_schemas/specific_application_type",
+                  "routes" : {
+                    "data_sync" : {
+                      "rewritePath" : true,
+                      "paths" : [ "/v1/index/search" ],
+                      "methods" : [ "POST" ],
+                      "upstreams" : [ {
+                        "endpoint" : "http://localhost:4848",
+                        "weight" : 1,
+                        "tier" : 0,
+                        "authType" : "API_KEY"
+                      } ],
+                      "maxRetryAttempts" : 1,
+                      "order" : 5,
+                      "permissions" : [ "WRITE" ],
+                      "attachmentPaths" : {
+                        "requestBody" : [ ],
+                        "responseBody" : [ ]
+                      }
+                    }
+                  }
+                }
+                """);
+    }
+
+    /**
+     * Reproduces an orchestrator delegating to a schema-rich application that declares a private sub-deployment of its own:
+     * the second hop runs under a per-request key carrying only the parent, so the sub-deployment has to be resolved there.
+     */
+    @Test
+    void testChainedSchemaRichApplicationCanReachOwnDeployment() {
+        Response response = send(HttpMethod.GET, "/v1/bucket", null, "", "authorization", "user");
+        verify(response, 200);
+        String userBucket = new JsonObject(response.body()).getString("bucket");
+
+        String subAgentUrl = "applications/%s/sub_agent".formatted(userBucket);
+        String parentAgentUrl = "applications/%s/parent_agent".formatted(userBucket);
+
+        response = send(HttpMethod.PUT, "/v1/" + subAgentUrl, null, """
+                {
+                  "endpoint": "http://localhost:4848/chat/completions",
+                  "display_name": "Sub Agent",
+                  "display_version": "1.0"
+                }
+                """, "authorization", "user");
+        verify(response, 200);
+
+        response = send(HttpMethod.PUT, "/v1/" + parentAgentUrl, null, """
+                {
+                  "displayName": "Parent Agent",
+                  "applicationTypeSchemaId": "https://mydial.somewhere.com/custom_application_schemas/chained_application_type",
+                  "applicationProperties": {
+                    "property1": "test property1",
+                    "deployments": ["%s"]
+                  }
+                }
+                """.formatted(subAgentUrl), "authorization", "user");
+        verify(response, 200);
+
+        // the key the parent receives from an orchestrator: the parent is attached, its own sub-agent is not
+        ApiKeyData appKey = createAppKey("user", Map.of(parentAgentUrl, new AutoSharedData(Set.of(ResourceAccessType.READ))));
+        appKey.setExecutionPath(List.of("orchestrator"));
+        apiKeyStore.assignPerRequestApiKey(appKey);
+
+        try (TestWebServer server = new TestWebServer(4848)) {
+            server.map(HttpMethod.POST, "/chat/completions", request -> new MockResponse()
+                    .setResponseCode(200)
+                    .setHeader("Content-Type", "application/json")
+                    .setBody("{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion\",\"choices\":[]}"));
+
+            response = send(HttpMethod.POST, "/openai/deployments/%s/chat/completions".formatted(parentAgentUrl), null, """
+                    {"messages":[{"role":"user","content":"how are you?"}]}
+                    """, "api-key", appKey.getPerRequestKey(), "Content-Type", "application/json");
+
+            assertEquals(200, response.status());
+        }
+    }
+
+    /**
+     * Reproduces #2018: the owner calls an orchestrator whose sub-agent declares the owner's private prompt.
+     * The sub-agent runs under a per-request key carrying only itself, so the prompt has to be resolved there too.
+     */
+    @Test
+    void testChainedSchemaRichApplicationCanReachOwnPrompt() {
+        Response response = send(HttpMethod.GET, "/v1/bucket", null, "", "authorization", "user");
+        verify(response, 200);
+        String userBucket = new JsonObject(response.body()).getString("bucket");
+
+        String promptUrl = "prompts/%s/sub_agent_prompt".formatted(userBucket);
+        String subAgentUrl = "applications/%s/sub_agent_with_prompt".formatted(userBucket);
+
+        response = send(HttpMethod.PUT, "/v1/" + promptUrl, null, PROMPT_BODY, "authorization", "user");
+        verify(response, 200);
+
+        response = send(HttpMethod.PUT, "/v1/" + subAgentUrl, null, """
+                {
+                  "displayName": "Sub Agent",
+                  "applicationTypeSchemaId": "https://mydial.somewhere.com/custom_application_schemas/chained_application_type",
+                  "applicationProperties": {
+                    "property1": "test property1",
+                    "prompts": ["%s"]
+                  }
+                }
+                """.formatted(promptUrl), "authorization", "user");
+        verify(response, 200);
+
+        // the key the sub-agent receives from an orchestrator: the sub-agent is attached, its prompt is not
+        ApiKeyData appKey = createAppKey("user", Map.of(subAgentUrl, new AutoSharedData(Set.of(ResourceAccessType.READ))));
+        appKey.setExecutionPath(List.of("orchestrator"));
+        apiKeyStore.assignPerRequestApiKey(appKey);
+
+        try (TestWebServer server = new TestWebServer(4848)) {
+            server.map(HttpMethod.POST, "/chat/completions", request -> new MockResponse()
+                    .setResponseCode(200)
+                    .setHeader("Content-Type", "application/json")
+                    .setBody("{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion\",\"choices\":[]}"));
+
+            response = send(HttpMethod.POST, "/openai/deployments/%s/chat/completions".formatted(subAgentUrl), null, """
+                    {"messages":[{"role":"user","content":"how are you?"}]}
+                    """, "api-key", appKey.getPerRequestKey(), "Content-Type", "application/json");
+
+            assertEquals(200, response.status());
+        }
     }
 
     @Test
@@ -989,6 +1764,7 @@ public class CustomApplicationApiTest extends ResourceBaseTest {
                   "reference": "@ignore",
                   "forward_auth_token" : false,
                   "defaults" : { },
+                  "responses_defaults" : { },
                   "interceptors" : [ ],
                   "description_keywords" : [ ],
                   "max_retry_attempts" : 1,
@@ -1216,19 +1992,225 @@ public class CustomApplicationApiTest extends ResourceBaseTest {
                        "accessible_by_per_request_key" : true,
                        "content_parts" : false,
                        "temperature" : true,
-                       "addons" : true,
                        "cache" : false,
                        "auto_caching" : false,
-                       "parallel_tool_calls" : true
+                       "parallel_tool_calls" : true,
+                       "assistant_attachments_in_request": false,
+                       "mcp" : true,
+                       "chat_completion" : false,
+                       "responses_api" : false,
+                       "max_tokens_supported": true,
+                       "max_completion_tokens_supported": false,
+                       "custom_temperature_supported": true,
+                       "skills_supported": false,
+                       "reasoning_efforts": []
                      },
                      "defaults" : { },
+                     "responses_defaults" : { },
                      "description_keywords" : [ ],
                      "max_retry_attempts" : 1,
                      "invalid" : true,
                      "application_type_schema_id" : "https://mydial.somewhere.com/custom_application_schemas/specific_application_type",
-                     "routes" : { }                  
+                     "viewer_url" : "https://mydial.somewhere.com/custom_application_schemas/viewer",
+                     "routes" : { }
                 }
                 """);
     }
 
+    @Test
+    void testDeleteApplicationWithTypeSchema_WhenSchemaIsNotfound() {
+
+        Response response = send(HttpMethod.PUT, "/v1/applications/public/test_app_files", null, """
+                  {
+                      "displayName": "test_app",
+                      "applicationTypeSchemaId": "https://mydial.somewhere.com/custom_application_schemas/specific_application_type",
+                       "userRoles": [
+                            "Admin"
+                       ],
+                       "application_properties" : null,
+                       "forwardAuthToken": true,
+                       "iconUrl": "https://mydial.somewhere.com/app-icon.svg",
+                       "description": "My application description"
+                  }
+                """, "authorization", "admin");
+        Assertions.assertEquals(200, response.status());
+
+        dial.getProxy().getConfigStore().get()
+                .getApplicationTypeSchemas().remove("https://mydial.somewhere.com/custom_application_schemas/specific_application_type");
+
+        response = send(HttpMethod.DELETE, "/v1/applications/public/test_app_files", null, null, "authorization", "admin");
+        Assertions.assertEquals(200, response.status());
+    }
+
+
+    @SuppressWarnings("checkstyle:LineLength")
+    @DialConfigLocation("dial-config/global-interceptor-config.json")
+    @Test
+    void testAccessCustomApplicationWithGlobalInterceptor() throws IOException {
+        Response response = send(HttpMethod.PUT, "/v1/applications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/my-custom-application", null, """
+                {
+                "endpoint": "http://localhost:4848/chat/completions",
+                "display_name": "My Custom Application",
+                "display_version": "1.0",
+                "icon_url": "http://application1/icon.svg",
+                "description": "My Custom Application Description"
+                }
+                """);
+        verify(response, 200);
+
+        String responseBody = """
+                data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1687780896,"model":"gpt-35-turbo","choices":[{"index":0,"finish_reason":null,"delta":{"content":"this is a"}}],"usage":null}\r
+                data: {"id":"chatcmpl-2","object":"chat.completion.chunk","created":1687780896,"model":"gpt-35-turbo","choices":[{"index":0,"finish_reason":null,"delta":{"content":"very long long"}}],"usage":null}\r
+                data: {"id":"chatcmpl-3","object":"chat.completion.chunk","created":1687780896,"model":"gpt-35-turbo","choices":[{"index":0,"finish_reason":null,"delta":{"content":"answer"}}],"usage":null}\r
+                data: {"id":"chatcmpl-4","object":"chat.completion.chunk","created":1687780896,"model":"gpt-35-turbo","choices":[{"index":0,"finish_reason":"stop","delta":{}}], "usage":{"completion_tokens": 20, "prompt_tokens": 20, "total_tokens": 40}}\r
+                data: [DONE]\r
+                """;
+        AtomicReference<String> capturedInterceptorBody = new AtomicReference<>();
+        try (TestWebServer server = new TestWebServer(4848)) {
+            TestWebServer.Handler chatCompletionHandler = request -> {
+                MockResponse mockResponse = new MockResponse();
+                mockResponse.setResponseCode(200);
+                mockResponse.setChunkedBody(responseBody, 200);
+                return mockResponse;
+            };
+            TestWebServer.Handler interceptorHandler = request -> {
+                try {
+                    capturedInterceptorBody.set(request.getBody().readUtf8());
+                    var nextInterceptorRequest = createHttpUriRequest(serverPort,
+                            "interceptor", request.getHeader("api-key"));
+                    var appResponse = client.execute(nextInterceptorRequest, ResourceBaseTest::toResponse);
+                    MockResponse mockResponse = new MockResponse();
+                    mockResponse.setResponseCode(appResponse.status());
+                    mockResponse.setChunkedBody(appResponse.body(), 200);
+                    return mockResponse;
+                } catch (Throwable error) {
+                    MockResponse mockResponse = new MockResponse();
+                    mockResponse.setResponseCode(500);
+                    mockResponse.setBody(error.getMessage());
+                    return mockResponse;
+                }
+            };
+            server.map(HttpMethod.POST, "/chat/completions", chatCompletionHandler);
+            server.map(HttpMethod.POST, "/interceptor/handle", interceptorHandler);
+            var request = createHttpUriRequest(serverPort,
+                    "applications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/my-custom-application", "proxyKey1");
+            response = client.execute(request, ResourceBaseTest::toResponse);
+            verify(response, 200);
+
+            assertEquals("""
+                    {"model":"gpt-3-turbo","stream":true,"messages":[{"content":"how are you?","role":"user"}]}""",
+                    capturedInterceptorBody.get());
+        }
+    }
+
+    @Test
+    public void testCreateMcpCompatibleApplication() {
+        var response = send(HttpMethod.PUT, "/v1/applications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/my%20app", null, """
+                {
+                "display_name": "My App",
+                "display_version": "1.0",
+                "icon_url": "http://apprunner/icon.svg",
+                "description": "My app Description",
+                "mcp": {
+                  "endpoint": "http://localhost:7878/mcp",
+                  "transport": "HTTP"
+                  }
+                }
+                """);
+        verify(response, 200);
+    }
+
+    @Test
+    void testMcpCall() {
+        var response = send(HttpMethod.PUT, "/v1/applications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/my%20app", null, """
+                {
+                "displayName": "Test Application",
+                "description": "For testing purposes only",
+                "endpoint": "http://<app host>/openai/deployments/test-app/chat/completions",
+                "forwardAuthToken": true
+                }
+                """);
+        verify(response, 200);
+
+        String mcpRequest = """
+                {
+                   "payload": "foo"
+                }
+                """;
+
+        Response resp = send(HttpMethod.POST, "/v1/deployments/applications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/my%20app/mcp",
+                null, mcpRequest, "Content-type", "application/json");
+        // application doesn't support MCP interface
+        assertEquals(400, resp.status());
+
+        response = send(HttpMethod.PUT, "/v1/applications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/my%20app", null, """
+                {
+                "display_name": "My App",
+                "display_version": "1.0",
+                "icon_url": "http://apprunner/icon.svg",
+                "description": "My app Description",
+                "applicationTypeSchemaId": "https://mydial.somewhere.com/custom_application_schemas/specific_toolset_type",
+                "applicationProperties": {
+                  "property1": "foo",
+                  "property2": "bar"
+                  }
+                }
+                """);
+        verify(response, 200);
+
+        response = send(HttpMethod.GET, "/openai/applications/applications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/my%20app");
+        verifyNotExact(response, 200, "\"mcp\":true");
+
+        String mcpResponse = """
+                {
+                  "result": "success"
+                }
+                """;
+        TestWebServer.Handler handler = request -> {
+            try {
+                assertNotNull(request.getHeader(Proxy.HEADER_API_KEY));
+                String body = request.getBody().readString(StandardCharsets.UTF_8);
+                JsonNode tree = ProxyUtil.MAPPER.readTree(body);
+                String basePath = "params._meta.ai_dial_config";
+                JsonNode node = JsonUtil.read(tree, basePath + ".property1");
+                assertNotNull(node);
+                assertEquals("foo", node.asText());
+                node = JsonUtil.read(tree, basePath + ".property2");
+                assertNotNull(node);
+                assertEquals("bar", node.asText());
+                return new MockResponse().setBody(mcpResponse).setHeader("Content-Type", "application/json");
+            } catch (Throwable e) {
+                return new MockResponse().setResponseCode(500);
+            }
+        };
+        try (TestWebServer ignore = new TestWebServer(9876, handler)) {
+            resp = send(HttpMethod.POST, "/v1/deployments/applications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/my%20app/mcp",
+                    null, mcpRequest, "Content-type", "application/json");
+
+            assertEquals(200, resp.status());
+            assertEquals(mcpResponse, resp.body());
+        }
+    }
+
+
+    private HttpUriRequest createHttpUriRequest(int port, String deployment, String apiKey) {
+        String uri = "http://127.0.0.1:" + port + "/openai/deployments/" + deployment + "/chat/completions";
+        String requestBody = """
+                {
+                   "model": "gpt-3-turbo",
+                   "stream": true,
+                   "messages": [
+                     {
+                       "content": "how are you?",
+                       "role": "user"
+                     }
+                   ]
+                 }
+                """;
+        HttpUriRequest httpUriRequest = new HttpUriRequestBase(HttpMethod.POST.name(), URI.create(uri));
+        httpUriRequest.setHeader("api-key", apiKey);
+        httpUriRequest.setHeader("content-type", "application/json");
+        httpUriRequest.setEntity(new StringEntity(requestBody));
+        return httpUriRequest;
+    }
 }

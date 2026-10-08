@@ -2,7 +2,6 @@ package com.epam.aidial.core.server.service;
 
 import com.epam.aidial.core.server.ProxyContext;
 import com.epam.aidial.core.server.data.Publication;
-import com.epam.aidial.core.server.data.ResourceTypes;
 import com.epam.aidial.core.server.data.Rule;
 import com.epam.aidial.core.server.security.RuleMatcher;
 import com.epam.aidial.core.server.util.ProxyUtil;
@@ -11,6 +10,7 @@ import com.epam.aidial.core.storage.data.MetadataBase;
 import com.epam.aidial.core.storage.data.ResourceFolderMetadata;
 import com.epam.aidial.core.storage.data.ResourceItemMetadata;
 import com.epam.aidial.core.storage.resource.ResourceDescriptor;
+import com.epam.aidial.core.storage.resource.ResourceTypes;
 import com.epam.aidial.core.storage.service.ResourceService;
 import com.epam.aidial.core.storage.util.EtagHeader;
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -125,15 +125,13 @@ public class RuleService {
     }
 
     private Map<String, List<Rule>> getCachedRules() {
-        ResourceItemMetadata meta = resources.getResourceMetadata(PUBLIC_RULES);
-        long key = (meta == null) ? Long.MIN_VALUE : meta.getUpdatedAt();
+        Pair<ResourceItemMetadata, String> resource = resources.getResourceWithMetadata(PUBLIC_RULES, EtagHeader.ANY);
+        long key = (resource == null) ? Long.MIN_VALUE : resource.getKey().getUpdatedAt();
         Pair<Long, Map<String, List<Rule>>> current = cachedRules.get();
 
         if (current == null || current.getKey() != key) {
-            Pair<ResourceItemMetadata, String> resource = resources.getResourceWithMetadata(PUBLIC_RULES, EtagHeader.ANY);
-            Pair<Long, Map<String, List<Rule>>> next = (resource == null)
-                    ? Pair.of(Long.MIN_VALUE, decodeRules(null))
-                    : Pair.of(resource.getKey().getUpdatedAt(), decodeRules(resource.getValue()));
+            Map<String, List<Rule>> decoded = decodeRules(resource == null ? null : resource.getValue());
+            Pair<Long, Map<String, List<Rule>>> next = Pair.of(key, decoded);
 
             cachedRules.compareAndSet(current, next);
             current = next;

@@ -6,19 +6,27 @@ import com.epam.aidial.core.config.Route;
 import com.epam.aidial.core.server.config.ConfigStore;
 import com.epam.aidial.core.server.controller.HealthCheckController;
 import com.epam.aidial.core.server.data.ApiKeyData;
+import com.epam.aidial.core.server.data.ApiKeyValidation;
 import com.epam.aidial.core.server.limiter.RateLimiter;
 import com.epam.aidial.core.server.log.LogStore;
 import com.epam.aidial.core.server.security.AccessTokenValidator;
 import com.epam.aidial.core.server.security.ApiKeyStore;
 import com.epam.aidial.core.server.security.ExtractedClaims;
+import com.epam.aidial.core.server.security.IdpNotFoundException;
 import com.epam.aidial.core.server.service.WellKnownResourceMetadataService;
+import com.epam.aidial.core.server.tracing.TracingSettings;
+import com.epam.aidial.core.server.util.ProxyUtil;
 import com.epam.aidial.core.storage.blobstore.BlobStorage;
 import com.epam.aidial.core.storage.http.HttpException;
 import com.epam.aidial.core.storage.service.ResourceService;
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.api.trace.SpanContext;
+import io.opentelemetry.api.trace.TraceFlags;
 import io.vertx.core.Future;
 import io.vertx.core.MultiMap;
 import io.vertx.core.Vertx;
 import io.vertx.core.http.HttpClient;
+import io.vertx.core.http.HttpConnection;
 import io.vertx.core.http.HttpHeaders;
 import io.vertx.core.http.HttpMethod;
 import io.vertx.core.http.HttpServerRequest;
@@ -57,7 +65,9 @@ import static com.epam.aidial.core.storage.http.HttpStatus.UNAUTHORIZED;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.mockStatic;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -95,6 +105,12 @@ public class ProxyTest {
     @Mock
     private HttpServerResponse response;
 
+    @Mock
+    private ApiKeyValidation apiKeyValidation;
+
+    @Mock
+    private TracingSettings tracingSettings;
+
     @InjectMocks
     private Proxy proxy;
 
@@ -108,6 +124,8 @@ public class ProxyTest {
         when(request.getHeader(HttpHeaders.ACCESS_CONTROL_REQUEST_METHOD)).thenReturn(null);
         when(request.getHeader(HttpHeaders.ACCESS_CONTROL_REQUEST_HEADERS)).thenReturn(null);
         when(response.setStatusCode(anyInt())).thenReturn(response);
+        HttpConnection httpConnection = mock(HttpConnection.class);
+        when(request.connection()).thenReturn(httpConnection);
 
         // Mock params() to avoid NullPointerException in error handling
         MultiMap params = mock(MultiMap.class);
@@ -192,6 +210,103 @@ public class ProxyTest {
         verify(response).setStatusCode(UNAUTHORIZED.getCode());
     }
 
+    @Test
+    public void testHandle_ResponseTraceHeadersAreReturnedWhenEnabled() {
+        when(tracingSettings.responseTraceHeaders()).thenReturn(true);
+        when(request.version()).thenReturn(HttpVersion.HTTP_1_1);
+        when(request.method()).thenReturn(HttpMethod.GET);
+        MultiMap headers = mock(MultiMap.class);
+        when(request.headers()).thenReturn(headers);
+        when(request.path()).thenReturn("/foo");
+
+        try (var ignored = mockStatic(Span.class)) {
+            Span span = mock(Span.class);
+            SpanContext spanContext = mock(SpanContext.class);
+            TraceFlags traceFlags = mock(TraceFlags.class);
+            when(span.getSpanContext()).thenReturn(spanContext);
+            when(spanContext.isValid()).thenReturn(true);
+            when(spanContext.getTraceId()).thenReturn("11111111111111111111111111111111");
+            when(spanContext.getSpanId()).thenReturn("2222222222222222");
+            when(spanContext.getTraceFlags()).thenReturn(traceFlags);
+            when(traceFlags.asHex()).thenReturn("01");
+            when(Span.current()).thenReturn(span);
+
+            proxy.handle(request);
+
+            verify(response).putHeader(Proxy.HEADER_DIAL_TRACE_ID, "11111111111111111111111111111111");
+            verify(response).putHeader(Proxy.HEADER_DIAL_SPAN_ID, "2222222222222222");
+            verify(response).putHeader(Proxy.HEADER_TRACEPARENT,
+                    "00-11111111111111111111111111111111-2222222222222222-01");
+            verify(response).putHeader(HttpHeaders.ACCESS_CONTROL_EXPOSE_HEADERS,
+                    "traceparent, X-DIAL-TRACE-ID, X-DIAL-SPAN-ID");
+        }
+    }
+
+    @Test
+    public void testHandle_TraceHeadersCoverShortCircuitedPaths() {
+        // /health returns before the request ever reaches a controller, and used to carry no trace id
+        when(tracingSettings.responseTraceHeaders()).thenReturn(true);
+        when(request.version()).thenReturn(HttpVersion.HTTP_1_1);
+        when(request.method()).thenReturn(HttpMethod.GET);
+        when(request.path()).thenReturn(Proxy.HEALTH_CHECK_PATH);
+
+        try (var ignored = mockStatic(Span.class)) {
+            Span span = mock(Span.class);
+            SpanContext spanContext = mock(SpanContext.class);
+            TraceFlags traceFlags = mock(TraceFlags.class);
+            when(span.getSpanContext()).thenReturn(spanContext);
+            when(spanContext.isValid()).thenReturn(true);
+            when(spanContext.getTraceId()).thenReturn("11111111111111111111111111111111");
+            when(spanContext.getSpanId()).thenReturn("2222222222222222");
+            when(spanContext.getTraceFlags()).thenReturn(traceFlags);
+            when(traceFlags.asHex()).thenReturn("01");
+            when(Span.current()).thenReturn(span);
+
+            proxy.handle(request);
+
+            verify(response).putHeader(Proxy.HEADER_TRACEPARENT,
+                    "00-11111111111111111111111111111111-2222222222222222-01");
+        }
+    }
+
+    @Test
+    public void testHandle_TraceHeadersAreOmittedWithoutValidSpanContext() {
+        // no SDK attached: the ids are all-zeros and a traceparent built from them would be malformed
+        when(tracingSettings.responseTraceHeaders()).thenReturn(true);
+        when(request.version()).thenReturn(HttpVersion.HTTP_1_1);
+        when(request.method()).thenReturn(HttpMethod.GET);
+        MultiMap headers = mock(MultiMap.class);
+        when(request.headers()).thenReturn(headers);
+        when(request.path()).thenReturn("/foo");
+
+        try (var ignored = mockStatic(Span.class)) {
+            Span span = mock(Span.class);
+            SpanContext spanContext = mock(SpanContext.class);
+            when(span.getSpanContext()).thenReturn(spanContext);
+            when(spanContext.isValid()).thenReturn(false);
+            when(Span.current()).thenReturn(span);
+
+            proxy.handle(request);
+
+            verify(response, never()).putHeader(eq(Proxy.HEADER_TRACEPARENT), anyString());
+            verify(response, never()).putHeader(eq(Proxy.HEADER_DIAL_TRACE_ID), anyString());
+        }
+    }
+
+    @Test
+    public void testHandle_ResponseTraceHeadersAreOmittedWhenDisabled() {
+        when(request.version()).thenReturn(HttpVersion.HTTP_1_1);
+        when(request.method()).thenReturn(HttpMethod.GET);
+        MultiMap headers = mock(MultiMap.class);
+        when(request.headers()).thenReturn(headers);
+        when(request.path()).thenReturn("/foo");
+
+        proxy.handle(request);
+
+        verify(response, never()).putHeader(eq(Proxy.HEADER_DIAL_TRACE_ID), anyString());
+        verify(response, never()).putHeader(eq(Proxy.HEADER_DIAL_SPAN_ID), anyString());
+    }
+
     @ParameterizedTest
     @ValueSource(strings = {"GET", "POST"})
     public void testHandle_MissingApiKeyAndToken_PathMatchesToolsetProxyPattern(String method) {
@@ -200,6 +315,22 @@ public class ProxyTest {
         MultiMap headers = mock(MultiMap.class);
         when(request.headers()).thenReturn(headers);
         when(request.path()).thenReturn("/v1/toolset/test/mcp");
+        when(resourceMetadataService.resolveResourceMetadataPath(request)).thenReturn(Optional.of("example.com"));
+
+        proxy.handle(request);
+
+        verify(response).setStatusCode(UNAUTHORIZED.getCode());
+        verify(response).putHeader("WWW-Authenticate", "Bearer resource_metadata=\"example.com\"");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"GET", "POST"})
+    public void testHandle_MissingApiKeyAndToken_PathMatchesApplicationMcpProxyPattern(String method) {
+        when(request.version()).thenReturn(HttpVersion.HTTP_1_1);
+        when(request.method()).thenReturn(HttpMethod.valueOf(method));
+        MultiMap headers = mock(MultiMap.class);
+        when(request.headers()).thenReturn(headers);
+        when(request.path()).thenReturn("/v1/deployments/test-app/mcp");
         when(resourceMetadataService.resolveResourceMetadataPath(request)).thenReturn(Optional.of("example.com"));
 
         proxy.handle(request);
@@ -222,7 +353,7 @@ public class ProxyTest {
 
         Config config = new Config();
         when(configStore.get()).thenReturn(config);
-        when(apiKeyStore.getApiKeyData(anyString())).thenReturn(Future.failedFuture(new HttpException(UNAUTHORIZED, "Unknown API key")));
+        when(apiKeyStore.getApiKeyData(anyString(), isNull())).thenReturn(Future.failedFuture(new HttpException(UNAUTHORIZED, "Unknown API key")));
 
         proxy.handle(request);
 
@@ -244,7 +375,7 @@ public class ProxyTest {
         Config config = new Config();
         when(configStore.get()).thenReturn(config);
         ApiKeyData apiKeyData = new ApiKeyData();
-        when(apiKeyStore.getApiKeyData(anyString())).thenReturn(Future.succeededFuture(apiKeyData));
+        when(apiKeyStore.getApiKeyData(anyString(), isNull())).thenReturn(Future.succeededFuture(apiKeyData));
 
         proxy.handle(request);
 
@@ -252,51 +383,36 @@ public class ProxyTest {
     }
 
     @Test
-    public void testHandle_BothApiKeyAndToken_CallerIsNotInterceptor_1() {
+    public void testHandle_BothApiKeyAndToken_WithPerRequestKey() {
         when(request.version()).thenReturn(HttpVersion.HTTP_1_1);
         when(request.method()).thenReturn(HttpMethod.GET);
         MultiMap headers = mock(MultiMap.class);
         when(request.headers()).thenReturn(headers);
         when(request.getHeader(eq(HttpHeaders.CONTENT_TYPE))).thenReturn(null);
         when(request.getHeader(eq(HttpHeaders.AUTHORIZATION))).thenReturn("bearer token");
-        when(headers.get(eq(HEADER_API_KEY))).thenReturn("api-key");
+        when(headers.get(eq(HEADER_API_KEY))).thenReturn("per-request-key");
         when(headers.get(eq(HttpHeaders.CONTENT_LENGTH))).thenReturn(Integer.toString(512));
         when(request.path()).thenReturn("/foo");
 
         Config config = new Config();
+        Route route = new Route();
+        route.setMethods(Set.of("GET"));
+        route.setName("route");
+        route.setPaths(List.of(Pattern.compile("/foo")));
+        route.setResponse(new Route.Response());
+        LinkedHashMap<String, Route> routes = new LinkedHashMap<>();
+        routes.put("route", route);
+        config.setRoutes(routes);
         when(configStore.get()).thenReturn(config);
         ApiKeyData apiKeyData = new ApiKeyData();
-        apiKeyData.setPerRequestKey("per-request_key");
-        when(apiKeyStore.getApiKeyData(anyString())).thenReturn(Future.succeededFuture(apiKeyData));
+        Key originalKey = new Key();
+        apiKeyData.setOriginalKey(originalKey);
+        apiKeyData.setPerRequestKey("per-request-key");
+        when(apiKeyStore.getApiKeyData("per-request-key", null)).thenReturn(Future.succeededFuture(apiKeyData));
 
         proxy.handle(request);
 
-        verify(response).setStatusCode(BAD_REQUEST.getCode());
-    }
-
-    @Test
-    public void testHandle_BothApiKeyAndToken_CallerIsNotInterceptor_2() {
-        when(request.version()).thenReturn(HttpVersion.HTTP_1_1);
-        when(request.method()).thenReturn(HttpMethod.GET);
-        MultiMap headers = mock(MultiMap.class);
-        when(request.headers()).thenReturn(headers);
-        when(request.getHeader(eq(HttpHeaders.CONTENT_TYPE))).thenReturn(null);
-        when(request.getHeader(eq(HttpHeaders.AUTHORIZATION))).thenReturn("bearer token");
-        when(headers.get(eq(HEADER_API_KEY))).thenReturn("api-key");
-        when(headers.get(eq(HttpHeaders.CONTENT_LENGTH))).thenReturn(Integer.toString(512));
-        when(request.path()).thenReturn("/foo");
-
-        Config config = new Config();
-        when(configStore.get()).thenReturn(config);
-        ApiKeyData apiKeyData = new ApiKeyData();
-        apiKeyData.setPerRequestKey("per-request_key");
-        apiKeyData.setInterceptors(List.of("interceptor1", "interceptor2"));
-        apiKeyData.setInterceptorIndex(2);
-        when(apiKeyStore.getApiKeyData(anyString())).thenReturn(Future.succeededFuture(apiKeyData));
-
-        proxy.handle(request);
-
-        verify(response).setStatusCode(BAD_REQUEST.getCode());
+        verify(response).setStatusCode(OK.getCode());
     }
 
     @Test
@@ -329,7 +445,7 @@ public class ProxyTest {
         apiKeyData.setInterceptorIndex(1);
         Key originalKey = new Key();
         apiKeyData.setOriginalKey(originalKey);
-        when(apiKeyStore.getApiKeyData(anyString())).thenReturn(Future.succeededFuture(apiKeyData));
+        when(apiKeyStore.getApiKeyData(anyString(), isNull())).thenReturn(Future.succeededFuture(apiKeyData));
 
         proxy.handle(request);
 
@@ -349,7 +465,7 @@ public class ProxyTest {
         Config config = new Config();
         config.setKeys(Map.of("key1", new Key()));
         when(configStore.get()).thenReturn(config);
-        when(apiKeyStore.getApiKeyData(anyString())).thenReturn(Future.failedFuture(new HttpException(UNAUTHORIZED, "Api key is not found")));
+        when(apiKeyStore.getApiKeyData(anyString(), isNull())).thenReturn(Future.failedFuture(new HttpException(UNAUTHORIZED, "Api key is not found")));
 
         when(request.response()).thenReturn(response);
         when(response.ended()).thenReturn(false);
@@ -388,7 +504,7 @@ public class ProxyTest {
         Key originalKey = new Key();
         apiKeyData.setOriginalKey(originalKey);
         when(accessTokenValidator.extractClaims(anyString())).thenReturn(Future.failedFuture(new RuntimeException()));
-        when(apiKeyStore.getApiKeyData("key1")).thenReturn(Future.succeededFuture(apiKeyData));
+        when(apiKeyStore.getApiKeyData("key1", null)).thenReturn(Future.succeededFuture(apiKeyData));
 
         proxy.handle(request);
 
@@ -423,13 +539,14 @@ public class ProxyTest {
         ApiKeyData apiKeyData = new ApiKeyData();
         Key originalKey = new Key();
         apiKeyData.setOriginalKey(originalKey);
-        ExtractedClaims extractedClaims = new ExtractedClaims("sub", List.of("role1"), "hash", Map.of(), null, null);
+        ExtractedClaims extractedClaims = new ExtractedClaims("sub", List.of("role1"), "hash",
+                ProxyUtil.MAPPER.createObjectNode(), null, null);
         when(accessTokenValidator.extractClaims(anyString())).thenReturn(Future.succeededFuture(extractedClaims));
 
         proxy.handle(request);
 
         verify(response).setStatusCode(OK.getCode());
-        verify(apiKeyStore, never()).getApiKeyData(anyString());
+        verify(apiKeyStore, never()).getApiKeyData(anyString(), anyString());
     }
 
     @Test
@@ -460,7 +577,7 @@ public class ProxyTest {
         Key originalKey = new Key();
         apiKeyData.setOriginalKey(originalKey);
         when(accessTokenValidator.extractClaims(anyString())).thenReturn(Future.failedFuture(new RuntimeException()));
-        when(apiKeyStore.getApiKeyData(anyString())).thenReturn(Future.failedFuture(new HttpException(UNAUTHORIZED, "Unknown API key")));
+        when(apiKeyStore.getApiKeyData(anyString(), isNull())).thenReturn(Future.failedFuture(new HttpException(UNAUTHORIZED, "Unknown API key")));
 
         proxy.handle(request);
 
@@ -483,7 +600,7 @@ public class ProxyTest {
         config.setKeys(Map.of("key1", new Key()));
         when(configStore.get()).thenReturn(config);
         when(accessTokenValidator.extractClaims(anyString())).thenReturn(Future.failedFuture(new HttpException(UNAUTHORIZED, "Bad Authorization header")));
-        when(apiKeyStore.getApiKeyData(anyString())).thenReturn(Future.failedFuture(new HttpException(UNAUTHORIZED, "Unknown API key")));
+        when(apiKeyStore.getApiKeyData(anyString(), isNull())).thenReturn(Future.failedFuture(new HttpException(UNAUTHORIZED, "Unknown API key")));
         when(request.response()).thenReturn(response);
         when(response.ended()).thenReturn(false);
 
@@ -517,7 +634,7 @@ public class ProxyTest {
         ApiKeyData apiKeyData = new ApiKeyData();
         Key originalKey = new Key();
         apiKeyData.setOriginalKey(originalKey);
-        when(apiKeyStore.getApiKeyData("key1")).thenReturn(Future.succeededFuture(apiKeyData));
+        when(apiKeyStore.getApiKeyData("key1", null)).thenReturn(Future.succeededFuture(apiKeyData));
 
         proxy.handle(request);
 
@@ -550,7 +667,7 @@ public class ProxyTest {
         ApiKeyData apiKeyData = new ApiKeyData();
         Key originalKey = new Key();
         apiKeyData.setOriginalKey(originalKey);
-        when(apiKeyStore.getApiKeyData("key1")).thenReturn(Future.succeededFuture(apiKeyData));
+        when(apiKeyStore.getApiKeyData("key1", null)).thenReturn(Future.succeededFuture(apiKeyData));
 
         proxy.handle(request);
 
@@ -579,7 +696,8 @@ public class ProxyTest {
         routes.put("route", route);
         config.setRoutes(routes);
         when(configStore.get()).thenReturn(config);
-        ExtractedClaims extractedClaims = new ExtractedClaims("sub", List.of("role1"), "hash", Map.of(), null, null);
+        ExtractedClaims extractedClaims = new ExtractedClaims("sub", List.of("role1"), "hash",
+                ProxyUtil.MAPPER.createObjectNode(), null, null);
         when(accessTokenValidator.extractClaims(anyString())).thenReturn(Future.succeededFuture(extractedClaims));
 
         proxy.handle(request);
@@ -615,6 +733,38 @@ public class ProxyTest {
         proxy.handle(request);
 
         verify(response).setStatusCode(UNAUTHORIZED.getCode());
+    }
+
+    @Test
+    public void testHandle_WrongAccessTokenTreatedAsKey() {
+        when(request.version()).thenReturn(HttpVersion.HTTP_1_1);
+        when(request.method()).thenReturn(HttpMethod.GET);
+        MultiMap headers = mock(MultiMap.class);
+        when(request.headers()).thenReturn(headers);
+        when(request.getHeader(eq(HttpHeaders.CONTENT_TYPE))).thenReturn(null);
+        when(request.getHeader(eq(HttpHeaders.AUTHORIZATION))).thenReturn("bearer key1");
+        when(headers.get(eq(HttpHeaders.CONTENT_LENGTH))).thenReturn(Integer.toString(512));
+        when(request.path()).thenReturn("/foo");
+
+        Config config = new Config();
+        Route route = new Route();
+        route.setMethods(Set.of("GET"));
+        route.setName("route");
+        route.setPaths(List.of(Pattern.compile("/foo")));
+        route.setResponse(new Route.Response());
+        LinkedHashMap<String, Route> routes = new LinkedHashMap<>();
+        routes.put("route", route);
+        config.setRoutes(routes);
+        when(configStore.get()).thenReturn(config);
+        when(accessTokenValidator.extractClaims(anyString())).thenReturn(Future.failedFuture(new IdpNotFoundException("IdP is not found")));
+        ApiKeyData apiKeyData = new ApiKeyData();
+        Key originalKey = new Key();
+        apiKeyData.setOriginalKey(originalKey);
+        when(apiKeyStore.getApiKeyData("key1", null)).thenReturn(Future.succeededFuture(apiKeyData));
+
+        proxy.handle(request);
+
+        verify(response).setStatusCode(OK.getCode());
     }
 
     @Test

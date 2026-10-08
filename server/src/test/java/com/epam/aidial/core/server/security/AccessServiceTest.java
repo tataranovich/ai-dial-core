@@ -5,12 +5,13 @@ import com.epam.aidial.core.config.Deployment;
 import com.epam.aidial.core.config.ResourceAccessType;
 import com.epam.aidial.core.server.ProxyContext;
 import com.epam.aidial.core.server.data.ApiKeyData;
-import com.epam.aidial.core.server.data.ResourceTypes;
 import com.epam.aidial.core.server.service.ApplicationSchemaService;
 import com.epam.aidial.core.server.service.RuleService;
 import com.epam.aidial.core.server.service.ShareService;
 import com.epam.aidial.core.server.util.BucketBuilder;
+import com.epam.aidial.core.server.util.ProxyUtil;
 import com.epam.aidial.core.storage.resource.ResourceDescriptor;
+import com.epam.aidial.core.storage.resource.ResourceTypes;
 import io.vertx.core.json.JsonObject;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -50,7 +51,7 @@ public class AccessServiceTest {
         ApiKeyData apiKeyData = new ApiKeyData();
         apiKeyData.setPerRequestKey("key");
         when(context.getApiKeyData()).thenReturn(apiKeyData);
-        when(context.getUserSub()).thenReturn("user");
+        when(context.getUserId()).thenReturn("user");
         when(context.getSourceDeployment()).thenReturn("source");
         ResourceDescriptor descriptor = new ResourceDescriptor(ResourceTypes.FILE, null, List.of(), "bucket", "Users/user/", true);
 
@@ -65,7 +66,7 @@ public class AccessServiceTest {
         ApiKeyData apiKeyData = new ApiKeyData();
         apiKeyData.setPerRequestKey("key");
         when(context.getApiKeyData()).thenReturn(apiKeyData);
-        when(context.getUserSub()).thenReturn("user");
+        when(context.getUserId()).thenReturn("user");
         when(context.getSourceDeployment()).thenReturn("source");
         ResourceDescriptor descriptor = new ResourceDescriptor(ResourceTypes.FILE, null, List.of("folder"), "bucket", "Users/user/", true);
 
@@ -80,7 +81,7 @@ public class AccessServiceTest {
         ApiKeyData apiKeyData = new ApiKeyData();
         apiKeyData.setPerRequestKey("key");
         when(context.getApiKeyData()).thenReturn(apiKeyData);
-        when(context.getUserSub()).thenReturn("user");
+        when(context.getUserId()).thenReturn("user");
         when(context.getSourceDeployment()).thenReturn("source");
         ResourceDescriptor descriptor = new ResourceDescriptor(ResourceTypes.FILE, "file.json", List.of(), "bucket", "Users/user/", false);
 
@@ -95,7 +96,7 @@ public class AccessServiceTest {
         ApiKeyData apiKeyData = new ApiKeyData();
         apiKeyData.setPerRequestKey("key");
         when(context.getApiKeyData()).thenReturn(apiKeyData);
-        when(context.getUserSub()).thenReturn("user");
+        when(context.getUserId()).thenReturn("user");
         when(context.getSourceDeployment()).thenReturn("app");
         ResourceDescriptor descriptor = new ResourceDescriptor(ResourceTypes.FILE, "file.json", List.of("appdata", "app"), "bucket", "Users/user/", false);
 
@@ -111,7 +112,7 @@ public class AccessServiceTest {
         ApiKeyData apiKeyData = new ApiKeyData();
         apiKeyData.setPerRequestKey("key");
         when(context.getApiKeyData()).thenReturn(apiKeyData);
-        when(context.getUserSub()).thenReturn("user");
+        when(context.getUserId()).thenReturn("user");
         when(context.getSourceDeployment()).thenReturn("app");
         ResourceDescriptor descriptor = new ResourceDescriptor(ResourceTypes.FILE, "app", List.of("appdata"), "bucket", "Users/user/", true);
 
@@ -127,7 +128,7 @@ public class AccessServiceTest {
         ApiKeyData apiKeyData = new ApiKeyData();
         apiKeyData.setPerRequestKey("key");
         when(context.getApiKeyData()).thenReturn(apiKeyData);
-        when(context.getUserSub()).thenReturn("user");
+        when(context.getUserId()).thenReturn("user");
         when(context.getSourceDeployment()).thenReturn("test app");
         ResourceDescriptor descriptor = new ResourceDescriptor(ResourceTypes.FILE, "file.json", List.of("appdata", "test app"), "bucket", "Users/user/", false);
 
@@ -308,11 +309,185 @@ public class AccessServiceTest {
     }
 
     @Test
+    public void testGetOwnResourcesAccessForChainedSchemaRichApplication_DeclaredDeployment() {
+        Application application = mock(Application.class);
+        when(application.hasApplicationTypeSchemaId()).thenReturn(true);
+        when(context.getDeployment()).thenReturn(application);
+
+        String initiatorBucket = "Users/user-sub-id/";
+        ResourceDescriptor subAgent =
+                new ResourceDescriptor(ResourceTypes.APPLICATION, "sub-agent__0.0.1", List.of(), "bucket", initiatorBucket, false);
+
+        ApplicationSchemaService applicationSchemaService = mock(ApplicationSchemaService.class);
+        when(applicationSchemaService.getDeployments(application)).thenReturn(List.of(subAgent));
+
+        try (MockedStatic<BucketBuilder> bucketBuilderMock = mockStatic(BucketBuilder.class)) {
+            bucketBuilderMock.when(() -> BucketBuilder.buildInitiatorBucket(context)).thenReturn(initiatorBucket);
+
+            Map<ResourceDescriptor, Set<ResourceAccessType>> result = accessService(applicationSchemaService)
+                    .getOwnResourcesAccessForChainedSchemaRichApplication(Set.of(subAgent), context);
+
+            assertEquals(ResourceAccessType.READ_ONLY, result.get(subAgent));
+        }
+    }
+
+    @Test
+    public void testGetOwnResourcesAccessForChainedSchemaRichApplication_DeclaredToolSet() {
+        Application application = mock(Application.class);
+        when(application.hasApplicationTypeSchemaId()).thenReturn(true);
+        when(context.getDeployment()).thenReturn(application);
+
+        String initiatorBucket = "Users/user-sub-id/";
+        ResourceDescriptor toolSet =
+                new ResourceDescriptor(ResourceTypes.TOOL_SET, "my-tool-set", List.of(), "bucket", initiatorBucket, false);
+
+        ApplicationSchemaService applicationSchemaService = mock(ApplicationSchemaService.class);
+        when(applicationSchemaService.getDeployments(application)).thenReturn(List.of(toolSet));
+
+        try (MockedStatic<BucketBuilder> bucketBuilderMock = mockStatic(BucketBuilder.class)) {
+            bucketBuilderMock.when(() -> BucketBuilder.buildInitiatorBucket(context)).thenReturn(initiatorBucket);
+
+            Map<ResourceDescriptor, Set<ResourceAccessType>> result = accessService(applicationSchemaService)
+                    .getOwnResourcesAccessForChainedSchemaRichApplication(Set.of(toolSet), context);
+
+            assertEquals(ResourceAccessType.READ_ONLY, result.get(toolSet));
+        }
+    }
+
+    @Test
+    public void testGetOwnResourcesAccessForChainedSchemaRichApplication_DeploymentNotDeclared() {
+        Application application = mock(Application.class);
+        when(application.hasApplicationTypeSchemaId()).thenReturn(true);
+        when(context.getDeployment()).thenReturn(application);
+
+        String initiatorBucket = "Users/user-sub-id/";
+        ResourceDescriptor subAgent =
+                new ResourceDescriptor(ResourceTypes.APPLICATION, "sub-agent__0.0.1", List.of(), "bucket", initiatorBucket, false);
+
+        ApplicationSchemaService applicationSchemaService = mock(ApplicationSchemaService.class);
+        when(applicationSchemaService.getDeployments(application)).thenReturn(List.of());
+
+        try (MockedStatic<BucketBuilder> bucketBuilderMock = mockStatic(BucketBuilder.class)) {
+            bucketBuilderMock.when(() -> BucketBuilder.buildInitiatorBucket(context)).thenReturn(initiatorBucket);
+
+            Map<ResourceDescriptor, Set<ResourceAccessType>> result = accessService(applicationSchemaService)
+                    .getOwnResourcesAccessForChainedSchemaRichApplication(Set.of(subAgent), context);
+
+            assertTrue(result.isEmpty());
+        }
+    }
+
+    @Test
+    public void testGetOwnResourcesAccessForChainedSchemaRichApplication_DeploymentFromAnotherBucket() {
+        Application application = mock(Application.class);
+        when(application.hasApplicationTypeSchemaId()).thenReturn(true);
+        when(context.getDeployment()).thenReturn(application);
+
+        ResourceDescriptor subAgent =
+                new ResourceDescriptor(ResourceTypes.APPLICATION, "sub-agent__0.0.1", List.of(), "bucket", "Users/another-user/", false);
+
+        ApplicationSchemaService applicationSchemaService = mock(ApplicationSchemaService.class);
+
+        try (MockedStatic<BucketBuilder> bucketBuilderMock = mockStatic(BucketBuilder.class)) {
+            bucketBuilderMock.when(() -> BucketBuilder.buildInitiatorBucket(context)).thenReturn("Users/user-sub-id/");
+
+            Map<ResourceDescriptor, Set<ResourceAccessType>> result = accessService(applicationSchemaService)
+                    .getOwnResourcesAccessForChainedSchemaRichApplication(Set.of(subAgent), context);
+
+            assertTrue(result.isEmpty());
+        }
+    }
+
+    @Test
+    public void testGetOwnResourcesAccessForChainedSchemaRichApplication_DeclaredPromptAndSkill() {
+        Application application = mock(Application.class);
+        when(application.hasApplicationTypeSchemaId()).thenReturn(true);
+        when(context.getDeployment()).thenReturn(application);
+
+        String initiatorBucket = "Users/user-sub-id/";
+        ResourceDescriptor prompt = new ResourceDescriptor(ResourceTypes.PROMPT, "prompt", List.of(), "bucket", initiatorBucket, false);
+        ResourceDescriptor skill = new ResourceDescriptor(ResourceTypes.SKILL, "skill", List.of(), "bucket", initiatorBucket, false);
+
+        ApplicationSchemaService applicationSchemaService = mock(ApplicationSchemaService.class);
+        when(applicationSchemaService.getPrompts(application)).thenReturn(List.of(prompt));
+        when(applicationSchemaService.getSkills(application)).thenReturn(List.of(skill));
+
+        try (MockedStatic<BucketBuilder> bucketBuilderMock = mockStatic(BucketBuilder.class)) {
+            bucketBuilderMock.when(() -> BucketBuilder.buildInitiatorBucket(context)).thenReturn(initiatorBucket);
+
+            Map<ResourceDescriptor, Set<ResourceAccessType>> result = accessService(applicationSchemaService)
+                    .getOwnResourcesAccessForChainedSchemaRichApplication(Set.of(prompt, skill), context);
+
+            assertEquals(ResourceAccessType.READ_ONLY, result.get(prompt));
+            assertEquals(ResourceAccessType.READ_ONLY, result.get(skill));
+        }
+    }
+
+    @Test
+    public void testGetOwnResourcesAccessForChainedSchemaRichApplication_PromptNotDeclared() {
+        Application application = mock(Application.class);
+        when(application.hasApplicationTypeSchemaId()).thenReturn(true);
+        when(context.getDeployment()).thenReturn(application);
+
+        String initiatorBucket = "Users/user-sub-id/";
+        ResourceDescriptor prompt = new ResourceDescriptor(ResourceTypes.PROMPT, "prompt", List.of(), "bucket", initiatorBucket, false);
+
+        ApplicationSchemaService applicationSchemaService = mock(ApplicationSchemaService.class);
+        when(applicationSchemaService.getPrompts(application)).thenReturn(List.of());
+
+        try (MockedStatic<BucketBuilder> bucketBuilderMock = mockStatic(BucketBuilder.class)) {
+            bucketBuilderMock.when(() -> BucketBuilder.buildInitiatorBucket(context)).thenReturn(initiatorBucket);
+
+            Map<ResourceDescriptor, Set<ResourceAccessType>> result = accessService(applicationSchemaService)
+                    .getOwnResourcesAccessForChainedSchemaRichApplication(Set.of(prompt), context);
+
+            assertTrue(result.isEmpty());
+        }
+    }
+
+    @Test
+    public void testGetOwnResourcesAccessForChainedSchemaRichApplication_FilesAndDeploymentsTogether() {
+        Application application = mock(Application.class);
+        when(application.hasApplicationTypeSchemaId()).thenReturn(true);
+        when(context.getDeployment()).thenReturn(application);
+
+        String initiatorBucket = "Users/user-sub-id/";
+        ResourceDescriptor file = new ResourceDescriptor(ResourceTypes.FILE, "file.json", List.of(), "bucket", initiatorBucket, false);
+        ResourceDescriptor subAgent =
+                new ResourceDescriptor(ResourceTypes.APPLICATION, "sub-agent__0.0.1", List.of(), "bucket", initiatorBucket, false);
+
+        ApplicationSchemaService applicationSchemaService = mock(ApplicationSchemaService.class);
+        when(applicationSchemaService.getFiles(application)).thenReturn(List.of(file));
+        when(applicationSchemaService.getDeployments(application)).thenReturn(List.of(subAgent));
+
+        try (MockedStatic<BucketBuilder> bucketBuilderMock = mockStatic(BucketBuilder.class)) {
+            bucketBuilderMock.when(() -> BucketBuilder.buildInitiatorBucket(context)).thenReturn(initiatorBucket);
+
+            Map<ResourceDescriptor, Set<ResourceAccessType>> result = accessService(applicationSchemaService)
+                    .getOwnResourcesAccessForChainedSchemaRichApplication(Set.of(file, subAgent), context);
+
+            assertEquals(ResourceAccessType.READ_ONLY, result.get(file));
+            assertEquals(ResourceAccessType.READ_ONLY, result.get(subAgent));
+        }
+    }
+
+    private AccessService accessService(ApplicationSchemaService applicationSchemaService) {
+        return new AccessService(encryptionService, shareService, ruleService, applicationSchemaService,
+                new JsonObject("""
+                        {
+                         "admin": {
+                            "rules": [{"source": "roles", "function": "EQUAL", "targets": ["admin"]}]
+                         },
+                         "createCodeAppRoles": ["admin"]
+                        }
+                        """));
+    }
+
+    @Test
     public void testGetAdminAccess_WhenPublicResource() {
         ResourceDescriptor resource = new ResourceDescriptor(ResourceTypes.FILE, "file.json", List.of(), "bucket", "public/", false);
         ApplicationSchemaService applicationSchemaService = mock(ApplicationSchemaService.class);
-        ExtractedClaims extractedClaims = new ExtractedClaims("sub", List.of("admin"), "hash", Map.of(), null, "userName");
-        when(context.getExtractedClaims()).thenReturn(extractedClaims);
+        when(context.getUserRoles()).thenReturn(List.of("admin"));
         when(context.getApiKeyData()).thenReturn(new ApiKeyData());
         AccessService accessService = new AccessService(encryptionService, shareService, ruleService,
                 applicationSchemaService,
@@ -335,8 +510,7 @@ public class AccessServiceTest {
         String reviewLocation = "/Users/sub/publications/123/";
         ResourceDescriptor resource = new ResourceDescriptor(ResourceTypes.FILE, "file.json", List.of(), "bucket", reviewLocation, false);
         ApplicationSchemaService applicationSchemaService = mock(ApplicationSchemaService.class);
-        ExtractedClaims extractedClaims = new ExtractedClaims("sub", List.of("admin"), "hash", Map.of(), null, "userName");
-        when(context.getExtractedClaims()).thenReturn(extractedClaims);
+        when(context.getUserRoles()).thenReturn(List.of("admin"));
         when(context.getApiKeyData()).thenReturn(new ApiKeyData());
         AccessService accessService = new AccessService(encryptionService, shareService, ruleService,
                 applicationSchemaService,
@@ -358,7 +532,8 @@ public class AccessServiceTest {
     public void testGetAdminAccess_WhenPrivateResource() {
         ResourceDescriptor resource = new ResourceDescriptor(ResourceTypes.FILE, "file.json", List.of(), "bucket", "/Users/sub", false);
         ApplicationSchemaService applicationSchemaService = mock(ApplicationSchemaService.class);
-        ExtractedClaims extractedClaims = new ExtractedClaims("sub", List.of("admin"), "hash", Map.of(), null, "userName");
+        ExtractedClaims extractedClaims = new ExtractedClaims("sub", List.of("admin"), "hash",
+                ProxyUtil.MAPPER.createObjectNode(), null, "userName");
         when(context.getExtractedClaims()).thenReturn(extractedClaims);
         when(context.getApiKeyData()).thenReturn(new ApiKeyData());
         AccessService accessService = new AccessService(encryptionService, shareService, ruleService,
@@ -380,8 +555,7 @@ public class AccessServiceTest {
     public void testGetAdminAccess_WhenSourceFolderOfCodeApp() {
         ResourceDescriptor resource = new ResourceDescriptor(ResourceTypes.FILE, "app.py", List.of(), "bucket", "public/deployments/123/", false);
         ApplicationSchemaService applicationSchemaService = mock(ApplicationSchemaService.class);
-        ExtractedClaims extractedClaims = new ExtractedClaims("sub", List.of("admin"), "hash", Map.of(), null, "userName");
-        when(context.getExtractedClaims()).thenReturn(extractedClaims);
+        when(context.getUserRoles()).thenReturn(List.of("admin"));
         when(context.getApiKeyData()).thenReturn(new ApiKeyData());
         AccessService accessService = new AccessService(encryptionService, shareService, ruleService,
                 applicationSchemaService,
@@ -397,5 +571,156 @@ public class AccessServiceTest {
 
         assertFalse(result.isEmpty());
         assertEquals(Map.of(resource, ResourceAccessType.ALL), result);
+    }
+
+    @Test
+    public void testHasExplicitAdminAccess_EmptyRulesDenies() {
+        ApplicationSchemaService applicationSchemaService = mock(ApplicationSchemaService.class);
+        AccessService accessService = new AccessService(encryptionService, shareService, ruleService,
+                applicationSchemaService,
+                new JsonObject("""
+                {
+                 "admin": {"rules": []}
+                }
+                """));
+
+        assertFalse(accessService.hasExplicitAdminAccess(context));
+    }
+
+    @Test
+    public void testHasExplicitAdminAccess_ConfiguredAndMatching() {
+        when(context.getApiKeyData()).thenReturn(new ApiKeyData());
+        when(context.getUserRoles()).thenReturn(List.of("admin"));
+        ApplicationSchemaService applicationSchemaService = mock(ApplicationSchemaService.class);
+        AccessService accessService = new AccessService(encryptionService, shareService, ruleService,
+                applicationSchemaService,
+                new JsonObject("""
+                {
+                 "admin": {"rules": [{"source": "roles", "function": "EQUAL", "targets": ["admin"]}]}
+                }
+                """));
+
+        assertTrue(accessService.hasExplicitAdminAccess(context));
+    }
+
+    @Test
+    public void testHasExplicitAdminAccess_ConfiguredAndNonMatching() {
+        when(context.getApiKeyData()).thenReturn(new ApiKeyData());
+        when(context.getUserRoles()).thenReturn(List.of("user"));
+        ApplicationSchemaService applicationSchemaService = mock(ApplicationSchemaService.class);
+        AccessService accessService = new AccessService(encryptionService, shareService, ruleService,
+                applicationSchemaService,
+                new JsonObject("""
+                {
+                 "admin": {"rules": [{"source": "roles", "function": "EQUAL", "targets": ["admin"]}]}
+                }
+                """));
+
+        assertFalse(accessService.hasExplicitAdminAccess(context));
+    }
+
+    @Test
+    public void testHasExplicitAdminAccess_MissingAdminBlockDoesNotThrow() {
+        ApplicationSchemaService applicationSchemaService = mock(ApplicationSchemaService.class);
+        AccessService missingAdmin = new AccessService(encryptionService, shareService, ruleService,
+                applicationSchemaService, new JsonObject("{}"));
+        AccessService missingRules = new AccessService(encryptionService, shareService, ruleService,
+                applicationSchemaService, new JsonObject("{\"admin\": {}}"));
+
+        assertFalse(missingAdmin.hasExplicitAdminAccess(context));
+        assertFalse(missingRules.hasExplicitAdminAccess(context));
+    }
+
+    @Test
+    public void testGetGlobalReaderAccess_PrivateResource() {
+        ResourceDescriptor resource = new ResourceDescriptor(ResourceTypes.FILE, "file.json", List.of(), "bucket", "Users/user/", false);
+        ApplicationSchemaService applicationSchemaService = mock(ApplicationSchemaService.class);
+        when(context.getUserRoles()).thenReturn(List.of("global-reader"));
+        when(context.getApiKeyData()).thenReturn(new ApiKeyData());
+        AccessService accessService = new AccessService(encryptionService, shareService, ruleService,
+                applicationSchemaService,
+                new JsonObject("""
+                {
+                 "admin": {
+                    "rules": [{"source": "roles", "function": "EQUAL", "targets": ["admin"]}]
+                 },
+                 "globalReader": {
+                    "rules": [{"source": "roles", "function": "EQUAL", "targets": ["global-reader"]}]
+                 }
+                }
+                """));
+
+        Map<ResourceDescriptor, Set<ResourceAccessType>> result = accessService.getGlobalReaderAccess(Set.of(resource), context);
+
+        assertFalse(result.isEmpty());
+        assertEquals(Map.of(resource, ResourceAccessType.READ_ONLY), result);
+    }
+
+    @Test
+    public void testGetGlobalReaderAccess_NoRole() {
+        ResourceDescriptor resource = new ResourceDescriptor(ResourceTypes.FILE, "file.json", List.of(), "bucket", "Users/user/", false);
+        ApplicationSchemaService applicationSchemaService = mock(ApplicationSchemaService.class);
+        when(context.getUserRoles()).thenReturn(List.of("regular-user"));
+        when(context.getApiKeyData()).thenReturn(new ApiKeyData());
+        AccessService accessService = new AccessService(encryptionService, shareService, ruleService,
+                applicationSchemaService,
+                new JsonObject("""
+                {
+                 "admin": {
+                    "rules": [{"source": "roles", "function": "EQUAL", "targets": ["admin"]}]
+                 },
+                 "globalReader": {
+                    "rules": [{"source": "roles", "function": "EQUAL", "targets": ["global-reader"]}]
+                 }
+                }
+                """));
+
+        Map<ResourceDescriptor, Set<ResourceAccessType>> result = accessService.getGlobalReaderAccess(Set.of(resource), context);
+
+        assertTrue(result.isEmpty());
+    }
+
+    @Test
+    public void testGetGlobalReaderAccess_ApplicationContextExcluded() {
+        ResourceDescriptor resource = new ResourceDescriptor(ResourceTypes.FILE, "file.json", List.of(), "bucket", "Users/user/", false);
+        ApplicationSchemaService applicationSchemaService = mock(ApplicationSchemaService.class);
+        ApiKeyData apiKeyData = new ApiKeyData();
+        apiKeyData.setPerRequestKey("per-request-key");
+        when(context.getApiKeyData()).thenReturn(apiKeyData);
+        AccessService accessService = new AccessService(encryptionService, shareService, ruleService,
+                applicationSchemaService,
+                new JsonObject("""
+                {
+                 "admin": {
+                    "rules": [{"source": "roles", "function": "EQUAL", "targets": ["admin"]}]
+                 },
+                 "globalReader": {
+                    "rules": [{"source": "roles", "function": "EQUAL", "targets": ["global-reader"]}]
+                 }
+                }
+                """));
+
+        Map<ResourceDescriptor, Set<ResourceAccessType>> result = accessService.getGlobalReaderAccess(Set.of(resource), context);
+
+        assertTrue(result.isEmpty());
+    }
+
+    @Test
+    public void testGetGlobalReaderAccess_MissingConfigReturnsEmpty() {
+        ResourceDescriptor resource = new ResourceDescriptor(ResourceTypes.FILE, "file.json", List.of(), "bucket", "Users/user/", false);
+        ApplicationSchemaService applicationSchemaService = mock(ApplicationSchemaService.class);
+        AccessService accessService = new AccessService(encryptionService, shareService, ruleService,
+                applicationSchemaService,
+                new JsonObject("""
+                {
+                 "admin": {
+                    "rules": [{"source": "roles", "function": "EQUAL", "targets": ["admin"]}]
+                 }
+                }
+                """));
+
+        Map<ResourceDescriptor, Set<ResourceAccessType>> result = accessService.getGlobalReaderAccess(Set.of(resource), context);
+
+        assertTrue(result.isEmpty());
     }
 }

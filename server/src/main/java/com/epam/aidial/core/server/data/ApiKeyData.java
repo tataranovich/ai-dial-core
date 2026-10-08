@@ -3,7 +3,9 @@ package com.epam.aidial.core.server.data;
 import com.epam.aidial.core.config.Key;
 import com.epam.aidial.core.server.Proxy;
 import com.epam.aidial.core.server.ProxyContext;
+import com.epam.aidial.core.server.data.permission.PerRequestSharedData;
 import com.epam.aidial.core.server.security.ExtractedClaims;
+import com.fasterxml.jackson.annotation.JsonAlias;
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import io.vertx.core.MultiMap;
 import lombok.Data;
@@ -15,6 +17,7 @@ import java.util.Map;
 
 /**
  * The container keeps data associated with API key.
+ *
  * <p>
  *     There are two types of API keys:
  *     <ul>
@@ -42,9 +45,15 @@ public class ApiKeyData {
     // list of attached file URLs collected from conversation history of the current request
     private Map<String, AutoSharedData> attachedFiles = new HashMap<>();
     private Map<String, AutoSharedData> attachedFolders = new HashMap<>();
-    // list of toolsets included into application properties
-    private Map<String, AutoSharedData> attachedToolSets = new HashMap<>();
-    // deployment name of the source(application/assistant/model/interceptor) associated with the current request
+    // list of deployments included into application properties
+    @JsonAlias({"attachedToolSets", "attachedDeployments"})
+    private Map<String, AutoSharedData> attachedDeployments = new HashMap<>();
+    private Map<String, AutoSharedData> attachedResourceCredentials = new HashMap<>();
+    // list of prompts included into application properties
+    private Map<String, AutoSharedData> attachedPrompts = new HashMap<>();
+    // list of skills included into application properties
+    private Map<String, AutoSharedData> attachedSkills = new HashMap<>();
+    // deployment name of the source(application/model/interceptor) associated with the current request
     private String sourceDeployment;
     // Execution path of the root request
     private List<String> executionPath;
@@ -57,6 +66,12 @@ public class ApiKeyData {
     private String initialDeploymentApi;
     // Original HTTP headers to be stored during an interceptor invocation chain
     private Map<String, String> httpHeaders = new HashMap<>();
+    // Map of receivers whom resources are shared to by per request API key.
+    // A key is a deployment ID, value is a map of resource IDs and per request shared data
+    private Map<String, Map<String, PerRequestSharedData>> perRequestReceivers = new HashMap<>();
+    // Map of resources are shared by per request API key.
+    // A key is a resource ID and value - per request shared data
+    private Map<String, PerRequestSharedData> perRequestSharedResources = new HashMap<>();
 
     public ApiKeyData() {
     }
@@ -77,15 +92,39 @@ public class ApiKeyData {
             proxyApiKeyData.setTraceId(apiKeyData.getTraceId());
             currentPath = new ArrayList<>(context.getApiKeyData().getExecutionPath());
         }
+        String receiver = null;
         if (context.getDeployment() != null) {
-            currentPath.add(context.getDeployment().getName());
-            proxyApiKeyData.setSourceDeployment(context.getDeployment().getName());
+            receiver = context.getDeployment().getName();
+            currentPath.add(receiver);
+            proxyApiKeyData.setSourceDeployment(receiver);
         } else if (context.getRoute() != null) {
-            currentPath.add(context.getRoute().getName());
-            proxyApiKeyData.setSourceDeployment(context.getRoute().getName());
+            receiver = context.getRoute().getName();
+            currentPath.add(receiver);
+            proxyApiKeyData.setSourceDeployment(receiver);
+        }
+        if (apiKeyData.getPerRequestKey() != null) {
+            Map<String, Map<String, PerRequestSharedData>> receivers = apiKeyData.getPerRequestReceivers();
+            if (receiver != null) {
+                sharePerRequestPermissions(proxyApiKeyData, receivers, receiver);
+            }
+            // per request permissions are always shared to interceptors if the initial deployment has them
+            if (context.getInitialDeployment() != null) {
+                sharePerRequestPermissions(proxyApiKeyData, receivers, context.getInitialDeployment());
+            }
         }
         proxyApiKeyData.setExecutionPath(currentPath);
         proxyApiKeyData.setSpanId(context.getSpanId());
+    }
+
+    private static void sharePerRequestPermissions(ApiKeyData proxyApiKeyData, Map<String, Map<String, PerRequestSharedData>> receivers,
+                                                   String receiver) {
+        if (receiver == null) {
+            return;
+        }
+        Map<String, PerRequestSharedData> resources = receivers.get(receiver);
+        if (resources != null) {
+            proxyApiKeyData.getPerRequestSharedResources().putAll(resources);
+        }
     }
 
     @JsonIgnore

@@ -1,15 +1,17 @@
 package com.epam.aidial.core.server.security;
 
+import com.epam.aidial.core.config.IpAddressRanges;
 import com.epam.aidial.core.config.Key;
 import com.epam.aidial.core.server.config.FileConfigStore;
+import com.epam.aidial.core.server.config.KeyValidator;
 import com.epam.aidial.core.server.data.ApiKeyData;
-import com.epam.aidial.core.server.data.ResourceTypes;
 import com.epam.aidial.core.server.util.ProxyUtil;
 import com.epam.aidial.core.server.util.ResourceDescriptorFactory;
 import com.epam.aidial.core.server.vertx.AsyncTaskExecutor;
 import com.epam.aidial.core.storage.http.HttpException;
 import com.epam.aidial.core.storage.http.HttpStatus;
 import com.epam.aidial.core.storage.resource.ResourceDescriptor;
+import com.epam.aidial.core.storage.resource.ResourceTypes;
 import com.epam.aidial.core.storage.util.RedisUtil;
 import io.vertx.core.Future;
 import io.vertx.core.json.JsonObject;
@@ -20,9 +22,10 @@ import org.redisson.api.RedissonClient;
 import org.redisson.client.codec.StringCodec;
 
 import java.time.Duration;
-import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
 
 import static com.epam.aidial.core.server.security.ApiKeyGenerator.generateKey;
@@ -47,6 +50,14 @@ public class ApiKeyStore {
 
     private final Duration ttl;
 
+    /**
+     * Serializes per-entry point-writes against the full rebuild's swap. The merged store adopts this
+     * same lock as its {@code rebuildLock} (via {@link #getMutationLock()}), so a point-write either
+     * completes before rebuild's blob scan (visible to it) or blocks until after the swap and applies
+     * to the new map — surviving either way. Reentrant so rebuild's own thread can re-enter mutators.
+     */
+    private final ReentrantLock mutationLock = new ReentrantLock();
+
     public ApiKeyStore(AsyncTaskExecutor taskExecutor, RedissonClient redis, String prefix, JsonObject settings) {
         this.taskExecutor = taskExecutor;
         this.redis = redis;
@@ -55,9 +66,10 @@ public class ApiKeyStore {
     }
 
     /**
-     * Project API keys are hosted in the secure storage.
+     * Project API keys, keyed by secret value for O(1) auth lookup (OQ-12). The reference is rebuilt and
+     * atomically swapped on full reload; per-entry mutations serialize via {@link #mutationLock}.
      */
-    private volatile Map<String, ApiKeyData> keys = new HashMap<>();
+    private volatile ConcurrentHashMap<String, ApiKeyData> keys = new ConcurrentHashMap<>();
 
     /**
      * Assigns a new generated per request key to the {@link ApiKeyData}.
@@ -66,41 +78,40 @@ public class ApiKeyStore {
      * </p>
      */
     public void assignPerRequestApiKey(ApiKeyData data) {
+        assignPerRequestApiKey(data, ttl);
+    }
+
+    public void assignPerRequestApiKey(ApiKeyData data, Duration customTtl) {
         String perRequestKey = generateKey();
         data.setPerRequestKey(perRequestKey);
         String json = ProxyUtil.convertToString(data);
         String redisKey = toRedisKey(perRequestKey);
         RBucket<String> bucket = redis.getBucket(redisKey, StringCodec.INSTANCE);
-        if (!bucket.setIfAbsent(json)) {
+        if (!bucket.setIfAbsent(json, customTtl)) {
             throw new IllegalStateException(String.format("API key %s already exists in Redis storage", perRequestKey));
         }
-        bucket.expire(ttl);
     }
 
-    public Future<Void> updatePerRequestApiKey(String key, Function<String, String> fn) {
+    public void updatePerRequestApiKey(String key, Function<String, String> fn) {
         if (key == null) {
-            IllegalArgumentException error = new IllegalArgumentException("Per request API key is undefined");
-            log.error("Error occurred at updating api key data: per request API key is undefined");
-            return Future.failedFuture(error);
+            throw new IllegalArgumentException("Per request API key is undefined");
         }
         String redisKey = toRedisKey(key);
-        return taskExecutor.submit(() -> {
-            RBucket<String> bucket = redis.getBucket(redisKey, StringCodec.INSTANCE);
-            // lock free
-            while (true) {
-                String oldJson = bucket.get();
-                if (oldJson == null) {
-                    throw new IllegalArgumentException("Per request key is not found: " + key);
-                }
-
-                String newJson = fn.apply(oldJson);
-
-                if (Objects.equals(oldJson, newJson) || bucket.compareAndSet(oldJson, newJson)) {
-                    break;
-                }
+        RBucket<String> bucket = redis.getBucket(redisKey, StringCodec.INSTANCE);
+        // lock free
+        while (true) {
+            String oldJson = bucket.get();
+            if (oldJson == null) {
+                throw new IllegalArgumentException("Per request key is not found: " + key);
             }
-            return null;
-        });
+
+            String newJson = fn.apply(oldJson);
+
+            if (Objects.equals(oldJson, newJson) || bucket.compareAndSet(oldJson, newJson)) {
+                break;
+            }
+        }
+        bucket.expire(ttl);
     }
 
     /**
@@ -109,10 +120,10 @@ public class ApiKeyStore {
      * @param key API key could be either project or per request key.
      * @return the future of data associated with the given key.
      */
-    public Future<ApiKeyData> getApiKeyData(String key) {
+    public Future<ApiKeyData> getApiKeyData(String key, String clientIpAddress) {
         ApiKeyData apiKeyData = keys.get(key);
         if (apiKeyData != null) {
-            return Future.succeededFuture(apiKeyData);
+            return validateIpAddressRange(apiKeyData, clientIpAddress);
         }
         String redisKey = toRedisKey(key);
         return taskExecutor.submit(() -> {
@@ -125,6 +136,16 @@ public class ApiKeyStore {
             }
             return Future.succeededFuture(result);
         });
+    }
+
+    private static Future<ApiKeyData> validateIpAddressRange(ApiKeyData apiKeyData, String clientIpAddress) {
+        log.debug("Api key {} is accessed by client IP {}", apiKeyData.getOriginalKey().getProject(), clientIpAddress);
+        IpAddressRanges ranges = apiKeyData.getOriginalKey().getAllowedIpAddressRanges();
+        if (ranges == null || ranges.isAddressInRange(clientIpAddress)) {
+            return Future.succeededFuture(apiKeyData);
+        }
+        return Future.failedFuture(new HttpException(HttpStatus.FORBIDDEN,
+                String.format("Access is forbidden from IP address: %s", clientIpAddress)));
     }
 
     /**
@@ -147,34 +168,110 @@ public class ApiKeyStore {
     }
 
     /**
-     * Adds new project keys from the secure storage and removes previous project keys if any.
+     * Rebuilds the project-key store from two explicitly-classified partitions and atomically swaps
+     * the {@code keys} reference once (single-atomic-swap invariant, per OQ-12).
      * <p>
      *     Note. The method is blocking and shouldn't be run in the event loop thread.
      * </p>
      *
-     * @param projectKeys new projects to be added to the store.
+     * @param fileKeysBySecret    file-sourced keys; the map key is the plaintext secret (pre-existing
+     *                            file convention). The secret may be any string including Base64 with
+     *                            '/', so no map-key shape is inferred — a blank {@link Key#getKey()} is
+     *                            back-filled from the map key.
+     * @param apiKeysByCanonicalId API-sourced keys; the map key is the canonical id, never the secret.
+     *                            The secret must already be on {@link Key#getKey()} (post-decrypt);
+     *                            blank entries are skipped (fail closed) — the canonical id is never
+     *                            used as an auth bearer.
      */
-    public void addProjectKeys(Map<String, Key> projectKeys) {
-        Map<String, ApiKeyData> apiKeyDataMap = new HashMap<>();
-        for (Map.Entry<String, Key> entry : projectKeys.entrySet()) {
-            String apiKey = entry.getKey();
+    public void addProjectKeys(Map<String, Key> fileKeysBySecret, Map<String, Key> apiKeysByCanonicalId) {
+        mutationLock.lock();
+        try {
+            addProjectKeysLocked(fileKeysBySecret, apiKeysByCanonicalId);
+        } finally {
+            mutationLock.unlock();
+        }
+    }
+
+    private void addProjectKeysLocked(Map<String, Key> fileKeysBySecret, Map<String, Key> apiKeysByCanonicalId) {
+        ConcurrentHashMap<String, ApiKeyData> apiKeyDataMap = new ConcurrentHashMap<>();
+        for (Map.Entry<String, Key> entry : fileKeysBySecret.entrySet()) {
+            String mapKey = entry.getKey();
             Key value = entry.getValue();
             validateProjectKey(value);
-            value.setKey(apiKey);
+            if (StringUtils.isBlank(value.getKey())) {
+                value.setKey(mapKey);
+            }
             ApiKeyData apiKeyData = new ApiKeyData();
             apiKeyData.setOriginalKey(value);
-            apiKeyDataMap.put(apiKey, apiKeyData);
+            putAndWarnOnDuplicateSecret(apiKeyDataMap, value, apiKeyData);
+            log.debug("Loading {}", value);
+        }
+        for (Map.Entry<String, Key> entry : apiKeysByCanonicalId.entrySet()) {
+            Key value = entry.getValue();
+            validateProjectKey(value);
+            if (StringUtils.isBlank(value.getKey())) {
+                log.warn("Skipping API-sourced project key '{}': Key.key is blank after decrypt; "
+                        + "refusing to use canonical id as auth bearer", entry.getKey());
+                continue;
+            }
+            ApiKeyData apiKeyData = new ApiKeyData();
+            apiKeyData.setOriginalKey(value);
+            putAndWarnOnDuplicateSecret(apiKeyDataMap, value, apiKeyData);
             log.debug("Loading {}", value);
         }
         keys = apiKeyDataMap;
     }
 
-    private void validateProjectKey(Key key) {
-        if (StringUtils.isEmpty(key.getProject())) {
-            throw new IllegalArgumentException("Project key is undefined");
+    private void putAndWarnOnDuplicateSecret(Map<String, ApiKeyData> apiKeyDataMap, Key value, ApiKeyData apiKeyData) {
+        ApiKeyData previous = apiKeyDataMap.put(value.getKey(), apiKeyData);
+        if (previous != null) {
+            log.warn("Duplicate key secret detected while rebuilding project keys; '{}' collides with '{}', "
+                    + "last one wins", value.getProject(), previous.getOriginalKey().getProject());
         }
-        if (StringUtils.isEmpty(key.getRole()) && (key.getRoles() == null || key.getRoles().isEmpty())) {
-            throw new IllegalArgumentException("Invalid key: at least one role must be assigned to the key " + key.getProject());
+    }
+
+    /**
+     * Shared mutation lock adopted by {@code MergedConfigStore} as its {@code rebuildLock} so
+     * per-entry point-writes serialize against the entire rebuild (scan → build → swap). See
+     * {@link #mutationLock}.
+     */
+    public ReentrantLock getMutationLock() {
+        return mutationLock;
+    }
+
+    /**
+     * Fast-path partial mutator used by API-managed key writes (Phase 2 keys controller).
+     * Serialized against the full rebuild via {@link #mutationLock} so the put is never discarded
+     * by a concurrent {@code addProjectKeys} map swap.
+     */
+    public void addOrUpdateKey(String secret, ApiKeyData data) {
+        mutationLock.lock();
+        try {
+            keys.put(secret, data);
+        } finally {
+            mutationLock.unlock();
+        }
+    }
+
+    /**
+     * Fast-path partial mutator used by API-managed key deletes (Phase 2 keys controller).
+     * Must be called after the corresponding blob {@code ResourceService.delete} returns
+     * (per the keys-controller {@code DELETE} ordering invariant). Serialized against the full
+     * rebuild via {@link #mutationLock}.
+     */
+    public void removeKey(String secret) {
+        mutationLock.lock();
+        try {
+            keys.remove(secret);
+        } finally {
+            mutationLock.unlock();
+        }
+    }
+
+    private void validateProjectKey(Key key) {
+        String error = KeyValidator.validateProjectAndRoles(key);
+        if (error != null) {
+            throw new IllegalArgumentException(error);
         }
     }
 

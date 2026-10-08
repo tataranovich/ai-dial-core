@@ -2,7 +2,13 @@ package com.epam.aidial.core.server.controller;
 
 import com.epam.aidial.core.config.Config;
 import com.epam.aidial.core.metaschemas.MetaSchemaHolder;
+import com.epam.aidial.core.openapi.annotations.ApiOperation;
+import com.epam.aidial.core.openapi.annotations.ApiParameter;
+import com.epam.aidial.core.openapi.annotations.ApiResponse;
+import com.epam.aidial.core.openapi.annotations.OpenApiDescriptions;
+import com.epam.aidial.core.openapi.annotations.ParameterIn;
 import com.epam.aidial.core.server.ProxyContext;
+import com.epam.aidial.core.server.service.ApplicationSchemaService;
 import com.epam.aidial.core.server.util.ProxyUtil;
 import com.epam.aidial.core.server.vertx.AsyncTaskExecutor;
 import com.epam.aidial.core.storage.http.HttpException;
@@ -27,12 +33,28 @@ public class ApplicationTypeSchemaController {
 
     private final ProxyContext context;
     private final AsyncTaskExecutor taskExecutor;
+    private final ApplicationSchemaService applicationSchemaService;
 
     public ApplicationTypeSchemaController(ProxyContext context) {
         this.context = context;
         this.taskExecutor = context.getProxy().getTaskExecutor();
+        this.applicationSchemaService = context.getProxy().getApplicationSchemaService();
     }
 
+    @ApiOperation(
+            method = "GET",
+            path = "/v1/application_type_schemas/meta_schema",
+            operationId = "getMetaSchemaOfCustomApplicationSchema",
+            tags = {"Applications"},
+            responses = {
+                    @ApiResponse(code = 200, description = "Success"),
+                    @ApiResponse(code = 400),
+                    @ApiResponse(code = 401),
+                    @ApiResponse(code = 403),
+                    @ApiResponse(code = 404),
+                    @ApiResponse(code = 500)
+            }
+    )
     public Future<?> handleGetMetaSchema() {
         return taskExecutor.submit(MetaSchemaHolder::getCustomApplicationMetaSchema)
                 .onSuccess(metaSchema -> context.respond(HttpStatus.OK, metaSchema))
@@ -54,7 +76,7 @@ public class ApplicationTypeSchemaController {
             throw new HttpException(HttpStatus.BAD_REQUEST, "Bad Schema ID");
         }
 
-        String schema = context.getConfig().getApplicationTypeSchemas().get(schemaId.toString());
+        String schema = applicationSchemaService.getSchema(schemaId, true);
         if (schema == null) {
             throw new HttpException(HttpStatus.NOT_FOUND, "Schema not found");
         }
@@ -80,6 +102,23 @@ public class ApplicationTypeSchemaController {
         return schemaNode;
     }
 
+    @ApiOperation(
+            method = "GET",
+            path = "/v1/application_type_schemas/schema",
+            operationId = "getCustomApplicationSchema",
+            tags = {"Applications"},
+            parameters = {
+                    @ApiParameter(name = "id", in = ParameterIn.QUERY, required = true, description = OpenApiDescriptions.SCHEMA_ID)
+            },
+            responses = {
+                    @ApiResponse(code = 200, description = "Success"),
+                    @ApiResponse(code = 400),
+                    @ApiResponse(code = 401),
+                    @ApiResponse(code = 403),
+                    @ApiResponse(code = 404),
+                    @ApiResponse(code = 500)
+            }
+    )
     public Future<?> handleGetSchema() {
         return taskExecutor.submit(this::getSchema)
                 .onSuccess(schemaNode -> context.respond(HttpStatus.OK, schemaNode))
@@ -112,6 +151,18 @@ public class ApplicationTypeSchemaController {
                 if (schemaNode.has(MetaSchemaHolder.APPLICATION_TYPE_PLAYBACK_SUPPORT)) {
                     filteredNode.set(MetaSchemaHolder.APPLICATION_TYPE_PLAYBACK_SUPPORT, schemaNode.get(MetaSchemaHolder.APPLICATION_TYPE_PLAYBACK_SUPPORT));
                 }
+                if (schemaNode.has(MetaSchemaHolder.DIAL_APPLICATION_TYPE_BUCKET_COPY)) {
+                    filteredNode.set(MetaSchemaHolder.DIAL_APPLICATION_TYPE_BUCKET_COPY, schemaNode.get(MetaSchemaHolder.DIAL_APPLICATION_TYPE_BUCKET_COPY));
+                }
+                if (schemaNode.has(MetaSchemaHolder.DIAL_APPLICATION_TYPE_SCHEMA_ENDPOINT)) {
+                    filteredNode.set(MetaSchemaHolder.DIAL_APPLICATION_TYPE_SCHEMA_ENDPOINT, schemaNode.get(MetaSchemaHolder.DIAL_APPLICATION_TYPE_SCHEMA_ENDPOINT));
+                }
+                if (schemaNode.has(MetaSchemaHolder.APPLICATION_TYPE_ROUTES)) {
+                    filteredNode.set(MetaSchemaHolder.APPLICATION_TYPE_ROUTES, schemaNode.get(MetaSchemaHolder.APPLICATION_TYPE_ROUTES));
+                }
+                if (schemaNode.has(MetaSchemaHolder.DIAL_APPLICATION_TYPE_MCP)) {
+                    filteredNode.set(MetaSchemaHolder.DIAL_APPLICATION_TYPE_MCP, schemaNode.get(MetaSchemaHolder.DIAL_APPLICATION_TYPE_MCP));
+                }
 
                 filteredSchemas.add(filteredNode);
             }
@@ -119,6 +170,20 @@ public class ApplicationTypeSchemaController {
         return filteredSchemas;
     }
 
+    @ApiOperation(
+            method = "GET",
+            path = "/v1/application_type_schemas/schemas",
+            operationId = "listCustomApplicationSchemas",
+            tags = {"Applications"},
+            responses = {
+                    @ApiResponse(code = 200, description = "Success"),
+                    @ApiResponse(code = 400),
+                    @ApiResponse(code = 401),
+                    @ApiResponse(code = 403),
+                    @ApiResponse(code = 404),
+                    @ApiResponse(code = 500)
+            }
+    )
     public Future<?> handleListSchemas() {
         return taskExecutor.submit(this::listSchemas)
                 .onSuccess(schemas -> context.respond(HttpStatus.OK, schemas))

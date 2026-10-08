@@ -2,8 +2,10 @@ package com.epam.aidial.core.credentials.data.credentials;
 
 import com.epam.aidial.core.config.AuthenticationType;
 import com.epam.aidial.core.config.CredentialsLevel;
+import com.fasterxml.jackson.annotation.JsonAlias;
 import lombok.Builder;
 import lombok.Data;
+import lombok.ToString;
 import lombok.extern.jackson.Jacksonized;
 
 @Data
@@ -15,11 +17,23 @@ public class ResourceCredentials {
     private CredentialsLevel credentialsLevel;
     private AuthenticationType authenticationType;
     private String apiKeyHeader;
+    @ToString.Exclude
     private String apiKey;
+    @ToString.Exclude
     private String accessToken;
+    @ToString.Exclude
     private String refreshToken;
+    /** Set only during sign-in so the caller can verify who the exchange was for; never returned to clients. */
+    @ToString.Exclude
+    private String idToken;
     private long createdAt;
     private long updatedAt;
     private Long expiresInSeconds;
-    private String userSub;
+    @JsonAlias({"userSub", "userId"})
+    private String userId;
+    // Owner's recorded consent to offline (on-behalf-of) use of this credential. Legacy blobs deserialize as false.
+    @JsonAlias({"offlineUsageConsent", "offline_usage_consent"})
+    private boolean offlineUsageConsent;
+    /** Issuer, recorded at sign-in because a refresh runs with no caller token to derive it from. */
+    private String issuer;
 }

@@ -84,6 +84,7 @@ class ApplicationDeploymentApiTest extends ResourceBaseTest {
                   "forward_auth_token" : false,
                   "features" : { },
                   "defaults" : { },
+                  "responses_defaults" : { },
                   "interceptors" : [ ],
                   "description_keywords" : [ ],
                   "max_retry_attempts" : 1,
@@ -119,6 +120,7 @@ class ApplicationDeploymentApiTest extends ResourceBaseTest {
                   "forward_auth_token" : false,
                   "features" : { },
                   "defaults" : { },
+                  "responses_defaults" : { },
                   "interceptors" : [ ],
                   "description_keywords" : [ ],
                   "max_retry_attempts" : 1,
@@ -176,6 +178,7 @@ class ApplicationDeploymentApiTest extends ResourceBaseTest {
                   "forward_auth_token" : false,
                   "features" : { },
                   "defaults" : { },
+                  "responses_defaults" : { },
                   "interceptors" : [ ],
                   "description_keywords" : [ ],
                   "max_retry_attempts" : 1,
@@ -210,6 +213,7 @@ class ApplicationDeploymentApiTest extends ResourceBaseTest {
                   "forward_auth_token" : false,
                   "features" : { },
                   "defaults" : { },
+                  "responses_defaults" : { },
                   "interceptors" : [ ],
                   "description_keywords" : [ ],
                   "max_retry_attempts" : 1,
@@ -267,6 +271,7 @@ class ApplicationDeploymentApiTest extends ResourceBaseTest {
                   "forward_auth_token" : false,
                   "features" : { },
                   "defaults" : { },
+                  "responses_defaults" : { },
                   "interceptors" : [ ],
                   "description_keywords" : [ ],
                   "max_retry_attempts" : 1,
@@ -302,6 +307,7 @@ class ApplicationDeploymentApiTest extends ResourceBaseTest {
                   "forward_auth_token" : false,
                   "features" : { },
                   "defaults" : { },
+                  "responses_defaults" : { },
                   "interceptors" : [ ],
                   "description_keywords" : [ ],
                   "max_retry_attempts" : 1,
@@ -359,6 +365,7 @@ class ApplicationDeploymentApiTest extends ResourceBaseTest {
                   "forward_auth_token" : false,
                   "features" : { },
                   "defaults" : { },
+                  "responses_defaults" : { },
                   "interceptors" : [ ],
                   "description_keywords" : [ ],
                   "max_retry_attempts" : 1,
@@ -393,6 +400,7 @@ class ApplicationDeploymentApiTest extends ResourceBaseTest {
                   "forward_auth_token" : false,
                   "features" : { },
                   "defaults" : { },
+                  "responses_defaults" : { },
                   "interceptors" : [ ],
                   "description_keywords" : [ ],
                   "max_retry_attempts" : 1,
@@ -447,6 +455,7 @@ class ApplicationDeploymentApiTest extends ResourceBaseTest {
                   "forward_auth_token" : false,
                   "features" : { },
                   "defaults" : { },
+                  "responses_defaults" : { },
                   "interceptors" : [ ],
                   "description_keywords" : [ ],
                   "max_retry_attempts" : 1,
@@ -505,6 +514,7 @@ class ApplicationDeploymentApiTest extends ResourceBaseTest {
                   "forward_auth_token" : false,
                   "features" : { },
                   "defaults" : { },
+                  "responses_defaults" : { },
                   "interceptors" : [ ],
                   "description_keywords" : [ ],
                   "max_retry_attempts" : 1,
@@ -566,7 +576,66 @@ class ApplicationDeploymentApiTest extends ResourceBaseTest {
     void testApiWhenStarted() {
         testApplicationStarted();
 
-        String answer = """
+        // the upstream already carries a bogus usage_per_model entry of its own - Core must strip
+        // it regardless, the same guarantee the streaming path gives (see testApiWhenStarted_Streaming)
+        String upstreamAnswer = """
+                {
+                  "id": "chatcmpl-7VfMTgj3ljKdGKS2BEIwloII3IoO0",
+                  "object": "chat.completion",
+                  "created": 1687781517,
+                  "model": "gpt-35-turbo",
+                  "choices": [
+                    {
+                      "index": 0,
+                      "finish_reason": "stop",
+                      "message": {
+                        "role": "assistant",
+                        "content": "As an AI language model, I do not have emotions like humans. However, I am functioning well and ready to assist you. How can I help you today?"
+                      }
+                    }
+                  ],
+                  "usage": {
+                    "completion_tokens": 33,
+                    "prompt_tokens": 19,
+                    "total_tokens": 52
+                  },
+                  "statistics": {
+                    "usage_per_model": [
+                      {
+                        "index": 0,
+                        "model": "upstream-echoed-entry",
+                        "usage": {
+                          "prompt_tokens": 999
+                        }
+                      }
+                    ]
+                  }
+                }
+                """;
+        webServer.map(HttpMethod.POST, "/application", 200, upstreamAnswer);
+
+        Response response = send(HttpMethod.POST, "/openai/deployments/applications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/my-app/chat/completions", null,
+                """
+                        {
+                          "messages": [
+                            {
+                              "role": "system",
+                              "content": ""
+                            },
+                            {
+                              "role": "user",
+                              "content": "How are you?"
+                            }
+                          ],
+                          "max_tokens": 500,
+                          "temperature": 1,
+                          "stream": true
+                        }
+                        """, "content-type", "application/json");
+        // the app has no DIAL-tracked descendants (its upstream is a raw mock endpoint, not a nested
+        // deployment call), so Core has nothing of its own to report - the upstream's bogus entry
+        // never reaches the client, and no statistics.usage_per_model is added at all (issue #1753)
+        String expected = """
                 {
                   "id": "chatcmpl-7VfMTgj3ljKdGKS2BEIwloII3IoO0",
                   "object": "chat.completion",
@@ -589,27 +658,49 @@ class ApplicationDeploymentApiTest extends ResourceBaseTest {
                   }
                 }
                 """;
-        webServer.map(HttpMethod.POST, "/application", 200, answer);
+        verifyJson(response, 200, expected);
+    }
+
+    @Test
+    void testApiWhenStarted_Streaming() {
+        testApplicationStarted();
+
+        // the last chunk carries both the app's own real usage AND a bogus usage_per_model the
+        // upstream already streamed - Core must strip the latter regardless
+        String sse = "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1687781517,"
+                + "\"model\":\"gpt-35-turbo\",\"choices\":[{\"index\":0,\"finish_reason\":null,"
+                + "\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"}}]}\n\n"
+                + "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1687781517,"
+                + "\"model\":\"gpt-35-turbo\",\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"delta\":{}}],"
+                + "\"usage\":{\"completion_tokens\":5,\"prompt_tokens\":10,\"total_tokens\":15},"
+                + "\"statistics\":{\"usage_per_model\":[{\"index\":0,\"name\":\"upstream-echoed-entry\",\"prompt_tokens\":999}]}}\n\n"
+                + "data: [DONE]\n\n";
+        webServer.map(HttpMethod.POST, "/application",
+                new MockResponse().setResponseCode(200).setHeader("Content-Type", "text/event-stream").setBody(sse));
 
         Response response = send(HttpMethod.POST, "/openai/deployments/applications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/my-app/chat/completions", null,
                 """
                         {
                           "messages": [
                             {
-                              "role": "system",
-                              "content": ""
-                            },
-                            {
                               "role": "user",
                               "content": "How are you?"
                             }
                           ],
                           "max_tokens": 500,
-                          "temperature": 1,
                           "stream": true
                         }
                         """, "content-type", "application/json");
-        verify(response, 200, answer);
+
+        verify(response, 200);
+        String body = response.body();
+
+        // the upstream's own (bogus) usage_per_model entry never reaches the client - Core strips it
+        Assertions.assertFalse(body.contains("upstream-echoed-entry"), body);
+
+        // the app has no DIAL-tracked descendants (its upstream is a raw mock endpoint, not a
+        // nested deployment call), so there's nothing for Core to report - no usage_per_model at all
+        Assertions.assertFalse(body.contains("\"usage_per_model\""), body);
     }
 
     @Test
@@ -686,6 +777,7 @@ class ApplicationDeploymentApiTest extends ResourceBaseTest {
                   "forward_auth_token" : false,
                   "features" : { },
                   "defaults" : { },
+                  "responses_defaults" : { },
                   "interceptors" : [ ],
                   "description_keywords" : [ ],
                   "max_retry_attempts" : 1,
@@ -750,7 +842,8 @@ class ApplicationDeploymentApiTest extends ResourceBaseTest {
                     "action" : "ADD",
                     "sourceUrl" : "applications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/my-app",
                     "targetUrl" : "applications/public/my-app",
-                    "reviewUrl" : "applications/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhG9cWs5cubLjt6DVqa4wmnj/my-app"
+                    "reviewUrl" : "applications/2CZ9i2bcBACFts8JbBu3MdTHfU5imDZBmDVomBuDCkbhG9cWs5cubLjt6DVqa4wmnj/my-app",
+                    "publishCredentials": false
                   } ],
                   "resourceTypes" : [ "APPLICATION" ],
                   "author" : "EPM-RTC-GPT"
@@ -770,6 +863,7 @@ class ApplicationDeploymentApiTest extends ResourceBaseTest {
                   "forward_auth_token" : false,
                   "features" : { },
                   "defaults" : { },
+                  "responses_defaults" : { },
                   "interceptors" : [ ],
                   "description_keywords" : [ ],
                   "max_retry_attempts" : 1,
@@ -929,14 +1023,56 @@ class ApplicationDeploymentApiTest extends ResourceBaseTest {
                       "accessible_by_per_request_key" : true,
                       "content_parts": false,
                       "temperature" : true,
-                      "addons" : true,
                       "cache" : false,
                       "auto_caching" : false,
-                      "parallel_tool_calls" : true
+                      "parallel_tool_calls" : true,
+                      "assistant_attachments_in_request": false,
+                      "mcp" : false,
+                      "chat_completion" : true,
+                      "responses_api" : false,
+                      "max_tokens_supported": true,
+                      "max_completion_tokens_supported": false,
+                      "custom_temperature_supported": true,
+                      "skills_supported": false,
+                      "reasoning_efforts": []
                     },
                     "defaults" : { },
+                    "responses_defaults" : { },
                     "description_keywords" : [ ],
                     "max_retry_attempts" : 1,
+                    "interface_configs" : {
+                      "openaiChatCompletions" : {
+                        "features" : {
+                          "rate" : false,
+                          "tokenize" : false,
+                          "truncate_prompt" : false,
+                          "configuration" : false,
+                          "system_prompt" : true,
+                          "tools" : false,
+                          "seed" : false,
+                          "url_attachments" : false,
+                          "folder_attachments" : false,
+                          "allow_resume" : true,
+                          "accessible_by_per_request_key" : true,
+                          "content_parts" : false,
+                          "temperature" : true,
+                          "cache" : false,
+                          "auto_caching" : false,
+                          "parallel_tool_calls" : true,
+                          "assistant_attachments_in_request" : false,
+                          "mcp" : false,
+                          "chat_completion" : true,
+                          "responses_api" : false,
+                          "max_tokens_supported" : true,
+                          "max_completion_tokens_supported" : false,
+                          "custom_temperature_supported" : true,
+                          "skills_supported" : false,
+                          "reasoning_efforts" : [ ]
+                        },
+                        "defaults" : { },
+                        "default_headers" : { }
+                      }
+                    },
                     "owner" : "EPM-RTC-GPT",
                     "created_at" : "@ignore",
                     "updated_at" : "@ignore",
@@ -985,86 +1121,161 @@ class ApplicationDeploymentApiTest extends ResourceBaseTest {
                       "folder_attachments" : false,
                       "allow_resume" : true,
                       "accessible_by_per_request_key" : true,
-                      "content_parts": false,
+                      "content_parts" : false,
                       "temperature" : true,
-                      "addons" : true,
                       "cache" : false,
                       "auto_caching" : false,
-                      "parallel_tool_calls" : true
+                      "parallel_tool_calls" : true,
+                      "assistant_attachments_in_request" : false,
+                      "mcp" : false,
+                      "chat_completion" : true,
+                      "responses_api" : false,
+                      "max_tokens_supported" : true,
+                      "max_completion_tokens_supported" : false,
+                      "custom_temperature_supported" : true,
+                      "skills_supported" : false,
+                      "reasoning_efforts" : [ ]
                     },
                     "defaults" : { },
+                    "responses_defaults" : { },
                     "description_keywords" : [ ],
                     "max_retry_attempts" : 1,
-                    "routes" : { }
-                  },
-                  {
-                      "id" : "app-route",
-                      "application" : "app-route",
-                      "display_name" : "10k",
-                      "icon_url" : "http://localhost:7001/logo10k.png",
-                      "description" : "Some description of the application for testing",
-                      "reference" : "app-route",
-                      "owner" : "organization-owner",
-                      "object" : "application",
-                      "status" : "succeeded",
-                      "created_at" : 1672534800,
-                      "updated_at" : 1672534800,
-                      "features" : {
-                        "rate" : true,
-                        "tokenize" : false,
-                        "truncate_prompt" : false,
-                        "configuration" : true,
-                        "system_prompt" : false,
-                        "tools" : false,
-                        "seed" : false,
-                        "url_attachments" : false,
-                        "folder_attachments" : false,
-                        "allow_resume" : true,
-                        "accessible_by_per_request_key" : true,
-                        "content_parts" : false,
-                        "temperature" : true,
-                        "addons" : true,
-                        "cache" : false,
-                        "auto_caching" : false,
-                        "parallel_tool_calls" : true
-                      },
-                      "defaults" : { },
-                      "description_keywords" : [ ],
-                      "max_retry_attempts" : 1,
-                      "routes" : {
-                        "index-search" : {
-                          "name" : null,
-                          "userRoles" : null,
-                          "response" : null,
-                          "rewritePath" : true,
-                          "paths" : [ "/v1/index(/[^/]+)*$" ],
-                          "methods" : [ "DELETE", "POST", "PUT" ],
-                          "upstreams" : [ {
-                            "endpoint" : "http://localhost:4848",
-                            "extraData" : null,
-                            "weight" : 1,
-                            "tier" : 0
-                          } ],
-                          "maxRetryAttempts" : 1,
-                          "order" : 2147483647,
-                          "permissions" : [ ],
-                          "attachmentPaths" : {
-                            "requestBody" : [ "@.attachments[*].url" ],
-                            "responseBody" : [ "@.result.attachedFiles" ]
-                          }
-                        }
+                    "interface_configs" : {
+                      "openaiChatCompletions" : {
+                        "features" : {
+                          "rate" : true,
+                          "tokenize" : false,
+                          "truncate_prompt" : false,
+                          "configuration" : true,
+                          "system_prompt" : false,
+                          "tools" : false,
+                          "seed" : false,
+                          "url_attachments" : false,
+                          "folder_attachments" : false,
+                          "allow_resume" : true,
+                          "accessible_by_per_request_key" : true,
+                          "content_parts" : false,
+                          "temperature" : true,
+                          "cache" : false,
+                          "auto_caching" : false,
+                          "parallel_tool_calls" : true,
+                          "assistant_attachments_in_request" : false,
+                          "mcp" : false,
+                          "chat_completion" : true,
+                          "responses_api" : false,
+                          "max_tokens_supported" : true,
+                          "max_completion_tokens_supported" : false,
+                          "custom_temperature_supported" : true,
+                          "skills_supported" : false,
+                          "reasoning_efforts" : [ ]
+                        },
+                        "defaults" : { },
+                        "default_headers" : { }
                       }
-                  },
-                  {
-                    "id" : "applications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/my-app",
-                    "application" : "applications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/my-app",
-                    "display_name" : "My App",
-                    "display_version" : "1.0",
-                    "icon_url" : "http://application1/icon.svg",
-                    "description" : "My App Description",
-                    "reference" : "@ignore",
+                    },
+                    "routes" : { },
+                    "viewer_url" : "http://some-host",
+                    "editor_url" : "http://some-host"
+                  }, {
+                    "id" : "app-route",
+                    "application" : "app-route",
+                    "display_name" : "10k",
+                    "icon_url" : "http://localhost:7001/logo10k.png",
+                    "description" : "Some description of the application for testing",
+                    "reference" : "app-route",
+                    "owner" : "organization-owner",
                     "object" : "application",
                     "status" : "succeeded",
+                    "created_at" : 1672534800,
+                    "updated_at" : 1672534800,
+                    "features" : {
+                      "rate" : true,
+                      "tokenize" : false,
+                      "truncate_prompt" : false,
+                      "configuration" : true,
+                      "system_prompt" : false,
+                      "tools" : false,
+                      "seed" : false,
+                      "url_attachments" : false,
+                      "folder_attachments" : false,
+                      "allow_resume" : true,
+                      "accessible_by_per_request_key" : true,
+                      "content_parts" : false,
+                      "temperature" : true,
+                      "cache" : false,
+                      "auto_caching" : false,
+                      "parallel_tool_calls" : true,
+                      "assistant_attachments_in_request" : false,
+                      "mcp" : false,
+                      "chat_completion" : true,
+                      "responses_api" : false,
+                      "max_tokens_supported" : true,
+                      "max_completion_tokens_supported" : false,
+                      "custom_temperature_supported" : true,
+                      "skills_supported" : false,
+                      "reasoning_efforts" : [ ]
+                    },
+                    "defaults" : { },
+                    "responses_defaults" : { },
+                    "description_keywords" : [ ],
+                    "max_retry_attempts" : 1,
+                    "interface_configs" : {
+                      "openaiChatCompletions" : {
+                        "features" : {
+                          "rate" : true,
+                          "tokenize" : false,
+                          "truncate_prompt" : false,
+                          "configuration" : true,
+                          "system_prompt" : false,
+                          "tools" : false,
+                          "seed" : false,
+                          "url_attachments" : false,
+                          "folder_attachments" : false,
+                          "allow_resume" : true,
+                          "accessible_by_per_request_key" : true,
+                          "content_parts" : false,
+                          "temperature" : true,
+                          "cache" : false,
+                          "auto_caching" : false,
+                          "parallel_tool_calls" : true,
+                          "assistant_attachments_in_request" : false,
+                          "mcp" : false,
+                          "chat_completion" : true,
+                          "responses_api" : false,
+                          "max_tokens_supported" : true,
+                          "max_completion_tokens_supported" : false,
+                          "custom_temperature_supported" : true,
+                          "skills_supported" : false,
+                          "reasoning_efforts" : [ ]
+                        },
+                        "defaults" : { },
+                        "default_headers" : { }
+                      }
+                    },
+                    "routes" : {
+                      "index-search" : {
+                        "rewritePath" : true,
+                        "paths" : [ "/v1/index(/[^/]+)*$" ],
+                        "methods" : [ "DELETE", "POST", "PUT" ],
+                        "maxRetryAttempts" : 1,
+                        "order" : 2147483647,
+                        "permissions" : [ ],
+                        "attachmentPaths" : {
+                          "requestBody" : [ "@.attachments[*].url" ],
+                          "responseBody" : [ "@.result.attachedFiles" ]
+                        }
+                      }
+                    }
+                  }, {
+                    "id" : "app-responses",
+                    "application" : "app-responses",
+                    "display_name" : "App with Responses API",
+                    "reference" : "app-responses",
+                    "owner" : "organization-owner",
+                    "object" : "application",
+                    "status" : "succeeded",
+                    "created_at" : 1672534800,
+                    "updated_at" : 1672534800,
                     "features" : {
                       "rate" : false,
                       "tokenize" : false,
@@ -1077,19 +1288,167 @@ class ApplicationDeploymentApiTest extends ResourceBaseTest {
                       "folder_attachments" : false,
                       "allow_resume" : true,
                       "accessible_by_per_request_key" : true,
-                      "content_parts": false,
+                      "content_parts" : false,
                       "temperature" : true,
-                      "addons" : true,
                       "cache" : false,
                       "auto_caching" : false,
-                      "parallel_tool_calls" : true
+                      "parallel_tool_calls" : true,
+                      "assistant_attachments_in_request" : false,
+                      "mcp" : false,
+                      "chat_completion" : true,
+                      "responses_api" : true,
+                      "max_tokens_supported" : true,
+                      "max_completion_tokens_supported" : false,
+                      "custom_temperature_supported" : true,
+                      "skills_supported" : false,
+                      "reasoning_efforts" : [ ]
                     },
                     "defaults" : { },
+                    "responses_defaults" : { },
                     "description_keywords" : [ ],
                     "max_retry_attempts" : 1,
+                    "interface_configs" : {
+                      "openaiChatCompletions" : {
+                        "features" : {
+                          "rate" : false,
+                          "tokenize" : false,
+                          "truncate_prompt" : false,
+                          "configuration" : false,
+                          "system_prompt" : true,
+                          "tools" : false,
+                          "seed" : false,
+                          "url_attachments" : false,
+                          "folder_attachments" : false,
+                          "allow_resume" : true,
+                          "accessible_by_per_request_key" : true,
+                          "content_parts" : false,
+                          "temperature" : true,
+                          "cache" : false,
+                          "auto_caching" : false,
+                          "parallel_tool_calls" : true,
+                          "assistant_attachments_in_request" : false,
+                          "mcp" : false,
+                          "chat_completion" : true,
+                          "responses_api" : false,
+                          "max_tokens_supported" : true,
+                          "max_completion_tokens_supported" : false,
+                          "custom_temperature_supported" : true,
+                          "skills_supported" : false,
+                          "reasoning_efforts" : [ ]
+                        },
+                        "defaults" : { },
+                        "default_headers" : { }
+                      },
+                      "openaiResponses" : {
+                        "features" : {
+                          "rate" : false,
+                          "tokenize" : false,
+                          "truncate_prompt" : false,
+                          "configuration" : false,
+                          "system_prompt" : true,
+                          "tools" : false,
+                          "seed" : false,
+                          "url_attachments" : false,
+                          "folder_attachments" : false,
+                          "allow_resume" : true,
+                          "accessible_by_per_request_key" : true,
+                          "content_parts" : false,
+                          "temperature" : true,
+                          "cache" : false,
+                          "auto_caching" : false,
+                          "parallel_tool_calls" : true,
+                          "assistant_attachments_in_request" : false,
+                          "mcp" : false,
+                          "chat_completion" : false,
+                          "responses_api" : true,
+                          "max_tokens_supported" : true,
+                          "max_completion_tokens_supported" : false,
+                          "custom_temperature_supported" : true,
+                          "skills_supported" : false,
+                          "reasoning_efforts" : [ ]
+                        },
+                        "defaults" : { },
+                        "default_headers" : { }
+                      }
+                    },
+                    "routes" : { }
+                  }, {
+                    "id" : "applications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/my-app",
+                    "application" : "applications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/my-app",
+                    "display_name" : "My App",
+                    "display_version" : "1.0",
+                    "icon_url" : "http://application1/icon.svg",
+                    "description" : "My App Description",
+                    "reference" : "@ignore",
                     "owner" : "EPM-RTC-GPT",
+                    "object" : "application",
+                    "status" : "succeeded",
                     "created_at" : "@ignore",
                     "updated_at" : "@ignore",
+                    "features" : {
+                      "rate" : false,
+                      "tokenize" : false,
+                      "truncate_prompt" : false,
+                      "configuration" : false,
+                      "system_prompt" : true,
+                      "tools" : false,
+                      "seed" : false,
+                      "url_attachments" : false,
+                      "folder_attachments" : false,
+                      "allow_resume" : true,
+                      "accessible_by_per_request_key" : true,
+                      "content_parts" : false,
+                      "temperature" : true,
+                      "cache" : false,
+                      "auto_caching" : false,
+                      "parallel_tool_calls" : true,
+                      "assistant_attachments_in_request" : false,
+                      "mcp" : false,
+                      "chat_completion" : true,
+                      "responses_api" : false,
+                      "max_tokens_supported" : true,
+                      "max_completion_tokens_supported" : false,
+                      "custom_temperature_supported" : true,
+                      "skills_supported" : false,
+                      "reasoning_efforts" : [ ]
+                    },
+                    "defaults" : { },
+                    "responses_defaults" : { },
+                    "description_keywords" : [ ],
+                    "max_retry_attempts" : 1,
+                    "interface_configs" : {
+                      "openaiChatCompletions" : {
+                        "features" : {
+                          "rate" : false,
+                          "tokenize" : false,
+                          "truncate_prompt" : false,
+                          "configuration" : false,
+                          "system_prompt" : true,
+                          "tools" : false,
+                          "seed" : false,
+                          "url_attachments" : false,
+                          "folder_attachments" : false,
+                          "allow_resume" : true,
+                          "accessible_by_per_request_key" : true,
+                          "content_parts" : false,
+                          "temperature" : true,
+                          "cache" : false,
+                          "auto_caching" : false,
+                          "parallel_tool_calls" : true,
+                          "assistant_attachments_in_request" : false,
+                          "mcp" : false,
+                          "chat_completion" : true,
+                          "responses_api" : false,
+                          "max_tokens_supported" : true,
+                          "max_completion_tokens_supported" : false,
+                          "custom_temperature_supported" : true,
+                          "skills_supported" : false,
+                          "reasoning_efforts" : [ ]
+                        },
+                        "defaults" : { },
+                        "default_headers" : { }
+                      }
+                    },
                     "function" : {
                       "id" : "0123",
                       "runtime" : "python3.11",
@@ -1112,9 +1471,9 @@ class ApplicationDeploymentApiTest extends ResourceBaseTest {
     }
 
     @SneakyThrows
-    private Response awaitApplicationStatus(String path, String status) {
+    private Response awaitApplicationStatus(String path, String status, String... headers) {
         for (long deadline = System.currentTimeMillis() + 10_000; ; ) {
-            Response response = send(HttpMethod.GET, path, null, null);
+            Response response = send(HttpMethod.GET, path, null, null, headers);
             verify(response, 200);
 
             if (response.body().contains(status)) {
@@ -1175,5 +1534,232 @@ class ApplicationDeploymentApiTest extends ResourceBaseTest {
 
         response = awaitApplicationStatus("/v1/applications/3CcedGxCx23EwiVbVmscVktScRyf46KypuBQ65miviST/my-app", "DEPLOYED");
         verify(response, 200);
+    }
+
+    @Test
+    void testDirectPublicApplicationCreated() {
+        Response response = send(HttpMethod.PUT, "/v1/applications/public/my-app", null, """
+                {
+                  "display_name": "My App",
+                  "display_version": "1.0",
+                  "icon_url": "http://application1/icon.svg",
+                  "description": "My App Description",
+                  "function": {
+                    "runtime": "python3.11",
+                    "source_folder": "files/public/my-app/",
+                    "mapping" : {
+                      "chat_completion" : "/application"
+                    },
+                    "env": {
+                      "VAR": "VAL"
+                    }
+                  }
+                }
+                """, "authorization", "admin");
+        verify(response, 200);
+        id++;
+    }
+
+    @Test
+    void testDirectPublicApplicationStarted() {
+        testDirectPublicApplicationCreated();
+
+        Response response = upload(HttpMethod.PUT, "/v1/files/public/my-app/app.py", null, """
+                some python code
+                """, "authorization", "admin");
+        verify(response, 200);
+
+        webServer.map(HttpMethod.POST, "/v1/image/0123", 200, """
+                :heartbeat
+                
+                event: result
+                data: {}
+                """);
+        webServer.map(HttpMethod.POST, "/v1/deployment/0123", 200, """
+                event: result
+                data: {"url":"http://localhost:17321"}
+                """);
+
+        response = send(HttpMethod.POST, "/v1/ops/application/deploy", null, """
+                {
+                  "url": "applications/public/my-app"
+                }
+                """, "authorization", "admin");
+        verifyJsonNotExact(response, 200, """
+                {
+                  "name" : "applications/public/my-app",
+                  "display_name" : "My App",
+                  "display_version" : "1.0",
+                  "icon_url" : "http://application1/icon.svg",
+                  "description" : "My App Description",
+                  "reference" : "@ignore",
+                  "forward_auth_token" : false,
+                  "features" : { },
+                  "defaults" : { },
+                  "responses_defaults" : { },
+                  "interceptors" : [ ],
+                  "description_keywords" : [ ],
+                  "max_retry_attempts" : 1,
+                  "dependencies" : [ ],
+                  "function" : {
+                    "id" : "0123",
+                    "runtime": "python3.11",
+                    "author_bucket" : "public",
+                    "source_folder" : "files/public/my-app/",
+                    "target_folder" : "files/BHSYDZdoJ31Kxh6XahLj91CUKXVSiLVJVCvSWyUkqFuc/",
+                    "status" : "DEPLOYING",
+                    "mapping" : {
+                      "chat_completion" : "/application"
+                    },
+                    "env" : {
+                      "VAR" : "VAL"
+                    }
+                  },
+                  "routes" : { }
+                }
+                """);
+
+        response = awaitApplicationStatus("/v1/applications/public/my-app", "DEPLOYED", "authorization", "admin");
+        verifyJsonNotExact(response, 200, """
+                {
+                  "name" : "applications/public/my-app",
+                  "endpoint" : "http://localhost:17321/application",
+                  "display_name" : "My App",
+                  "display_version" : "1.0",
+                  "icon_url" : "http://application1/icon.svg",
+                  "description" : "My App Description",
+                  "reference" : "@ignore",
+                  "forward_auth_token" : false,
+                  "features" : { },
+                  "defaults" : { },
+                  "responses_defaults" : { },
+                  "interceptors" : [ ],
+                  "description_keywords" : [ ],
+                  "max_retry_attempts" : 1,
+                  "dependencies" : [ ],
+                  "author" : "admin user",
+                  "created_at" : "@ignore",
+                  "updated_at" : "@ignore",
+                  "function" : {
+                    "id" : "0123",
+                    "runtime": "python3.11",
+                    "author_bucket" : "public",
+                    "source_folder" : "files/public/my-app/",
+                    "target_folder" : "files/BHSYDZdoJ31Kxh6XahLj91CUKXVSiLVJVCvSWyUkqFuc/",
+                    "status" : "DEPLOYED",
+                    "mapping" : {
+                      "chat_completion" : "/application"
+                    },
+                    "env" : {
+                      "VAR" : "VAL"
+                    }
+                  },
+                  "routes" : { }
+                }
+                """);
+
+        response = send(HttpMethod.GET, "/v1/metadata/files/BHSYDZdoJ31Kxh6XahLj91CUKXVSiLVJVCvSWyUkqFuc/app.py", null, null,
+                "authorization", "admin");
+        verify(response, 200);
+    }
+
+    @Test
+    void testDirectPublicApplicationStopped() {
+        testDirectPublicApplicationStarted();
+
+        webServer.map(HttpMethod.DELETE, "/v1/image/0123", 200,
+                """
+                event: result
+                data: {}
+                """);
+        webServer.map(HttpMethod.DELETE, "/v1/deployment/0123", 200,
+                """
+                event: result
+                data: {"deleted":true}
+                """);
+
+        Response response = send(HttpMethod.POST, "/v1/ops/application/undeploy", null, """
+                {
+                  "url": "applications/public/my-app"
+                }
+                """, "authorization", "admin");
+        verifyJsonNotExact(response, 200, """
+                {
+                  "name" : "applications/public/my-app",
+                  "display_name" : "My App",
+                  "display_version" : "1.0",
+                  "icon_url" : "http://application1/icon.svg",
+                  "description" : "My App Description",
+                  "reference" : "@ignore",
+                  "forward_auth_token" : false,
+                  "features" : { },
+                  "defaults" : { },
+                  "responses_defaults" : { },
+                  "interceptors" : [ ],
+                  "description_keywords" : [ ],
+                  "max_retry_attempts" : 1,
+                  "dependencies" : [ ],
+                  "function" : {
+                    "id" : "0123",
+                    "runtime": "python3.11",
+                    "author_bucket" : "public",
+                    "source_folder" : "files/public/my-app/",
+                    "target_folder" : "files/BHSYDZdoJ31Kxh6XahLj91CUKXVSiLVJVCvSWyUkqFuc/",
+                    "status" : "UNDEPLOYING",
+                    "mapping" : {
+                      "chat_completion" : "/application"
+                    },
+                    "env" : {
+                      "VAR" : "VAL"
+                    }
+                  },
+                   "routes" : { }
+                }
+                """);
+
+        response = awaitApplicationStatus("/v1/applications/public/my-app", "UNDEPLOYED", "authorization", "admin");
+        verifyJsonNotExact(response, 200, """
+                {
+                  "name" : "applications/public/my-app",
+                  "display_name" : "My App",
+                  "display_version" : "1.0",
+                  "icon_url" : "http://application1/icon.svg",
+                  "description" : "My App Description",
+                  "reference" : "@ignore",
+                  "forward_auth_token" : false,
+                  "features" : { },
+                  "defaults" : { },
+                  "responses_defaults" : { },
+                  "interceptors" : [ ],
+                  "description_keywords" : [ ],
+                  "max_retry_attempts" : 1,
+                  "dependencies" : [ ],
+                  "author" : "admin user",
+                  "created_at" : "@ignore",
+                  "updated_at" : "@ignore",
+                  "function" : {
+                    "id" : "0123",
+                    "runtime": "python3.11",
+                    "author_bucket" : "public",
+                    "source_folder" : "files/public/my-app/",
+                    "target_folder" : "files/BHSYDZdoJ31Kxh6XahLj91CUKXVSiLVJVCvSWyUkqFuc/",
+                    "status" : "UNDEPLOYED",
+                    "mapping" : {
+                      "chat_completion" : "/application"
+                    },
+                    "env" : {
+                      "VAR" : "VAL"
+                    }
+                  },
+                  "routes" : { }
+                }
+                """);
+
+        response = send(HttpMethod.GET, "/v1/metadata/files/public/my-app/app.py", null, null,
+                "authorization", "admin");
+        verify(response, 200);
+        response = send(HttpMethod.GET, "/v1/metadata/files/BHSYDZdoJ31Kxh6XahLj91CUKXVSiLVJVCvSWyUkqFuc/app.py", null, null,
+                "authorization", "admin");
+        verify(response, 404);
     }
 }

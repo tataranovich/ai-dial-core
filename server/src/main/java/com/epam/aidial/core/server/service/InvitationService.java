@@ -4,7 +4,6 @@ import com.epam.aidial.core.config.ResourceAccessType;
 import com.epam.aidial.core.server.data.Invitation;
 import com.epam.aidial.core.server.data.InvitationCollection;
 import com.epam.aidial.core.server.data.InvitationsMap;
-import com.epam.aidial.core.server.data.ResourceTypes;
 import com.epam.aidial.core.server.data.SharedResource;
 import com.epam.aidial.core.server.security.ApiKeyGenerator;
 import com.epam.aidial.core.server.security.EncryptionService;
@@ -12,6 +11,8 @@ import com.epam.aidial.core.server.util.ProxyUtil;
 import com.epam.aidial.core.server.util.ResourceDescriptorFactory;
 import com.epam.aidial.core.storage.exception.ResourceNotFoundException;
 import com.epam.aidial.core.storage.resource.ResourceDescriptor;
+import com.epam.aidial.core.storage.resource.ResourceType;
+import com.epam.aidial.core.storage.resource.ResourceTypes;
 import com.epam.aidial.core.storage.service.ResourceService;
 import io.vertx.core.json.JsonObject;
 import lombok.extern.slf4j.Slf4j;
@@ -41,19 +42,31 @@ public class InvitationService {
 
     private final ResourceService resourceService;
     private final EncryptionService encryptionService;
-    private final int expirationInSeconds;
+    private final int defaultTtlInSeconds;
 
     public InvitationService(ResourceService resourceService, EncryptionService encryptionService, JsonObject settings) {
         this.resourceService = resourceService;
         this.encryptionService = encryptionService;
-        this.expirationInSeconds = settings.getInteger("ttlInSeconds", DEFAULT_INVITATION_TTL_IN_SECONDS);
+        this.defaultTtlInSeconds = settings.getInteger("ttlInSeconds", DEFAULT_INVITATION_TTL_IN_SECONDS);
+        if (this.defaultTtlInSeconds <= 0) {
+            throw new IllegalArgumentException("invitations.ttlInSeconds must be a positive integer, but got: " + this.defaultTtlInSeconds);
+        }
     }
 
-    public Invitation createInvitation(String bucket, String location, List<SharedResource> resources, String userDisplayName, int maxAcceptedUsers, long ttl) {
+    /**
+     * Default invitation TTL in hours, derived from the {@code ttlInSeconds} setting.
+     * Used when no role defines an {@code invitation_ttl} share limit for a resource type.
+     */
+    public long getDefaultTtlInHours() {
+        long secondsPerHour = ChronoUnit.HOURS.getDuration().getSeconds();
+        return (defaultTtlInSeconds + secondsPerHour - 1) / secondsPerHour;
+    }
+
+    public Invitation createInvitation(String bucket, String location, List<SharedResource> resources, String userDisplayName, int maxAcceptedUsers, long ttlInHours) {
         ResourceDescriptor resource = ResourceDescriptorFactory.fromDecoded(ResourceTypes.INVITATION, bucket, location, INVITATION_RESOURCE_FILENAME);
         String invitationId = generateInvitationId(resource);
         Instant creationTime = Instant.now();
-        Instant expirationTime = Instant.now().plus(ttl, ChronoUnit.SECONDS);
+        Instant expirationTime = Instant.now().plus(ttlInHours, ChronoUnit.HOURS);
         Invitation invitation = new Invitation(invitationId, resources, creationTime.toEpochMilli(),
                 expirationTime.toEpochMilli(), userDisplayName, maxAcceptedUsers, new HashSet<>());
 
@@ -264,7 +277,7 @@ public class InvitationService {
         }
         String location = parts[0] + ResourceDescriptor.PATH_SEPARATOR + parts[1] + ResourceDescriptor.PATH_SEPARATOR;
         String bucket = encryptionService.encrypt(location);
-        ResourceTypes resourceType = ResourceTypes.of(parts[2]);
+        ResourceType resourceType = ResourceTypes.of(parts[2]);
         return ResourceDescriptorFactory.fromDecoded(resourceType, bucket, location, INVITATION_RESOURCE_FILENAME);
     }
 

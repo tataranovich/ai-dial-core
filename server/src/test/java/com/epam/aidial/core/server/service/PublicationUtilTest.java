@@ -1,11 +1,11 @@
 package com.epam.aidial.core.server.service;
 
 import com.epam.aidial.core.server.ResourceBaseTest;
-import com.epam.aidial.core.server.data.ResourceTypes;
 import com.epam.aidial.core.server.security.EncryptionService;
 import com.epam.aidial.core.server.util.ProxyUtil;
 import com.epam.aidial.core.server.util.ResourceDescriptorFactory;
 import com.epam.aidial.core.storage.resource.ResourceDescriptor;
+import com.epam.aidial.core.storage.resource.ResourceTypes;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -46,7 +46,6 @@ public class PublicationUtilTest {
                 "temperature": 1,
                 "folderId": "conversations/bucketName",
                 "messages": [],
-                "selectedAddons": ["R", "T", "G"],
                 "assistantModelId": "assistantId",
                 "lastActivityDate": 4848683153
                 }
@@ -62,7 +61,6 @@ public class PublicationUtilTest {
                 "temperature": 1,
                 "folderId": "conversations/bucketName/folder1",
                 "messages": [],
-                "selectedAddons": ["R", "T", "G"],
                 "assistantModelId": "assistantId",
                 "lastActivityDate": 4848683153
                 }
@@ -127,7 +125,6 @@ public class PublicationUtilTest {
                           }
                         }
                     ],
-                    "selectedAddons": ["R", "T", "G"],
                     "assistantModelId": "assistantId",
                     "lastActivityDate": 4848683153,
                     "playback": {
@@ -216,7 +213,6 @@ public class PublicationUtilTest {
                           }
                         }
                     ],
-                    "selectedAddons": ["R", "T", "G"],
                     "assistantModelId": "assistantId",
                     "lastActivityDate": 4848683153,
                     "playback" : {
@@ -295,7 +291,6 @@ public class PublicationUtilTest {
                           }
                         }
                     ],
-                    "selectedAddons": ["R", "T", "G"],
                     "assistantModelId": "assistantId",
                     "lastActivityDate": 4848683153,
                     "playback" : {
@@ -342,6 +337,34 @@ public class PublicationUtilTest {
                 "files/7G9WZNcoY26Vy9D7bEgbv6zqbJGfyDp9KZyEbJR4XMZt/b1/LICENSE", "files/public/License",
                 "files/7G9WZNcoY26Vy9D7bEgbv6zqbJGfyDp9KZyEbJR4XMZt/b1/Dockerfile", "files/public/Dockerfile",
                 "files/7G9WZNcoY26Vy9D7bEgbv6zqbJGfyDp9KZyEbJR4XMZt/b1/", "files/public/attachments/")));
+    }
+
+    @Test
+    void getRootLocation_withShortPath() {
+        String location = "Users/user/";
+
+        String result = PublicationUtil.getRootLocation(location);
+
+        assertEquals(location, result);
+    }
+
+    @Test
+    void getRootLocation_withOneElement() {
+        String location = "public/";
+
+        String result = PublicationUtil.getRootLocation(location);
+
+        assertEquals(location, result);
+    }
+
+    @Test
+    void getRootLocation_withDeeplyNestedPath() {
+        String location = "Users/user/publication-id/sub-folder/";
+        String expectedRootBucket = "Users/user/";
+
+        String result = PublicationUtil.getRootLocation(location);
+
+        assertEquals(expectedRootBucket, result);
     }
 
     private static void verifyJson(String expected, String actual) {

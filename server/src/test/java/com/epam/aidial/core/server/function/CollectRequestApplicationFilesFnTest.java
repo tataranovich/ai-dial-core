@@ -6,13 +6,14 @@ import com.epam.aidial.core.config.Deployment;
 import com.epam.aidial.core.server.Proxy;
 import com.epam.aidial.core.server.ProxyContext;
 import com.epam.aidial.core.server.data.ApiKeyData;
+import com.epam.aidial.core.server.function.request.ChatCompletionRequest;
+import com.epam.aidial.core.server.function.request.RequestObject;
 import com.epam.aidial.core.server.security.AccessService;
 import com.epam.aidial.core.server.service.ApplicationSchemaService;
 import com.epam.aidial.core.storage.http.HttpException;
 import com.epam.aidial.core.storage.resource.ResourceDescriptor;
 import com.epam.aidial.core.storage.service.ResourceService;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
-import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -62,12 +63,12 @@ public class CollectRequestApplicationFilesFnTest {
     private CollectRequestApplicationFilesFn fn;
 
     private Application application;
-    private ObjectNode tree;
+    private RequestObject request;
 
     @BeforeEach
     void setUp() {
         application = new Application();
-        tree = JsonNodeFactory.instance.objectNode();
+        request = new ChatCompletionRequest(JsonNodeFactory.instance.objectNode());
     }
 
     @Test
@@ -75,7 +76,7 @@ public class CollectRequestApplicationFilesFnTest {
         Deployment deployment = mock(Deployment.class);
         when(context.getDeployment()).thenReturn(deployment);
 
-        assertFalse(fn.apply(tree));
+        assertFalse(fn.apply(request));
         verify(proxy, never()).getApiKeyStore();
         verify(context, never()).getProxyApiKeyData();
     }
@@ -85,7 +86,7 @@ public class CollectRequestApplicationFilesFnTest {
         when(context.getDeployment()).thenReturn(application);
         application.setApplicationTypeSchemaId(null);
 
-        assertFalse(fn.apply(tree));
+        assertFalse(fn.apply(request));
         verify(proxy, never()).getApiKeyStore();
         verify(context, never()).getProxyApiKeyData();
     }
@@ -109,7 +110,7 @@ public class CollectRequestApplicationFilesFnTest {
         when(file.getUrl()).thenReturn(serverFile);
         when(applicationSchemaService.getFiles(eq(application))).thenReturn(List.of(file));
 
-        boolean result = fn.apply(tree);
+        boolean result = fn.apply(request);
 
         assertFalse(result);
         assertNotNull(apiKeyData.getAttachedFiles().get(serverFile));
@@ -167,13 +168,99 @@ public class CollectRequestApplicationFilesFnTest {
         when(file2.getUrl()).thenReturn(ragFiles[1]);
         when(applicationSchemaService.getFiles(eq(application))).thenReturn(List.of(file1, file2));
 
-        boolean result = fn.apply(tree);
+        boolean result = fn.apply(request);
 
         assertFalse(result);
         assertEquals(ragFiles.length, apiKeyData.getAttachedFiles().size());
         for (String ragFile : ragFiles) {
             assertNotNull(apiKeyData.getAttachedFiles().get(ragFile));
         }
+    }
+
+    @Test
+    void apply_appendsPromptsToApiKeyData_whenApplicationHasCustomSchemaId() {
+        String promptUrl = "prompts/bucket/my-prompt";
+        when(context.getDeployment()).thenReturn(application);
+        application.setApplicationTypeSchemaId(URI.create("customSchemaId"));
+        Map<String, Object> customProps = new HashMap<>();
+        customProps.put("prompt", Map.of("name", "my-prompt", "dial_id", promptUrl));
+        application.setApplicationProperties(customProps);
+        when(accessService.hasReadAccess(any(), any())).thenReturn(true);
+        ApiKeyData apiKeyData = new ApiKeyData();
+        when(context.getProxyApiKeyData()).thenReturn(apiKeyData);
+        when(proxy.getApplicationSchemaService()).thenReturn(applicationSchemaService);
+        when(proxy.getAccessService()).thenReturn(accessService);
+        ResourceDescriptor prompt = mock(ResourceDescriptor.class);
+        when(prompt.getUrl()).thenReturn(promptUrl);
+        when(applicationSchemaService.getPrompts(eq(application))).thenReturn(List.of(prompt));
+
+        boolean result = fn.apply(request);
+
+        assertFalse(result);
+        assertNotNull(apiKeyData.getAttachedPrompts().get(promptUrl));
+        assertEquals(1, apiKeyData.getAttachedPrompts().size());
+    }
+
+    @Test
+    void apply_throws_whenAccessServiceHasNoReadAccessToPrompt() {
+        String promptUrl = "prompts/bucket/my-prompt";
+        when(context.getDeployment()).thenReturn(application);
+        application.setApplicationTypeSchemaId(URI.create("customSchemaId"));
+        Map<String, Object> customProps = new HashMap<>();
+        customProps.put("prompt", Map.of("name", "my-prompt", "dial_id", promptUrl));
+        application.setApplicationProperties(customProps);
+        when(proxy.getApplicationSchemaService()).thenReturn(applicationSchemaService);
+        when(proxy.getAccessService()).thenReturn(accessService);
+        ResourceDescriptor prompt = mock(ResourceDescriptor.class);
+        when(applicationSchemaService.getPrompts(eq(application))).thenReturn(List.of(prompt));
+        when(accessService.hasReadAccess(any(), any())).thenReturn(false);
+        ApiKeyData apiKeyData = new ApiKeyData();
+        when(context.getProxyApiKeyData()).thenReturn(apiKeyData);
+
+        Assertions.assertThrows(HttpException.class, () -> fn.apply(request));
+    }
+
+    @Test
+    void apply_appendsSkillsToApiKeyData_whenApplicationHasCustomSchemaId() {
+        String skillUrl = "skills/bucket/my-skill";
+        when(context.getDeployment()).thenReturn(application);
+        application.setApplicationTypeSchemaId(URI.create("customSchemaId"));
+        Map<String, Object> customProps = new HashMap<>();
+        customProps.put("skill", Map.of("name", "my-skill", "dial_id", skillUrl));
+        application.setApplicationProperties(customProps);
+        when(accessService.hasReadAccess(any(), any())).thenReturn(true);
+        ApiKeyData apiKeyData = new ApiKeyData();
+        when(context.getProxyApiKeyData()).thenReturn(apiKeyData);
+        when(proxy.getApplicationSchemaService()).thenReturn(applicationSchemaService);
+        when(proxy.getAccessService()).thenReturn(accessService);
+        ResourceDescriptor skill = mock(ResourceDescriptor.class);
+        when(skill.getUrl()).thenReturn(skillUrl);
+        when(applicationSchemaService.getSkills(eq(application))).thenReturn(List.of(skill));
+
+        boolean result = fn.apply(request);
+
+        assertFalse(result);
+        assertNotNull(apiKeyData.getAttachedSkills().get(skillUrl));
+        assertEquals(1, apiKeyData.getAttachedSkills().size());
+    }
+
+    @Test
+    void apply_throws_whenAccessServiceHasNoReadAccessToSkill() {
+        String skillUrl = "skills/bucket/my-skill";
+        when(context.getDeployment()).thenReturn(application);
+        application.setApplicationTypeSchemaId(URI.create("customSchemaId"));
+        Map<String, Object> customProps = new HashMap<>();
+        customProps.put("skill", Map.of("name", "my-skill", "dial_id", skillUrl));
+        application.setApplicationProperties(customProps);
+        when(proxy.getApplicationSchemaService()).thenReturn(applicationSchemaService);
+        when(proxy.getAccessService()).thenReturn(accessService);
+        ResourceDescriptor skill = mock(ResourceDescriptor.class);
+        when(applicationSchemaService.getSkills(eq(application))).thenReturn(List.of(skill));
+        when(accessService.hasReadAccess(any(), any())).thenReturn(false);
+        ApiKeyData apiKeyData = new ApiKeyData();
+        when(context.getProxyApiKeyData()).thenReturn(apiKeyData);
+
+        Assertions.assertThrows(HttpException.class, () -> fn.apply(request));
     }
 
     @Test
@@ -194,6 +281,6 @@ public class CollectRequestApplicationFilesFnTest {
         ApiKeyData apiKeyData = new ApiKeyData();
         when(context.getProxyApiKeyData()).thenReturn(apiKeyData);
 
-        Assertions.assertThrows(HttpException.class, () -> fn.apply(tree));
+        Assertions.assertThrows(HttpException.class, () -> fn.apply(request));
     }
 }

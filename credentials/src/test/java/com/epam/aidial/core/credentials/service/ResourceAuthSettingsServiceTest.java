@@ -12,7 +12,13 @@ import com.epam.aidial.core.credentials.data.registration.ClientRegistration;
 import com.epam.aidial.core.credentials.service.registration.ResourceRegistrationService;
 import com.epam.aidial.core.credentials.service.token.OauthTokenRefreshStrategy;
 import com.epam.aidial.core.credentials.service.token.TokenRefreshStrategyFactory;
-import com.epam.aidial.core.credentials.validation.ResourceAuthSettingsValidator;
+import com.epam.aidial.core.credentials.validation.ApiKeyAuthSettingsValidator;
+import com.epam.aidial.core.credentials.validation.AuthSettingsValidatorFactory;
+import com.epam.aidial.core.credentials.validation.OauthAuthSettingsValidator;
+import com.nimbusds.oauth2.sdk.pkce.CodeChallenge;
+import com.nimbusds.oauth2.sdk.pkce.CodeChallengeMethod;
+import com.nimbusds.oauth2.sdk.pkce.CodeVerifier;
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -29,9 +35,10 @@ import java.util.Objects;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -42,12 +49,11 @@ class ResourceAuthSettingsServiceTest {
 
     private static final String USER_1 = "user1";
     private static final String USER_2 = "user2";
+    private static final String RESOURCE_NAME = "TestToolSet";
+    private static final String RESOURCE_ENDPOINT = "https://example.com";
 
     @Mock
     private ResourceCredentialsService resourceCredentialsService;
-
-    @Mock
-    private ResourceAuthSettingsValidator resourceAuthSettingsValidator;
 
     @Mock
     private ResourceRegistrationService resourceRegistrationService;
@@ -57,6 +63,15 @@ class ResourceAuthSettingsServiceTest {
 
     @Mock
     private OauthTokenRefreshStrategy oauthTokenRefreshStrategy;
+
+    @Mock
+    private AuthSettingsValidatorFactory validatorFactory;
+
+    @Mock
+    private OauthAuthSettingsValidator oauthAuthSettingsValidator;
+
+    @Mock
+    private ApiKeyAuthSettingsValidator apiKeyAuthSettingsValidator;
 
     @InjectMocks
     private ResourceAuthSettingsService resourceAuthSettingsService;
@@ -122,7 +137,7 @@ class ResourceAuthSettingsServiceTest {
                                      ResourceAuthStatus expectedUserLevelStatus,
                                      ResourceAuthStatus expectedGlobalLevelStatus) {
         // Given
-        ToolSet toolSet = createToolSet();
+        ToolSet toolSet = createOauthToolSet();
         CredentialsLocator credentialsLocator = createCredentialsLocator();
         when(resourceCredentialsService.getAllResourceCredentials(credentialsLocator))
                 .thenReturn(
@@ -153,118 +168,450 @@ class ResourceAuthSettingsServiceTest {
     }
 
     @Test
-    void testEnrichResourceAuthSettings_NoAuthSettings() {
+    void testProcessResourceAuthSettings_ForwardPerRequestKeyAndAuthType() {
         // Given
-        String resourceId = "resource-id";
-        String resourceEndpoint = "https://example.com";
+        ToolSet newToolSet = createApiKeyToolSet("apiKeyHeader");
+        newToolSet.setForwardPerRequestKey(true);
 
-        // When & Then
-        IllegalArgumentException exception = assertThrows(IllegalArgumentException.class,
-                () -> resourceAuthSettingsService.enrichResourceAuthSettings(resourceId, resourceEndpoint, null)
-        );
-
-        assertEquals("ResourceAuthSettings is not defined for Resource: " + resourceId, exception.getMessage());
+        // When
+        Assertions.assertThrows(IllegalArgumentException.class, () -> resourceAuthSettingsService.processResourceAuthSettings(newToolSet, null));
     }
 
     @Test
-    void testEnrichResourceAuthSettings_Validated() {
+    void testProcessResourceAuthSettings_NewOauthToolSetWithDynamicRegistration() {
         // Given
-        String resourceId = "resource-id";
-        String resourceEndpoint = "https://example.com";
-        ResourceAuthSettings resourceAuthSettings = new ResourceAuthSettings();
-        resourceAuthSettings.setAuthenticationType(AuthenticationType.OAUTH);
+        ToolSet newToolSet = createOauthToolSet(null, null);
+        ClientRegistration mockRegistration = createClientRegistration();
 
-        ClientRegistration mockClientRegistration = ClientRegistration.builder().build();
-        when(resourceRegistrationService.register(resourceId, resourceEndpoint, resourceAuthSettings))
-                .thenReturn(mockClientRegistration);
+        when(validatorFactory.getValidator(AuthenticationType.OAUTH)).thenReturn(oauthAuthSettingsValidator);
+        when(resourceRegistrationService.register(eq(RESOURCE_NAME), eq(RESOURCE_ENDPOINT), any(), eq(true)))
+                .thenReturn(mockRegistration);
 
         // When
-        resourceAuthSettingsService.enrichResourceAuthSettings(resourceId, resourceEndpoint, resourceAuthSettings);
+        resourceAuthSettingsService.processResourceAuthSettings(newToolSet, null);
 
         // Then
-        verify(resourceAuthSettingsValidator, times(1)).validate(resourceAuthSettings);
+        verify(oauthAuthSettingsValidator, times(1)).validate(
+                any(ResourceAuthSettings.class), eq(ResourceAuthSettingsChangeMode.CREATE_DYNAMIC_CLIENT));
+        verify(resourceRegistrationService, times(1)).register(
+                eq(RESOURCE_NAME), eq(RESOURCE_ENDPOINT), any(ResourceAuthSettings.class), eq(true));
+
+        assertEquals("newClientId", newToolSet.getAuthSettings().getClientId());
+        assertEquals("newClientSecret", newToolSet.getAuthSettings().getClientSecret());
+        assertEquals("authEndpoint", newToolSet.getAuthSettings().getAuthorizationEndpoint());
+        assertEquals("redirectUri", newToolSet.getAuthSettings().getRedirectUri());
+        assertEquals(List.of("read", "write"), newToolSet.getAuthSettings().getScopesSupported());
     }
 
     @Test
-    void testEnrichResourceAuthSettings_ApiKey() {
+    void testProcessResourceAuthSettings_NewOauthToolSetWithStaticRegistration() {
         // Given
-        String resourceId = "resource-id";
-        String resourceEndpoint = "https://example.com";
-        ResourceAuthSettings resourceAuthSettings = new ResourceAuthSettings();
-        resourceAuthSettings.setAuthenticationType(AuthenticationType.API_KEY);
+        ToolSet newToolSet = createOauthToolSet("newClientId", "newClientSecret");
+        ClientRegistration mockRegistration = createClientRegistration();
+
+        when(validatorFactory.getValidator(AuthenticationType.OAUTH)).thenReturn(oauthAuthSettingsValidator);
+        when(resourceRegistrationService.register(eq(RESOURCE_NAME), eq(RESOURCE_ENDPOINT), any(), eq(false)))
+                .thenReturn(mockRegistration);
 
         // When
-        resourceAuthSettingsService.enrichResourceAuthSettings(resourceId, resourceEndpoint, resourceAuthSettings);
+        resourceAuthSettingsService.processResourceAuthSettings(newToolSet, null);
 
         // Then
+        verify(oauthAuthSettingsValidator, times(1)).validate(
+                any(ResourceAuthSettings.class), eq(ResourceAuthSettingsChangeMode.CREATE_STATIC_CLIENT));
+        verify(resourceRegistrationService, times(1)).register(
+                eq(RESOURCE_NAME), eq(RESOURCE_ENDPOINT), any(ResourceAuthSettings.class), eq(false));
+
+        assertEquals("newClientId", newToolSet.getAuthSettings().getClientId());
+        assertEquals("newClientSecret", newToolSet.getAuthSettings().getClientSecret());
+        assertEquals("authEndpoint", newToolSet.getAuthSettings().getAuthorizationEndpoint());
+        assertEquals("redirectUri", newToolSet.getAuthSettings().getRedirectUri());
+        assertEquals(List.of("read", "write"), newToolSet.getAuthSettings().getScopesSupported());
+    }
+
+    @Test
+    void testProcessResourceAuthSettings_NewApiKeyToolSet() {
+        // Given
+        ToolSet newToolSet = createApiKeyToolSet("apiKeyHeader");
+
+        // When
+        when(validatorFactory.getValidator(AuthenticationType.API_KEY)).thenReturn(apiKeyAuthSettingsValidator);
+
+        resourceAuthSettingsService.processResourceAuthSettings(newToolSet, null);
+
+        // Then
+        verify(apiKeyAuthSettingsValidator, times(1)).validate(
+                any(ResourceAuthSettings.class), eq(ResourceAuthSettingsChangeMode.NO_CLIENT_CHANGES));
         verifyNoInteractions(resourceRegistrationService);
-        assertNull(resourceAuthSettings.getClientId());
-        assertNull(resourceAuthSettings.getClientSecret());
+        assertEquals("apiKeyHeader", newToolSet.getAuthSettings().getApiKeyHeader());
     }
 
     @Test
-    void testEnrichResourceAuthSettings_Success() {
+    void testProcessResourceAuthSettings_OauthUpdate_CodeChallengeMethodUnchanged_PreservesPkce() {
         // Given
-        String resourceId = "resource-id";
-        String resourceEndpoint = "https://example.com";
-        ResourceAuthSettings resourceAuthSettings = new ResourceAuthSettings();
-        resourceAuthSettings.setAuthenticationType(AuthenticationType.OAUTH);
+        ToolSet updatedToolSet = createOauthToolSetWithPkce("clientId", "clientSecret",
+                CodeChallengeMethod.S256.getValue(), "origChallenge", "origVerifier");
+        ToolSet existingToolSet = createOauthToolSetWithPkce("clientId", "clientSecret",
+                CodeChallengeMethod.S256.getValue(), "origChallenge", "origVerifier");
 
-        ClientRegistration mockClientRegistration = ClientRegistration.builder()
-                .clientId("mock-client-id")
-                .clientSecret("mock-client-secret")
-                .authorizationEndpoint("mock-auth-endpoint")
-                .tokenEndpoint("mock-token-endpoint")
-                .redirectUri("mock-redirect-uri")
-                .scopesSupported(List.of("scope1", "scope2"))
-                .codeChallengeMethod("S256")
-                .build();
-
-        when(resourceRegistrationService.register(resourceId, resourceEndpoint, resourceAuthSettings))
-                .thenReturn(mockClientRegistration);
+        when(validatorFactory.getValidator(AuthenticationType.OAUTH)).thenReturn(oauthAuthSettingsValidator);
 
         // When
-        resourceAuthSettingsService.enrichResourceAuthSettings(resourceId, resourceEndpoint, resourceAuthSettings);
+        resourceAuthSettingsService.processResourceAuthSettings(updatedToolSet, existingToolSet);
 
         // Then
-        verify(resourceRegistrationService, times(1)).register(resourceId, resourceEndpoint, resourceAuthSettings);
-        assertEquals("mock-client-id", resourceAuthSettings.getClientId());
-        assertEquals("mock-client-secret", resourceAuthSettings.getClientSecret());
-        assertEquals("mock-auth-endpoint", resourceAuthSettings.getAuthorizationEndpoint());
-        assertEquals("mock-token-endpoint", resourceAuthSettings.getTokenEndpoint());
-        assertEquals("mock-redirect-uri", resourceAuthSettings.getRedirectUri());
-        assertEquals(List.of("scope1", "scope2"), resourceAuthSettings.getScopesSupported());
+        verify(oauthAuthSettingsValidator, times(1)).validate(
+                any(ResourceAuthSettings.class), eq(ResourceAuthSettingsChangeMode.NO_CLIENT_CHANGES));
+        verifyNoInteractions(resourceRegistrationService);
+
+        ResourceAuthSettings result = updatedToolSet.getAuthSettings();
+        assertEquals(CodeChallengeMethod.S256.getValue(), result.getCodeChallengeMethod());
+        assertEquals("origChallenge", result.getCodeChallenge());
+        assertEquals("origVerifier", result.getCodeVerifier());
     }
 
     @Test
-    void shouldSetCodeChallengePropertiesWhenMethodIsProvided() {
+    void testProcessResourceAuthSettings_OauthUpdate_CodeChallengeMethodNull_PreservesPkce() {
         // Given
-        String resourceId = "resource-id";
-        String resourceEndpoint = "https://example.com";
-        ResourceAuthSettings resourceAuthSettings = new ResourceAuthSettings();
-        resourceAuthSettings.setAuthenticationType(AuthenticationType.OAUTH);
+        ToolSet updatedToolSet = createOauthToolSetWithPkce("clientId", "clientSecret",
+                null, null, null);
+        ToolSet existingToolSet = createOauthToolSetWithPkce("clientId", "clientSecret",
+                CodeChallengeMethod.S256.getValue(), "origChallenge", "origVerifier");
 
-        ClientRegistration mockClientRegistration = ClientRegistration.builder()
-                .codeChallengeMethod("S256")
-                .build();
-
-        when(resourceRegistrationService.register(resourceId, resourceEndpoint, resourceAuthSettings))
-                .thenReturn(mockClientRegistration);
+        when(validatorFactory.getValidator(AuthenticationType.OAUTH)).thenReturn(oauthAuthSettingsValidator);
 
         // When
-        resourceAuthSettingsService.enrichResourceAuthSettings(resourceId, resourceEndpoint, resourceAuthSettings);
+        resourceAuthSettingsService.processResourceAuthSettings(updatedToolSet, existingToolSet);
 
         // Then
-        assertNotNull(resourceAuthSettings.getCodeChallenge());
-        assertNotNull(resourceAuthSettings.getCodeVerifier());
-        assertEquals("S256", resourceAuthSettings.getCodeChallengeMethod());
+        verify(oauthAuthSettingsValidator, times(1)).validate(
+                any(ResourceAuthSettings.class), eq(ResourceAuthSettingsChangeMode.NO_CLIENT_CHANGES));
+        verifyNoInteractions(resourceRegistrationService);
+
+        ResourceAuthSettings result = updatedToolSet.getAuthSettings();
+        assertEquals(CodeChallengeMethod.S256.getValue(), result.getCodeChallengeMethod());
+        assertEquals("origChallenge", result.getCodeChallenge());
+        assertEquals("origVerifier", result.getCodeVerifier());
     }
 
-    private ToolSet createToolSet() {
+    @Test
+    void testProcessResourceAuthSettings_OauthUpdate_CodeChallengeMethodChanged_RegeneratesPkce() {
+        // Given
+        CodeVerifier originalVerifier = new CodeVerifier();
+        String originalChallenge = CodeChallenge.compute(CodeChallengeMethod.S256, originalVerifier).getValue();
+        ToolSet updatedToolSet = createOauthToolSetWithPkce("clientId", "clientSecret",
+                CodeChallengeMethod.PLAIN.getValue(), originalChallenge, originalVerifier.getValue());
+        ToolSet existingToolSet = createOauthToolSetWithPkce("clientId", "clientSecret",
+                CodeChallengeMethod.S256.getValue(), originalChallenge, originalVerifier.getValue());
+
+        when(validatorFactory.getValidator(AuthenticationType.OAUTH)).thenReturn(oauthAuthSettingsValidator);
+
+        // When
+        resourceAuthSettingsService.processResourceAuthSettings(updatedToolSet, existingToolSet);
+
+        // Then
+        verify(oauthAuthSettingsValidator, times(1)).validate(
+                any(ResourceAuthSettings.class), eq(ResourceAuthSettingsChangeMode.NO_CLIENT_CHANGES));
+        verifyNoInteractions(resourceRegistrationService);
+
+        ResourceAuthSettings result = updatedToolSet.getAuthSettings();
+        assertEquals(CodeChallengeMethod.PLAIN.getValue(), result.getCodeChallengeMethod());
+        Assertions.assertNotNull(result.getCodeVerifier());
+        Assertions.assertNotNull(result.getCodeChallenge());
+        Assertions.assertNotEquals(originalVerifier.getValue(), result.getCodeVerifier());
+        Assertions.assertNotEquals(originalChallenge, result.getCodeChallenge());
+        // PLAIN method: challenge equals verifier
+        assertEquals(result.getCodeVerifier(), result.getCodeChallenge());
+    }
+
+    @Test
+    void testProcessResourceAuthSettings_DcrToolsetUpdate_WithClientIdButNoSecret_PreservesDynamicallyRegistered() {
+        // Frontend echoes back client_id (returned by GET) but no client_secret (never returned).
+        // dynamically_registered must NOT be reset to false — the toolset is still DCR.
+        ToolSet updatedToolSet = createOauthToolSet("dcr-client-id", null);
+        ToolSet existingToolSet = createOauthToolSet("dcr-client-id", "encrypted-client-secret");
+        existingToolSet.getAuthSettings().setDynamicallyRegistered(true);
+
+        when(validatorFactory.getValidator(AuthenticationType.OAUTH)).thenReturn(oauthAuthSettingsValidator);
+
+        resourceAuthSettingsService.processResourceAuthSettings(updatedToolSet, existingToolSet);
+
+        assertEquals(Boolean.TRUE, updatedToolSet.getAuthSettings().getDynamicallyRegistered());
+        verify(resourceRegistrationService, never()).register(any(), any(), any(), anyBoolean());
+    }
+
+    @Test
+    void testProcessResourceAuthSettings_DcrToolsetConvertedToStatic_SetsDynamicallyRegisteredFalse() {
+        // Admin explicitly provides both client_id and client_secret → converting DCR to static.
+        // dynamically_registered must be set to false.
+        ToolSet updatedToolSet = createOauthToolSet("static-client-id", "static-client-secret");
+        ToolSet existingToolSet = createOauthToolSet("dcr-client-id", "encrypted-dcr-secret");
+        existingToolSet.getAuthSettings().setDynamicallyRegistered(true);
+
+        when(validatorFactory.getValidator(AuthenticationType.OAUTH)).thenReturn(oauthAuthSettingsValidator);
+
+        resourceAuthSettingsService.processResourceAuthSettings(updatedToolSet, existingToolSet);
+
+        assertEquals(Boolean.FALSE, updatedToolSet.getAuthSettings().getDynamicallyRegistered());
+        verify(resourceRegistrationService, never()).register(any(), any(), any(), anyBoolean());
+    }
+
+    @Test
+    void testProcessResourceAuthSettings_OauthUpdate_TokenEndpointAuthMethodNull_PreservesExisting() {
+        ToolSet updatedToolSet = createOauthToolSetWithTokenEndpointAuthMethod("clientId", "clientSecret", null);
+        ToolSet existingToolSet = createOauthToolSetWithTokenEndpointAuthMethod("clientId", "clientSecret",
+                "client_secret_basic");
+
+        when(validatorFactory.getValidator(AuthenticationType.OAUTH)).thenReturn(oauthAuthSettingsValidator);
+
+        resourceAuthSettingsService.processResourceAuthSettings(updatedToolSet, existingToolSet);
+
+        verifyNoInteractions(resourceRegistrationService);
+        assertEquals("client_secret_basic", updatedToolSet.getAuthSettings().getTokenEndpointAuthMethod());
+    }
+
+    @Test
+    void testProcessResourceAuthSettings_OauthUpdate_TokenEndpointAuthMethodChanged_Overrides() {
+        ToolSet updatedToolSet = createOauthToolSetWithTokenEndpointAuthMethod("clientId", "clientSecret", "none");
+        ToolSet existingToolSet = createOauthToolSetWithTokenEndpointAuthMethod("clientId", "clientSecret",
+                "client_secret_basic");
+
+        when(validatorFactory.getValidator(AuthenticationType.OAUTH)).thenReturn(oauthAuthSettingsValidator);
+
+        resourceAuthSettingsService.processResourceAuthSettings(updatedToolSet, existingToolSet);
+
+        verifyNoInteractions(resourceRegistrationService);
+        assertEquals("none", updatedToolSet.getAuthSettings().getTokenEndpointAuthMethod());
+    }
+
+    @Test
+    void testProcessResourceAuthSettings_UpdatedApiKeyToolSet() {
+        // Given
+        ToolSet updatedToolSet = createApiKeyToolSet("newApiKeyHeader");
+        ToolSet existingToolSet = createApiKeyToolSet("oldApiKeyHeader");
+
+        // When
+        when(validatorFactory.getValidator(AuthenticationType.API_KEY)).thenReturn(apiKeyAuthSettingsValidator);
+
+        resourceAuthSettingsService.processResourceAuthSettings(updatedToolSet, existingToolSet);
+
+        // Then
+        verify(apiKeyAuthSettingsValidator, times(1)).validate(
+                any(ResourceAuthSettings.class), eq(ResourceAuthSettingsChangeMode.NO_CLIENT_CHANGES));
+        verifyNoInteractions(resourceRegistrationService);
+        assertEquals("newApiKeyHeader", updatedToolSet.getAuthSettings().getApiKeyHeader());
+    }
+
+    private static Stream<Arguments> provideProcessResourceAuthSettingsTestCases() {
+        return Stream.of(
+                // Case 1: Unchanged OAuth settings
+                Arguments.of(createOauthToolSet("sameClientId", "sameClientSecret"),
+                        createOauthToolSet("sameClientId", "sameClientSecret", "sameCodeVerifier"),
+                        AuthenticationType.OAUTH,
+                        false,
+                        ResourceAuthSettingsChangeMode.NO_CLIENT_CHANGES,
+                        false),
+
+                // Case 2: Changed OAuth settings
+                Arguments.of(createOauthToolSet("newClientId", "newClientSecret"),
+                        createOauthToolSet("oldClientId", "oldClientSecret", "oldCodeVerifier"),
+                        AuthenticationType.OAUTH,
+                        false,
+                        ResourceAuthSettingsChangeMode.NO_CLIENT_CHANGES,
+                        false),
+
+                // Case 3: Changed OAuth settings with null clientSecret
+                Arguments.of(createOauthToolSet("newClientId", null),
+                        createOauthToolSet("oldClientId", "oldClientSecret", "oldCodeVerifier"),
+                        AuthenticationType.OAUTH,
+                        false,
+                        ResourceAuthSettingsChangeMode.NO_CLIENT_CHANGES,
+                        false),
+
+                // Case 4: API Key -> OAuth Dynamic Registration
+                Arguments.of(createOauthToolSet(null, null),
+                        createApiKeyToolSet("apiKeyHeader"),
+                        AuthenticationType.OAUTH,
+                        false,
+                        ResourceAuthSettingsChangeMode.CREATE_DYNAMIC_CLIENT,
+                        true),
+
+                // Case 5: API Key -> OAuth Static Registration
+                Arguments.of(createOauthToolSet("newClientId", "newClientSecret"),
+                        createApiKeyToolSet("apiKeyHeader"),
+                        AuthenticationType.OAUTH,
+                        false,
+                        ResourceAuthSettingsChangeMode.CREATE_STATIC_CLIENT,
+                        true),
+
+                // Case 6: None -> OAuth Dynamic Registration
+                Arguments.of(createOauthToolSet(null, null),
+                        createNoneToolSet(),
+                        AuthenticationType.OAUTH,
+                        false,
+                        ResourceAuthSettingsChangeMode.CREATE_DYNAMIC_CLIENT,
+                        true),
+
+                // Case 7: None -> OAuth Static Registration
+                Arguments.of(createOauthToolSet("newClientId", "newClientSecret"),
+                        createNoneToolSet(),
+                        AuthenticationType.OAUTH,
+                        false,
+                        ResourceAuthSettingsChangeMode.CREATE_STATIC_CLIENT,
+                        true),
+
+                // Case 8: OAuth -> API Key
+                Arguments.of(createApiKeyToolSet("newApiKeyHeader"),
+                        createOauthToolSet("oldClientId", "oldClientSecret"),
+                        AuthenticationType.API_KEY,
+                        true,
+                        ResourceAuthSettingsChangeMode.NO_CLIENT_CHANGES,
+                        false),
+
+                // Case 9: None -> API Key
+                Arguments.of(createApiKeyToolSet("newApiKeyHeader"),
+                        createNoneToolSet(),
+                        AuthenticationType.API_KEY,
+                        true,
+                        ResourceAuthSettingsChangeMode.NO_CLIENT_CHANGES,
+                        false),
+
+                // Case 10: API Key -> None
+                Arguments.of(createNoneToolSet(),
+                        createApiKeyToolSet("apiKeyHeader"),
+                        AuthenticationType.NONE,
+                        true,
+                        ResourceAuthSettingsChangeMode.NO_CLIENT_CHANGES,
+                        false),
+
+                // Case 11: OAuth -> None
+                Arguments.of(createNoneToolSet(),
+                        createOauthToolSet("oldClientId", "oldClientSecret"),
+                        AuthenticationType.NONE,
+                        true,
+                        ResourceAuthSettingsChangeMode.NO_CLIENT_CHANGES,
+                        false)
+        );
+    }
+
+    @ParameterizedTest
+    @MethodSource("provideProcessResourceAuthSettingsTestCases")
+    void parametrizedTestProcessResourceAuthSettings(ToolSet updatedToolSet,
+                                                     ToolSet existingToolSet,
+                                                     AuthenticationType expectedAuthType,
+                                                     boolean expectedNullCodeVerifier,
+                                                     ResourceAuthSettingsChangeMode changeMode,
+                                                     boolean shouldRegister) {
+        // Given
+        ClientRegistration mockRegistration = createClientRegistration();
+        if (shouldRegister) {
+            when(resourceRegistrationService.register(
+                    eq(RESOURCE_NAME), eq(RESOURCE_ENDPOINT), any(), eq(changeMode == ResourceAuthSettingsChangeMode.CREATE_DYNAMIC_CLIENT)))
+                    .thenReturn(mockRegistration);
+        }
+        when(validatorFactory.getValidator(expectedAuthType))
+                .thenReturn(expectedAuthType == AuthenticationType.OAUTH ? oauthAuthSettingsValidator : apiKeyAuthSettingsValidator);
+
+        // When
+        resourceAuthSettingsService.processResourceAuthSettings(updatedToolSet, existingToolSet);
+
+        // Then
+        verify(validatorFactory.getValidator(expectedAuthType), times(1))
+                .validate(any(ResourceAuthSettings.class), eq(changeMode));
+
+        if (shouldRegister) {
+            verify(resourceRegistrationService, times(1))
+                    .register(eq(RESOURCE_NAME), eq(RESOURCE_ENDPOINT), any(ResourceAuthSettings.class), eq(changeMode == ResourceAuthSettingsChangeMode.CREATE_DYNAMIC_CLIENT));
+        } else {
+            verify(resourceRegistrationService, never()).register(any(), any(), any(), anyBoolean());
+        }
+
+        assertEquals(expectedAuthType, updatedToolSet.getAuthSettings().getAuthenticationType());
+        assertEquals(expectedNullCodeVerifier, updatedToolSet.getAuthSettings().getCodeVerifier() == null);
+    }
+
+    // Helper methods
+
+    private static ToolSet createOauthToolSet(String clientId,
+                                              String clientSecret) {
+        return createOauthToolSet(clientId, clientSecret, null);
+    }
+
+    private ToolSet createOauthToolSet() {
         ResourceAuthSettings authSettings = new ResourceAuthSettings();
         ToolSet toolSet = Mockito.mock(ToolSet.class);
         when(toolSet.getAuthSettings()).thenReturn(authSettings);
         return toolSet;
+    }
+
+    private static ToolSet createOauthToolSet(String clientId,
+                                              String clientSecret,
+                                              String codeVerifier) {
+        ResourceAuthSettings authSettings = new ResourceAuthSettings();
+        authSettings.setAuthenticationType(AuthenticationType.OAUTH);
+        authSettings.setClientId(clientId);
+        authSettings.setClientSecret(clientSecret);
+        authSettings.setCodeVerifier(codeVerifier);
+        return createToolSet(authSettings);
+    }
+
+    private static ToolSet createOauthToolSetWithTokenEndpointAuthMethod(String clientId,
+                                                                         String clientSecret,
+                                                                         String tokenEndpointAuthMethod) {
+        ResourceAuthSettings authSettings = new ResourceAuthSettings();
+        authSettings.setAuthenticationType(AuthenticationType.OAUTH);
+        authSettings.setClientId(clientId);
+        authSettings.setClientSecret(clientSecret);
+        authSettings.setTokenEndpointAuthMethod(tokenEndpointAuthMethod);
+        return createToolSet(authSettings);
+    }
+
+    private static ToolSet createOauthToolSetWithPkce(String clientId,
+                                                      String clientSecret,
+                                                      String codeChallengeMethod,
+                                                      String codeChallenge,
+                                                      String codeVerifier) {
+        ResourceAuthSettings authSettings = new ResourceAuthSettings();
+        authSettings.setAuthenticationType(AuthenticationType.OAUTH);
+        authSettings.setClientId(clientId);
+        authSettings.setClientSecret(clientSecret);
+        authSettings.setCodeChallengeMethod(codeChallengeMethod);
+        authSettings.setCodeChallenge(codeChallenge);
+        authSettings.setCodeVerifier(codeVerifier);
+        return createToolSet(authSettings);
+    }
+
+    private static ToolSet createApiKeyToolSet(String apiKeyHeader) {
+        ResourceAuthSettings authSettings = new ResourceAuthSettings();
+        authSettings.setAuthenticationType(AuthenticationType.API_KEY);
+        authSettings.setApiKeyHeader(apiKeyHeader);
+        return createToolSet(authSettings);
+    }
+
+    private static ToolSet createNoneToolSet() {
+        ResourceAuthSettings authSettings = new ResourceAuthSettings();
+        authSettings.setAuthenticationType(AuthenticationType.NONE);
+        return createToolSet(authSettings);
+    }
+
+    private static ToolSet createToolSet(ResourceAuthSettings authSettings) {
+        ToolSet toolSet = new ToolSet();
+        toolSet.setName(RESOURCE_NAME);
+        toolSet.setEndpoint(RESOURCE_ENDPOINT);
+        toolSet.setAuthSettings(authSettings);
+        return toolSet;
+    }
+
+    private ClientRegistration createClientRegistration() {
+        return ClientRegistration.builder()
+                .clientId("newClientId")
+                .clientSecret("newClientSecret")
+                .authorizationEndpoint("authEndpoint")
+                .tokenEndpoint("tokenEndpoint")
+                .redirectUri("redirectUri")
+                .scopesSupported(List.of("read", "write"))
+                .codeChallengeMethod("S256")
+                .build();
     }
 
     private static ResourceCredentials createGlobalLevelResourceCredentials() {
@@ -281,7 +628,7 @@ class ResourceAuthSettingsServiceTest {
         ResourceCredentials credentials = Mockito.mock(ResourceCredentials.class);
         when(credentials.getCredentialsLevel()).thenReturn(level);
         when(credentials.getAuthenticationType()).thenReturn(authenticationType);
-        when(credentials.getUserSub()).thenReturn(userSub);
+        when(credentials.getUserId()).thenReturn(userSub);
         return credentials;
     }
 

@@ -1,5 +1,6 @@
 package com.epam.aidial.core.server.data;
 
+import com.epam.aidial.core.config.PricingRate;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.databind.PropertyNamingStrategies;
 import com.fasterxml.jackson.databind.annotation.JsonNaming;
@@ -10,6 +11,8 @@ import lombok.Data;
 @JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)
 public class PricingData {
     private String unit;
-    private String prompt;
-    private String completion;
+    private PricingRate prompt;
+    private PricingRate completion;
+    private PricingRate cacheRead;
+    private PricingRate cacheWrite;
 }

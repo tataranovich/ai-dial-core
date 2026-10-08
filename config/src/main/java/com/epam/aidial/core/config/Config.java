@@ -2,8 +2,11 @@ package com.epam.aidial.core.config;
 
 import com.epam.aidial.core.config.databind.JsonArrayToSchemaMapDeserializer;
 import com.epam.aidial.core.config.databind.MapToJsonArraySerializer;
+import com.epam.aidial.core.config.validation.CatalogPropertiesConformToSchemas;
+import com.epam.aidial.core.config.validation.ConformToCatalogMetaSchema;
 import com.epam.aidial.core.config.validation.ConformToMetaSchema;
 import com.epam.aidial.core.config.validation.CustomApplicationsConformToTypeSchemas;
+import com.fasterxml.jackson.annotation.JsonAlias;
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonProperty;
@@ -14,32 +17,58 @@ import lombok.Data;
 import java.net.URI;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
 @Data
 @JsonIgnoreProperties(ignoreUnknown = true)
 @CustomApplicationsConformToTypeSchemas(message = "All custom schema-rich applications should conform to their schemas")
+@CatalogPropertiesConformToSchemas(message = "All deployments with catalog_schema_id should conform to their catalog schema")
 public class Config {
-    public static final String ASSISTANT = "assistant";
-
     // maintain the order of routes defined in the config
+    // key: route name (file-sourced) or canonical id "routes/<bucket>/<name>" (blob/API-sourced)
     private LinkedHashMap<String, Route> routes = new LinkedHashMap<>();
+    // key: deployment id (short name); shared namespace with applications/toolsets/interceptors
     private Map<String, Model> models = Map.of();
-    private Map<String, Addon> addons = Map.of();
+    // key: deployment id (short name); shared namespace with models/toolsets/interceptors
     private Map<String, Application> applications = Map.of();
+    // key: deployment id (short name); shared namespace with models/applications/interceptors
     private Map<String, ToolSet> toolsets = Map.of();
-    private Assistants assistant = new Assistants();
+    // key: raw API key secret (file-sourced) or canonical id "keys/<bucket>/<name>" (blob/API-sourced)
     @JsonProperty(access = JsonProperty.Access.WRITE_ONLY)
     private Map<String, Key> keys = new HashMap<>();
+    // key: role name (short name); not part of the deployment-id namespace above
     private Map<String, Role> roles = new HashMap<>();
     private Set<Integer> retriableErrorCodes = Set.of();
+    // key: deployment id (short name); shared namespace with models/applications/toolsets
     private Map<String, Interceptor> interceptors = Map.of();
+    // key: translator name, as referenced by interfaces.<type>.translator
+    private Map<String, Translator> translators = Map.of();
 
+    // key: schema $id (URI string)
     @JsonDeserialize(using = JsonArrayToSchemaMapDeserializer.class)
     @JsonSerialize(using = MapToJsonArraySerializer.class)
     @ConformToMetaSchema(message = "All custom application type schemas should conform to meta schema")
     private Map<String, String> applicationTypeSchemas = Map.of();
+
+    // key: schema $id (URI string)
+    @JsonDeserialize(using = JsonArrayToSchemaMapDeserializer.class)
+    @JsonSerialize(using = MapToJsonArraySerializer.class)
+    @ConformToCatalogMetaSchema(message = "All catalog schemas should conform to the catalog meta schema")
+    private Map<String, String> catalogSchemas = Map.of();
+
+    /**
+     * Instance-wide BCP-47 default locale: the locale assigned to legacy plain-string
+     * displayName/description/intro values, and the fallback locale used across localized fields.
+     */
+    @JsonAlias({"defaultLocale", "default_locale"})
+    private String defaultLocale = "en";
+
+    private List<String> globalInterceptors = List.of();
+
+    // deployment-wide anchor for the DAY/WEEK/MONTH fixed calendar rate-limit windows
+    private RateLimitSchedule rateLimitSchedule = new RateLimitSchedule();
 
     @JsonIgnore
     public Deployment selectDeployment(String deploymentId) {
@@ -58,13 +87,11 @@ public class Config {
             return toolSet;
         }
 
-        Interceptor interceptor = interceptors.get(deploymentId);
-        if (interceptor != null) {
-            return interceptor;
-        }
+        return interceptors.get(deploymentId);
+    }
 
-        Assistants assistants = assistant;
-        return assistants.getAssistants().get(deploymentId);
+    public boolean isDeploymentExists(String deploymentId) {
+        return selectDeployment(deploymentId) != null;
     }
 
     @JsonIgnore
@@ -73,5 +100,13 @@ public class Config {
             return null;
         }
         return applicationTypeSchemas.get(schemaId.toString());
+    }
+
+    @JsonIgnore
+    public String getCatalogSchema(URI schemaId) {
+        if (schemaId == null) {
+            return null;
+        }
+        return catalogSchemas.get(schemaId.toString());
     }
 }

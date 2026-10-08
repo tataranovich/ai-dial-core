@@ -3,10 +3,11 @@ package com.epam.aidial.core.server.service;
 import com.epam.aidial.core.config.Application;
 import com.epam.aidial.core.config.Features;
 import com.epam.aidial.core.config.Route;
+import com.epam.aidial.core.metaschemas.CopyAppBucketOptions;
 import com.epam.aidial.core.metaschemas.MetaSchemaHolder;
 import com.epam.aidial.core.server.config.ConfigStore;
-import com.epam.aidial.core.server.data.ResourceTypes;
 import com.epam.aidial.core.server.security.EncryptionService;
+import com.epam.aidial.core.server.service.resource.ComplexResourceService;
 import com.epam.aidial.core.server.util.ApplicationTypeSchemaProcessingException;
 import com.epam.aidial.core.server.util.ProxyUtil;
 import com.epam.aidial.core.server.util.ResourceDescriptorFactory;
@@ -16,41 +17,59 @@ import com.epam.aidial.core.server.validation.DialFileKeyword;
 import com.epam.aidial.core.server.validation.DialMetaKeyword;
 import com.epam.aidial.core.server.validation.DialResourceKeyKeyword;
 import com.epam.aidial.core.server.validation.ListCollector;
+import com.epam.aidial.core.storage.http.HttpException;
 import com.epam.aidial.core.storage.resource.ResourceDescriptor;
+import com.epam.aidial.core.storage.resource.ResourceType;
+import com.epam.aidial.core.storage.resource.ResourceTypes;
 import com.epam.aidial.core.storage.service.ResourceService;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.google.common.annotations.VisibleForTesting;
 import com.networknt.schema.CollectorContext;
 import com.networknt.schema.InputFormat;
 import com.networknt.schema.JsonMetaSchema;
 import com.networknt.schema.JsonSchema;
 import com.networknt.schema.JsonSchemaFactory;
 import com.networknt.schema.ValidationMessage;
-import lombok.AllArgsConstructor;
 import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
 
 import java.lang.reflect.Type;
+import java.net.ProxySelector;
 import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import javax.annotation.Nullable;
 
 import static com.epam.aidial.core.metaschemas.MetaSchemaHolder.APPLICATION_TYPE_COMPLETION_ENDPOINT;
 import static com.epam.aidial.core.metaschemas.MetaSchemaHolder.APPLICATION_TYPE_CONFIGURATION_ENDPOINT;
 import static com.epam.aidial.core.metaschemas.MetaSchemaHolder.APPLICATION_TYPE_RATE_ENDPOINT;
+import static com.epam.aidial.core.metaschemas.MetaSchemaHolder.APPLICATION_TYPE_RESPONSES_ENDPOINT;
 import static com.epam.aidial.core.metaschemas.MetaSchemaHolder.APPLICATION_TYPE_ROUTES;
 import static com.epam.aidial.core.metaschemas.MetaSchemaHolder.APPLICATION_TYPE_TOKENIZE_ENDPOINT;
 import static com.epam.aidial.core.metaschemas.MetaSchemaHolder.APPLICATION_TYPE_TRUNCATE_PROMPT_ENDPOINT;
+import static com.epam.aidial.core.metaschemas.MetaSchemaHolder.DIAL_APPLICATION_TYPE_ASSISTANT_ATTACHMENTS_IN_REQUEST;
+import static com.epam.aidial.core.metaschemas.MetaSchemaHolder.DIAL_APPLICATION_TYPE_BUCKET_COPY;
+import static com.epam.aidial.core.metaschemas.MetaSchemaHolder.DIAL_APPLICATION_TYPE_INTERCEPTORS;
+import static com.epam.aidial.core.metaschemas.MetaSchemaHolder.DIAL_APPLICATION_TYPE_MCP;
 import static com.epam.aidial.core.metaschemas.MetaSchemaHolder.getMetaschemaBuilder;
 
 @Slf4j
-@AllArgsConstructor
 public class ApplicationSchemaService {
 
     private static final JsonMetaSchema DIAL_META_SCHEMA = getMetaschemaBuilder()
@@ -64,7 +83,28 @@ public class ApplicationSchemaService {
             .defaultMetaSchemaIri(DIAL_META_SCHEMA.getIri())
             .build();
 
-    private static final TypeReference<Map<String, Route>> APP_ROUTE_TYPE_REF = new TypeReference<>() {
+    private static final TypeReference<LinkedHashMap<String, Route>> APP_ROUTE_TYPE_REF = new TypeReference<>() {
+        @Override
+        public Type getType() {
+            return super.getType();
+        }
+    };
+
+    private static final TypeReference<Application.Mcp> APP_MCP_TYPE_REF = new TypeReference<>() {
+        @Override
+        public Type getType() {
+            return super.getType();
+        }
+    };
+
+    private static final TypeReference<CopyAppBucketOptions> COPY_APP_BUCKET_OPTIONS_TYPE_REF = new TypeReference<>() {
+        @Override
+        public Type getType() {
+            return super.getType();
+        }
+    };
+
+    private static final TypeReference<List<String>> APP_INTERCEPTOR_LIST_REF = new TypeReference<>() {
         @Override
         public Type getType() {
             return super.getType();
@@ -73,25 +113,158 @@ public class ApplicationSchemaService {
 
     private final ResourceService resourceService;
     private final ConfigStore configStore;
+    private final ComplexResourceService complexResourceService;
 
     private final EncryptionService encryptionService;
 
-    String getCustomApplicationSchemaOrThrow(Application application) {
+    private final HttpClient httpClient;
+
+    private static final class CachedSchema {
+        private final String raw;
+        private final JsonNode parsed;
+        private volatile JsonSchema compiled;
+
+        CachedSchema(String raw, JsonNode parsed) {
+            this.raw = raw;
+            this.parsed = parsed;
+        }
+
+        JsonSchema compiled() {
+            JsonSchema result = compiled;
+            if (result == null) {
+                result = SCHEMA_FACTORY.getSchema(raw);
+                compiled = result;
+            }
+            return result;
+        }
+    }
+
+    private final ConcurrentHashMap<URI, CachedSchema> schemaCache = new ConcurrentHashMap<>();
+
+    public ApplicationSchemaService(ResourceService resourceService, ConfigStore configStore,
+                                    ComplexResourceService complexResourceService,
+                                    EncryptionService encryptionService, @Nullable ProxySelector proxySelector) {
+        this.resourceService = resourceService;
+        this.configStore = configStore;
+        this.complexResourceService = complexResourceService;
+        this.encryptionService = encryptionService;
+        HttpClient.Builder builder = HttpClient.newBuilder();
+        builder.connectTimeout(Duration.of(5, ChronoUnit.SECONDS));
+        if (proxySelector != null) {
+            builder.proxy(proxySelector);
+        }
+        this.httpClient = builder.build();
+    }
+
+    @VisibleForTesting
+    ApplicationSchemaService(ResourceService resourceService, ConfigStore configStore,
+                             ComplexResourceService complexResourceService,
+                             EncryptionService encryptionService, HttpClient httpClient) {
+        this.resourceService = resourceService;
+        this.configStore = configStore;
+        this.complexResourceService = complexResourceService;
+        this.encryptionService = encryptionService;
+        this.httpClient = httpClient;
+    }
+
+    @VisibleForTesting
+    int schemaCacheSize() {
+        return schemaCache.size();
+    }
+
+    @SneakyThrows
+    @Nullable
+    public String getSchema(URI schemaId, boolean forceReload) {
+        CachedSchema cached = resolveSchema(schemaId, forceReload);
+        return cached == null ? null : cached.raw;
+    }
+
+    @SneakyThrows
+    @Nullable
+    private CachedSchema resolveSchema(URI schemaId, boolean forceReload) {
+        if (!forceReload) {
+            CachedSchema cached = schemaCache.get(schemaId);
+            if (cached != null) {
+                return cached;
+            }
+        }
+        String customApplicationSchema = configStore.get().getCustomApplicationSchema(schemaId);
+        if (customApplicationSchema == null) {
+            schemaCache.remove(schemaId);
+            return null;
+        }
+        JsonNode schema = ProxyUtil.MAPPER.readTree(customApplicationSchema);
+        CachedSchema result;
+        if (schema.has(MetaSchemaHolder.DIAL_APPLICATION_TYPE_SCHEMA_ENDPOINT)) {
+            String url = schema.get(MetaSchemaHolder.DIAL_APPLICATION_TYPE_SCHEMA_ENDPOINT).textValue();
+            try {
+                ObjectNode appSchema = downloadAppSchema(url);
+                merge(appSchema, schema);
+                result = new CachedSchema(appSchema.toString(), appSchema);
+            } catch (Exception e) {
+                log.warn("Failed to download application schema: {}", url, e);
+                throw new ApplicationTypeSchemaProcessingException("Failed to download application schema: " + url, e);
+            }
+        } else {
+            result = new CachedSchema(customApplicationSchema, schema);
+        }
+        schemaCache.put(schemaId, result);
+        return result;
+    }
+
+    @SneakyThrows
+    String getCustomApplicationSchemaOrThrow(Application application, boolean forceReload) {
+        CachedSchema cached = getCachedSchemaOrThrow(application, forceReload);
+        return cached == null ? null : cached.raw;
+    }
+
+    @SneakyThrows
+    @Nullable
+    private CachedSchema getCachedSchemaOrThrow(Application application, boolean forceReload) {
         URI schemaId = application.getApplicationTypeSchemaId();
         if (schemaId == null) {
             return null;
         }
-        String customApplicationSchema = configStore.get().getCustomApplicationSchema(schemaId);
-        if (customApplicationSchema == null) {
+        CachedSchema cached = resolveSchema(schemaId, forceReload);
+        if (cached == null) {
             throw new ApplicationTypeSchemaValidationException("Custom application schema not found: " + schemaId);
         }
-        return customApplicationSchema;
+        return cached;
+    }
+
+    private void merge(ObjectNode appSchema, JsonNode schema) {
+        Iterator<String> fieldNames = schema.fieldNames();
+        while (fieldNames.hasNext()) {
+            String field = fieldNames.next();
+            appSchema.set(field, schema.get(field));
+        }
+    }
+
+    @SneakyThrows
+    private ObjectNode downloadAppSchema(String url) {
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .timeout(java.time.Duration.ofSeconds(5))
+                .GET()
+                .build();
+        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+        int status = response.statusCode();
+        String body = response.body();
+        if (status != 200) {
+            log.debug("Error of downloading application schema {}: status {}, response {}, headers: {}",
+                    request.uri(), response.statusCode(), response.body(), response.headers());
+            throw new HttpException(status, "Application runner returned error on downloading application schema");
+        }
+        JsonNode tree = ProxyUtil.MAPPER.readTree(body);
+        if (!tree.isObject()) {
+            throw new ApplicationTypeSchemaProcessingException("Application schema is not JSON object");
+        }
+        return (ObjectNode) tree;
     }
 
     @SuppressWarnings("unchecked")
-    private static Map<String, Object> filterProperties(Map<String, Object> applicationProperties, String schema, ListCollector.MetaDataCollectorType collector) {
+    private static Map<String, Object> filterProperties(Map<String, Object> applicationProperties, JsonSchema appSchema, ListCollector.MetaDataCollectorType collector) {
         try {
-            JsonSchema appSchema = SCHEMA_FACTORY.getSchema(schema);
             CollectorContext collectorContext = new CollectorContext();
             String applicationPropertiesJson = ProxyUtil.MAPPER.writeValueAsString(applicationProperties);
             Set<ValidationMessage> validationResult = appSchema.validate(applicationPropertiesJson, InputFormat.JSON,
@@ -121,21 +294,20 @@ public class ApplicationSchemaService {
     }
 
     public void consumeMetadataProperties(Application application, MetadataPropertiesConsumer consumer) {
-        String customApplicationSchema = getCustomApplicationSchemaOrThrow(application);
-        if (customApplicationSchema == null) {
-            return;
-        }
-
         if (application.getApplicationProperties() == null) {
             throw new ApplicationTypeSchemaValidationException("Typed application's properties not set");
         }
-
+        CachedSchema cached = getCachedSchemaOrThrow(application, false);
         try {
-            JsonNode schemaNode = ProxyUtil.MAPPER.readTree(customApplicationSchema);
+            if (cached == null) {
+                consumer.accept(application.getApplicationProperties(), true);
+                return;
+            }
+            JsonNode schemaNode = cached.parsed;
             boolean appendApplicationPropertiesHeader = !schemaNode.has(MetaSchemaHolder.APPLICATION_TYPE_APPEND_APPLICATION_PROPERTIES)
                                                         || schemaNode.get(MetaSchemaHolder.APPLICATION_TYPE_APPEND_APPLICATION_PROPERTIES).asBoolean();
             Map<String, Object> serverProperties = filterProperties(application.getApplicationProperties(),
-                    customApplicationSchema, ListCollector.MetaDataCollectorType.ALL);
+                    cached.compiled(), ListCollector.MetaDataCollectorType.ALL);
             consumer.accept(serverProperties, appendApplicationPropertiesHeader);
         } catch (JsonProcessingException e) {
             throw new ApplicationTypeSchemaProcessingException("Failed to parse custom application schema", e);
@@ -144,24 +316,43 @@ public class ApplicationSchemaService {
 
     @FunctionalInterface
     private interface EndpointConsumer {
-        void accept(String completion, String configuration, String rate, String tokenize, String truncatePrompt);
+        void accept(
+                String completion,
+                String responses,
+                String configuration,
+                String rate,
+                String tokenize,
+                String truncatePrompt);
     }
 
     private void consumeCustomApplicationEndpoints(Application application, EndpointConsumer consumer) {
         try {
-            String schema = getCustomApplicationSchemaOrThrow(application);
-            JsonNode schemaNode = ProxyUtil.MAPPER.readTree(schema);
+            CachedSchema cached = getCachedSchemaOrThrow(application, false);
+            JsonNode schemaNode = cached.parsed;
 
-            String completionEndpoint = getEndpoint(schemaNode, APPLICATION_TYPE_COMPLETION_ENDPOINT, true);
+            String completionEndpoint = getEndpoint(schemaNode, APPLICATION_TYPE_COMPLETION_ENDPOINT, false);
+            String responsesEndpoint = getEndpoint(schemaNode, APPLICATION_TYPE_RESPONSES_ENDPOINT, false);
             String configurationEndpoint = getEndpoint(schemaNode, APPLICATION_TYPE_CONFIGURATION_ENDPOINT, false);
             String rateEndpoint = getEndpoint(schemaNode, APPLICATION_TYPE_RATE_ENDPOINT, false);
             String tokenizeEndpoint = getEndpoint(schemaNode, APPLICATION_TYPE_TOKENIZE_ENDPOINT, false);
             String truncatePromptEndpoint = getEndpoint(schemaNode, APPLICATION_TYPE_TRUNCATE_PROMPT_ENDPOINT, false);
 
-            consumer.accept(completionEndpoint, configurationEndpoint, rateEndpoint, tokenizeEndpoint, truncatePromptEndpoint);
-        } catch (JsonProcessingException | IllegalArgumentException e) {
+            consumer.accept(
+                    completionEndpoint,
+                    responsesEndpoint,
+                    configurationEndpoint,
+                    rateEndpoint,
+                    tokenizeEndpoint,
+                    truncatePromptEndpoint);
+        } catch (IllegalArgumentException e) {
             throw new ApplicationTypeSchemaProcessingException("Failed to get custom application endpoints", e);
         }
+    }
+
+    @SneakyThrows
+    public String getChatCompletionEndpoint(Application application) {
+        CachedSchema cached = getCachedSchemaOrThrow(application, false);
+        return getEndpoint(cached.parsed, APPLICATION_TYPE_COMPLETION_ENDPOINT, false);
     }
 
     private static String getEndpoint(JsonNode schemaNode, String endpointKey, boolean isRequired) {
@@ -183,8 +374,11 @@ public class ApplicationSchemaService {
 
         Application copy = new Application(application);
 
-        consumeCustomApplicationEndpoints(application, (completionEndpoint, configurationEndpoint, rateEndpoint, tokenizeEndpoint, truncatePromptEndpoint) -> {
+        consumeCustomApplicationEndpoints(application, (completionEndpoint, responsesEndpoint, configurationEndpoint, rateEndpoint, tokenizeEndpoint, truncatePromptEndpoint) -> {
             copy.setEndpoint(completionEndpoint);
+            if (responsesEndpoint != null) {
+                copy.setResponsesEndpoint(responsesEndpoint);
+            }
 
             Features features = copy.getFeatures();
             if (features == null) {
@@ -211,8 +405,8 @@ public class ApplicationSchemaService {
     }
 
     public Application filterCustomClientProperties(Application application) {
-        String customApplicationSchema = getCustomApplicationSchemaOrThrow(application);
-        if (customApplicationSchema == null) {
+        CachedSchema cached = getCachedSchemaOrThrow(application, false);
+        if (cached == null) {
             return application;
         }
         if (application.getApplicationProperties() == null) {
@@ -220,54 +414,42 @@ public class ApplicationSchemaService {
         }
         Application copy = new Application(application);
         Map<String, Object> appWithClientOptionsOnly = filterProperties(application.getApplicationProperties(),
-                customApplicationSchema, ListCollector.MetaDataCollectorType.CLIENT);
+                cached.compiled(), ListCollector.MetaDataCollectorType.CLIENT);
         copy.setApplicationProperties(appWithClientOptionsOnly);
         return copy;
     }
 
     public List<ResourceDescriptor> getServerFiles(Application application) {
-        return getFiles(application, ListCollector.ResourceCollectorType.ONLY_SERVER_RESOURCES);
+        return getApplicationResources(application, Set.of(ResourceTypes.FILE),
+                ListCollector.ResourceCollectorType.ONLY_SERVER_RESOURCES, false);
     }
 
     public List<ResourceDescriptor> getFiles(Application application) {
-        return getFiles(application, ListCollector.ResourceCollectorType.ALL_RESOURCES);
+        return getApplicationResources(application, Set.of(ResourceTypes.FILE),
+                ListCollector.ResourceCollectorType.ALL_RESOURCES, false);
+    }
+
+    public List<ResourceDescriptor> getPrompts(Application application) {
+        return getApplicationResources(application, Set.of(ResourceTypes.PROMPT),
+                ListCollector.ResourceCollectorType.ALL_RESOURCES, false);
+    }
+
+    public List<ResourceDescriptor> getSkills(Application application) {
+        return getApplicationResources(application, Set.of(ResourceTypes.SKILL),
+                ListCollector.ResourceCollectorType.ALL_RESOURCES, false);
+    }
+
+    public List<ResourceDescriptor> getDeployments(Application application) {
+        return getApplicationResources(application, Set.of(ResourceTypes.APPLICATION, ResourceTypes.TOOL_SET),
+                ListCollector.ResourceCollectorType.ALL_RESOURCES, false);
     }
 
     @SuppressWarnings("unchecked")
-    private List<ResourceDescriptor> getFiles(Application application, ListCollector.ResourceCollectorType collectorName) {
-        try {
-            ListCollector<String> propsCollector = (ListCollector<String>) getCollector(application, collectorName.getValue());
-            if (propsCollector == null) {
-                return Collections.emptyList();
-            }
-            List<ResourceDescriptor> result = new ArrayList<>();
-            for (String item : propsCollector.collect()) {
-                try {
-                    ResourceDescriptor descriptor = ResourceDescriptorFactory.fromAnyUrl(item, encryptionService);
-                    if (descriptor.getType() != ResourceTypes.FILE) {
-                        continue;
-                    }
-                    if (!descriptor.isFolder() && !resourceService.hasResource(descriptor)) {
-                        throw new ApplicationTypeResourceException("Resource listed as dependent to the application not found or inaccessible", item);
-                    }
-                    result.add(descriptor);
-                } catch (IllegalArgumentException e) {
-                    throw new ApplicationTypeResourceException("Failed to get resource descriptor for url", item, e);
-                }
-            }
-            return result;
-        } catch (ApplicationTypeSchemaValidationException | ApplicationTypeResourceException e) {
-            throw e;
-        } catch (Exception e) {
-            throw new ApplicationTypeSchemaProcessingException("Failed to obtain list of files attached to the custom app", e);
-        }
-    }
-
-    @SuppressWarnings("unchecked")
-    public List<ResourceDescriptor> getToolSets(Application application) {
+    private List<ResourceDescriptor> getApplicationResources(Application application, Set<ResourceTypes> resourceTypes,
+                                                             ListCollector.ResourceCollectorType collectorName, boolean forceReload) {
         try {
             ListCollector<String> propsCollector = (ListCollector<String>) getCollector(application,
-                    ListCollector.ResourceCollectorType.ALL_RESOURCES.getValue());
+                    collectorName.getValue(), forceReload);
             if (propsCollector == null) {
                 return Collections.emptyList();
             }
@@ -275,32 +457,38 @@ public class ApplicationSchemaService {
             for (String item : propsCollector.collect()) {
                 try {
                     ResourceDescriptor descriptor = ResourceDescriptorFactory.fromAnyUrl(item, encryptionService);
-                    if (descriptor.getType() != ResourceTypes.TOOL_SET) {
-                        continue;
+                    ResourceType type = descriptor.getType();
+                    if (resourceTypes.contains(type)) {
+                        if (!descriptor.isFolder() && !hasResource(descriptor)) {
+                            throw new ApplicationTypeResourceException("Resource listed as dependent to the application is not found", item);
+                        }
+                        result.add(descriptor);
                     }
-                    if (descriptor.isFolder() || !resourceService.hasResource(descriptor)) {
-                        throw new ApplicationTypeResourceException("Toolset listed as dependent to the application not found or inaccessible", item);
-                    }
-                    result.add(descriptor);
                 } catch (IllegalArgumentException e) {
-                    // ignored
+                    // ignore resource to be defined in DIAL config
                 }
             }
             return result;
         } catch (ApplicationTypeSchemaValidationException | ApplicationTypeResourceException e) {
             throw e;
         } catch (Exception e) {
-            throw new ApplicationTypeSchemaProcessingException("Failed to obtain list of toolsets attached to the custom app", e);
+            throw new ApplicationTypeSchemaProcessingException("Failed to obtain list of resources attached to the custom app", e);
         }
+    }
+
+    private boolean hasResource(ResourceDescriptor resource) {
+        return resource.getType() == ResourceTypes.SKILL
+                ? complexResourceService.hasResource(resource)
+                : resourceService.hasResource(resource);
     }
 
     @Nullable
-    private Object getCollector(Application application, String collectorName) throws JsonProcessingException {
-        String customApplicationSchema = getCustomApplicationSchemaOrThrow(application);
-        if (customApplicationSchema == null) {
+    private Object getCollector(Application application, String collectorName, boolean forceReload) throws JsonProcessingException {
+        CachedSchema cached = getCachedSchemaOrThrow(application, forceReload);
+        if (cached == null) {
             return null;
         }
-        JsonSchema appSchema = SCHEMA_FACTORY.getSchema(customApplicationSchema);
+        JsonSchema appSchema = cached.compiled();
         CollectorContext collectorContext = new CollectorContext();
         String customPropsJson = ProxyUtil.MAPPER.writeValueAsString(application.getApplicationProperties());
         Set<ValidationMessage> validationResult = appSchema.validate(customPropsJson, InputFormat.JSON,
@@ -317,6 +505,20 @@ public class ApplicationSchemaService {
                 application = filterCustomClientProperties(application);
             }
             application = modifyEndpointsForCustomApplication(application);
+            boolean assistantAttachmentsInRequest = getBooleanProperty(application, DIAL_APPLICATION_TYPE_ASSISTANT_ATTACHMENTS_IN_REQUEST);
+            if (assistantAttachmentsInRequest) {
+                Features features = application.getFeatures();
+                if (features == null) {
+                    features = new Features();
+                    application.setFeatures(features);
+                }
+                features.setAssistantAttachmentsInRequestSupported(assistantAttachmentsInRequest);
+            }
+
+            LinkedHashMap<String, Route> routes = getRoutes(application);
+            if (routes != null) {
+                application.setRoutes(routes);
+            }
         } catch (ApplicationTypeSchemaProcessingException | ApplicationTypeResourceException | ApplicationTypeSchemaValidationException ex) {
             log.warn("Failed to modify application to fulfill schema's restrictions %s".formatted(application.getName()), ex);
             application.setApplicationProperties(null);
@@ -327,16 +529,81 @@ public class ApplicationSchemaService {
 
     @Nullable
     @SneakyThrows
-    public Map<String, Route> getRoutes(Application application) {
-        String customApplicationSchema = getCustomApplicationSchemaOrThrow(application);
-        if (customApplicationSchema == null) {
+    public LinkedHashMap<String, Route> getRoutes(Application application) {
+        CachedSchema cached = getCachedSchemaOrThrow(application, false);
+        if (cached == null) {
             return null;
         }
-        JsonNode schemaNode = ProxyUtil.MAPPER.readTree(customApplicationSchema);
+        JsonNode schemaNode = cached.parsed;
         JsonNode appRoutes = schemaNode.get(APPLICATION_TYPE_ROUTES);
         if (appRoutes == null) {
             return null;
         }
         return ProxyUtil.MAPPER.treeToValue(appRoutes, APP_ROUTE_TYPE_REF);
     }
+
+    @Nullable
+    @SneakyThrows
+    public Application.Mcp getMcp(Application application) {
+        CachedSchema cached = getCachedSchemaOrThrow(application, false);
+        if (cached == null) {
+            return null;
+        }
+        JsonNode schemaNode = cached.parsed;
+        JsonNode mcp = schemaNode.get(DIAL_APPLICATION_TYPE_MCP);
+        if (mcp == null) {
+            return null;
+        }
+        return ProxyUtil.MAPPER.treeToValue(mcp, APP_MCP_TYPE_REF);
+    }
+
+    @SneakyThrows
+    public CopyAppBucketOptions getCopyAppBucketOptions(Application application) {
+        CachedSchema cached = getCachedSchemaOrThrow(application, false);
+        if (cached == null) {
+            return CopyAppBucketOptions.DISABLED;
+        }
+        JsonNode schemaNode = cached.parsed;
+        JsonNode options = schemaNode.get(DIAL_APPLICATION_TYPE_BUCKET_COPY);
+        if (options == null) {
+            return CopyAppBucketOptions.DISABLED;
+        }
+        return ProxyUtil.MAPPER.treeToValue(options, COPY_APP_BUCKET_OPTIONS_TYPE_REF);
+    }
+
+    @SneakyThrows
+    public List<String> getInterceptors(Application application) {
+        CachedSchema cached = getCachedSchemaOrThrow(application, false);
+        if (cached == null) {
+            return List.of();
+        }
+        JsonNode schemaNode = cached.parsed;
+        JsonNode interceptors = schemaNode.get(DIAL_APPLICATION_TYPE_INTERCEPTORS);
+        if (interceptors == null) {
+            return List.of();
+        }
+        return ProxyUtil.MAPPER.treeToValue(interceptors, APP_INTERCEPTOR_LIST_REF);
+    }
+
+    @SneakyThrows
+    private boolean getBooleanProperty(Application application, String propName) {
+        CachedSchema cached = getCachedSchemaOrThrow(application, false);
+        if (cached == null) {
+            return false;
+        }
+        return Optional.ofNullable(cached.parsed.get(propName))
+                .map(JsonNode::asBoolean).orElse(false);
+    }
+
+    @SneakyThrows
+    @Nullable
+    public String getStringProperty(Application application, String propName) {
+        CachedSchema cached = getCachedSchemaOrThrow(application, false);
+        if (cached == null) {
+            return null;
+        }
+        return Optional.ofNullable(cached.parsed.get(propName))
+                .map(JsonNode::asText).orElse(null);
+    }
+
 }

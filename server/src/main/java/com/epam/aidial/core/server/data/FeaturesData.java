@@ -1,11 +1,16 @@
 package com.epam.aidial.core.server.data;
 
+import com.epam.aidial.core.config.Deployment;
 import com.epam.aidial.core.config.Features;
+import com.epam.aidial.core.config.InterfaceType;
+import com.epam.aidial.core.server.util.DeploymentEndpointUtil;
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.databind.PropertyNamingStrategies;
 import com.fasterxml.jackson.databind.annotation.JsonNaming;
 import lombok.Data;
+
+import java.util.List;
 
 @Data
 @JsonInclude(JsonInclude.Include.NON_NULL)
@@ -25,10 +30,40 @@ public class FeaturesData {
     private boolean accessibleByPerRequestKey = true;
     private boolean contentParts = false;
     private boolean temperature = true;
-    private boolean addons = true;
     private boolean cache = false;
     private boolean autoCaching = false;
     private boolean parallelToolCalls = true;
+    private boolean assistantAttachmentsInRequest = false;
+    private boolean mcp = false;
+    private boolean chatCompletion = false;
+    private boolean responsesApi = false;
+    private boolean maxTokensSupported = true;
+    private boolean maxCompletionTokensSupported = false;
+    private boolean customTemperatureSupported = true;
+    private boolean skillsSupported = false;
+    private List<String> reasoningEfforts = List.of();
+
+    /**
+     * Features of a deployment: the configured {@link Features} plus the API-surface flags derived from the
+     * deployment itself. A deployment serves an API when it declares it either in the {@code interfaces} map
+     * or via a legacy endpoint, so both flavours must light up the corresponding feature flag.
+     */
+    @JsonIgnore
+    public static FeaturesData createDeploymentFeatures(Deployment deployment) {
+        return createDeploymentFeatures(deployment, deployment.getFeatures());
+    }
+
+    @JsonIgnore
+    public static FeaturesData createDeploymentFeatures(Deployment deployment, InterfaceType type) {
+        return createDeploymentFeatures(deployment, deployment.resolveFeatures(type));
+    }
+
+    private static FeaturesData createDeploymentFeatures(Deployment deployment, Features features) {
+        FeaturesData data = createFeatures(features);
+        data.setChatCompletion(DeploymentEndpointUtil.isInterfaceDeclared(deployment, InterfaceType.OPENAI_CHAT_COMPLETIONS));
+        data.setResponsesApi(DeploymentEndpointUtil.isInterfaceDeclared(deployment, InterfaceType.OPENAI_RESPONSES));
+        return data;
+    }
 
     @JsonIgnore
     public static FeaturesData createFeatures(Features features) {
@@ -79,10 +114,6 @@ public class FeaturesData {
             data.setTemperature(features.getTemperatureSupported());
         }
 
-        if (features.getAddonsSupported() != null) {
-            data.setAddons(features.getAddonsSupported());
-        }
-
         if (features.getCacheSupported() != null) {
             data.setCache(features.getCacheSupported());
         }
@@ -93,6 +124,30 @@ public class FeaturesData {
 
         if (features.getParallelToolCallsSupported() != null) {
             data.setParallelToolCalls(features.getParallelToolCallsSupported());
+        }
+
+        if (features.getAssistantAttachmentsInRequestSupported() != null) {
+            data.setAssistantAttachmentsInRequest(features.getAssistantAttachmentsInRequestSupported());
+        }
+
+        if (features.getMaxTokensSupported() != null) {
+            data.setMaxTokensSupported(features.getMaxTokensSupported());
+        }
+
+        if (features.getMaxCompletionTokensSupported() != null) {
+            data.setMaxCompletionTokensSupported(features.getMaxCompletionTokensSupported());
+        }
+
+        if (features.getCustomTemperatureSupported() != null) {
+            data.setCustomTemperatureSupported(features.getCustomTemperatureSupported());
+        }
+
+        if (features.getSkillsSupported() != null) {
+            data.setSkillsSupported(features.getSkillsSupported());
+        }
+
+        if (features.getReasoningEfforts() != null && !features.getReasoningEfforts().isEmpty()) {
+            data.setReasoningEfforts(List.copyOf(features.getReasoningEfforts()));
         }
 
         return data;

@@ -1,20 +1,25 @@
 package com.epam.aidial.core.server.token;
 
 import com.epam.aidial.core.server.ProxyContext;
-import com.epam.aidial.core.server.data.ApiKeyData;
-import com.epam.aidial.core.server.data.ResourceTypes;
 import com.epam.aidial.core.server.util.ProxyUtil;
 import com.epam.aidial.core.server.util.ResourceDescriptorFactory;
 import com.epam.aidial.core.server.vertx.AsyncTaskExecutor;
 import com.epam.aidial.core.storage.resource.ResourceDescriptor;
+import com.epam.aidial.core.storage.resource.ResourceTypes;
 import com.epam.aidial.core.storage.service.ResourceService;
 import com.epam.aidial.core.storage.util.EtagHeader;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import io.vertx.core.Future;
+import lombok.AllArgsConstructor;
 import lombok.Data;
+import lombok.NoArgsConstructor;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 
+import java.math.BigDecimal;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 import static com.epam.aidial.core.storage.resource.ResourceDescriptor.PATH_SEPARATOR;
@@ -50,14 +55,26 @@ public class TokenStatsTracker {
     }
 
     public Future<TokenUsage> getTokenStats(ProxyContext context) {
+        return getUsageStats(context).map(UsageStats::total);
+    }
+
+    public Future<UsageStats> getUsageStats(ProxyContext context) {
         return taskExecutor.submit(() -> {
             ResourceDescriptor resource = toResource(context.getTraceId());
             String json = resourceService.getResource(resource);
             TraceContext traceContext = ProxyUtil.convertToObject(json, TraceContext.class);
             if (traceContext == null) {
-                return null;
+                return UsageStats.EMPTY;
             }
-            return traceContext.getStats(context);
+            return traceContext.getUsageStats(context.getSpanId());
+        });
+    }
+
+    public Future<Void> endSpan(String traceId) {
+        ResourceDescriptor resource = toResource(traceId);
+        return taskExecutor.submit(() -> {
+            resourceService.deleteResource(resource, EtagHeader.ANY);
+            return null;
         });
     }
 
@@ -65,13 +82,8 @@ public class TokenStatsTracker {
      * Ends current span.
      */
     public Future<Void> endSpan(ProxyContext context) {
-        ApiKeyData apiKeyData = context.getApiKeyData();
-        if (apiKeyData.getPerRequestKey() == null) {
-            return taskExecutor.submit(() -> {
-                ResourceDescriptor resource = toResource(context.getTraceId());
-                resourceService.deleteResource(resource, EtagHeader.ANY);
-                return null;
-            });
+        if (context.isOriginalRequest()) {
+            return endSpan(context.getTraceId());
         } else {
             // we don't need to remove the span from trace context right now.
             // we can do it later when the initial span is completed
@@ -79,67 +91,155 @@ public class TokenStatsTracker {
         }
     }
 
-    public Future<TokenUsage> updateModelStats(ProxyContext context) {
-        ResourceDescriptor resource = toResource(context.getTraceId());
+    /**
+     * Records usage self-reported by a deployment (Model or Application) and rolls it into the
+     * subtree aggregate and per-deployment breakdown of every ancestor. Returns the resulting
+     * {@link UsageStats} for {@code spanId} itself - including the aggregated cost increments
+     * collected for every ancestor along the way - computed inside the same locked
+     * read-modify-write so callers never need a separate read.
+     */
+    public Future<UsageStats> updateDeploymentStats(String traceId, String spanId, String deploymentName, TokenUsage tokenUsage) {
+        ResourceDescriptor resource = toResource(traceId);
         return taskExecutor.submit(() -> {
+            UsageStats[] result = {UsageStats.EMPTY};
             resourceService.computeResource(resource, json -> {
                 TraceContext traceContext = ProxyUtil.convertToObject(json, TraceContext.class);
                 if (traceContext == null) {
                     return null;
                 }
-                traceContext.updateStats(context.getSpanId(), context.getTokenUsage());
+                List<AggregatedCost> aggregatedCosts = traceContext.updateStats(spanId, deploymentName, tokenUsage);
+                UsageStats usageStats = traceContext.getUsageStats(spanId);
+                result[0] = new UsageStats(usageStats.total(), usageStats.usagePerModel(), aggregatedCosts);
                 return ProxyUtil.convertToString(traceContext);
             });
-            return context.getTokenUsage();
+            return result[0];
         });
     }
 
     @Data
+    @JsonIgnoreProperties(ignoreUnknown = true)
     public static class TraceContext {
         Map<String, TokenStats> spans = new HashMap<>();
 
         void addSpan(ProxyContext context) {
             String spanId = context.getSpanId();
             String parentSpanId = context.getParentSpanId();
-            TokenStats tokenStats = new TokenStats(new TokenUsage(), parentSpanId);
+            String deploymentName = context.getDeployment() == null ? null : context.getDeployment().getName();
+            TokenStats tokenStats = new TokenStats(new TokenUsage(), parentSpanId, deploymentName);
             spans.put(spanId, tokenStats);
         }
 
-        TokenUsage getStats(ProxyContext context) {
-            TokenStats tokenStats = spans.get(context.getSpanId());
-            if (tokenStats == null) {
-                return null;
-            }
-            return tokenStats.tokenUsage;
-        }
-
-        void updateStats(String spanId, TokenUsage tokenUsage) {
+        UsageStats getUsageStats(String spanId) {
             TokenStats tokenStats = spans.get(spanId);
             if (tokenStats == null) {
-                return;
+                return UsageStats.EMPTY;
             }
-            tokenStats.tokenUsage = tokenUsage;
-            String parenSpanId = tokenStats.parentSpanId;
-            while (parenSpanId != null) {
-                tokenStats = spans.get(parenSpanId);
-                tokenStats.tokenUsage.increase(tokenUsage);
-                parenSpanId = tokenStats.parentSpanId;
+            return new UsageStats(tokenStats.tokenUsage, toUsagePerModelList(tokenStats.usagePerModel), List.of());
+        }
+
+        /**
+         * Rolls the reporting span's usage into every ancestor's subtree aggregate and per-model
+         * breakdown, and returns the aggregated-cost increment for each ancestor along the way.
+         * The mechanism is deployment-kind-agnostic: every span visited here is, by definition, an
+         * ancestor with a descendant call, whatever kind of deployment it turns out to be.
+         */
+        List<AggregatedCost> updateStats(String spanId, String deploymentName, TokenUsage tokenUsage) {
+            TokenStats tokenStats = spans.get(spanId);
+            if (tokenStats == null) {
+                return List.of();
             }
+            // self: the reporting deployment's own usage replaces whatever was here, except
+            // aggCost, which keeps accumulating (a descendant may have already rolled its
+            // cost into this span before this deployment self-reported). usagePerModel is
+            // not self-merged: a deployment's own usage is already visible via tokenUsage,
+            // so its own breakdown only needs to cover what its descendants contributed.
+            tokenStats.tokenUsage.assign(tokenUsage);
+
+            List<AggregatedCost> aggregatedCosts = new ArrayList<>();
+            BigDecimal delta = tokenUsage.getAggCost();
+            String parentSpanId = tokenStats.parentSpanId;
+            while (parentSpanId != null) {
+                tokenStats = spans.get(parentSpanId);
+                if (tokenStats == null) {
+                    log.warn("Parent span {} was not added to the trace context.", parentSpanId);
+                    break;
+                }
+                // ancestors: only aggCost and the per-model breakdown roll up - raw token
+                // counts are never accumulated into an ancestor's own tokenUsage.
+                tokenStats.tokenUsage.increaseAggCost(delta);
+                addUsagePerModel(tokenStats, deploymentName, tokenUsage);
+                if (tokenStats.deploymentName != null && delta != null && delta.signum() > 0) {
+                    aggregatedCosts.add(new AggregatedCost(tokenStats.deploymentName, delta));
+                }
+                parentSpanId = tokenStats.parentSpanId;
+            }
+            return aggregatedCosts;
+        }
+
+        /**
+         * Appends this report as a new entry - no merge-by-name: two reports from the same
+         * deployment name produce two separate entries, each carrying only that one report's usage.
+         */
+        private static void addUsagePerModel(TokenStats tokenStats, String deploymentName, TokenUsage tokenUsage) {
+            // own copy, never the caller's reference: this node and every ancestor must be
+            // able to accumulate independently without aliasing each other
+            TokenUsage copy = new TokenUsage();
+            copy.increase(tokenUsage);
+            tokenStats.usagePerModel.add(new ModelTokenUsage(deploymentName, copy));
+        }
+
+        private static List<UsagePerModel> toUsagePerModelList(List<ModelTokenUsage> usagePerModel) {
+            List<UsagePerModel> result = new ArrayList<>(usagePerModel.size());
+            for (ModelTokenUsage entry : usagePerModel) {
+                result.add(new UsagePerModel(result.size(), entry.getModel(), entry.getUsage()));
+            }
+            return result;
         }
     }
 
     @Data
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class ModelTokenUsage {
+        String model;
+        TokenUsage usage;
+    }
+
+    @Data
+    @JsonIgnoreProperties(ignoreUnknown = true)
     public static class TokenStats {
         TokenUsage tokenUsage;
         String parentSpanId;
+        String deploymentName;
+        List<ModelTokenUsage> usagePerModel = new ArrayList<>();
 
         public TokenStats() {
         }
 
-        public TokenStats(TokenUsage tokenUsage, String parentSpanId) {
+        public TokenStats(TokenUsage tokenUsage, String parentSpanId, String deploymentName) {
             this.tokenUsage = tokenUsage;
             this.parentSpanId = parentSpanId;
+            this.deploymentName = deploymentName;
         }
+    }
+
+    /**
+     * Aggregated-cost increment for one ancestor span, kind-agnostic: whatever kind of deployment
+     * {@code deploymentName} turns out to be, it is credited the same way once it has a descendant
+     * call rolling cost into it.
+     */
+    public record AggregatedCost(String deploymentName, BigDecimal cost) {
+    }
+
+    /**
+     * @param total scalar subtree aggregate (drives cost/aggCost propagation), as before.
+     * @param usagePerModel one entry per self-report from a descendant, indexed in report order;
+     *                       repeated reports from the same deployment name are not merged.
+     * @param aggregatedCosts aggregated-cost increment for every ancestor visited by this report,
+     *                         empty for a pure read (nothing new is "known" outside an update).
+     */
+    public record UsageStats(TokenUsage total, List<UsagePerModel> usagePerModel, List<AggregatedCost> aggregatedCosts) {
+        public static final UsageStats EMPTY = new UsageStats(null, List.of(), List.of());
     }
 
     private static ResourceDescriptor toResource(String traceId) {

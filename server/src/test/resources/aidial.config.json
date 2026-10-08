@@ -1,4 +1,16 @@
 {
+  "interceptors": {
+    "interceptor1": {
+      "endpoint": "http://localhost:4088/api/v1/interceptor/handle"
+    }
+  },
+  "translators": {
+    "translator1": {
+      "in": "anthropicMessages",
+      "out": "openaiChatCompletions",
+      "baseUrl": "http://localhost:4089/translator"
+    }
+  },
   "routes" : {
     "route-rate" : {
       "paths": ["/+v1/rate"],
@@ -6,6 +18,31 @@
       "response" : {
         "status": 200,
         "body": "OK"
+      }
+    },
+    "tasks": {
+      "rewritePath": true,
+      "paths": [
+        "/tasks(/[^/]+)*$"
+      ],
+      "methods": [
+        "DELETE",
+        "POST",
+        "GET"
+      ],
+      "upstreams": [
+        {
+          "endpoint": "http://localhost:9876",
+          "key": "123456789",
+          "weight": 1,
+          "tier": 0
+        }
+      ],
+      "maxRetryAttempts": 1,
+      "permissions": [],
+      "attachmentPaths": {
+        "requestBody": [],
+        "responseBody": []
       }
     },
     "forbidden" : {
@@ -18,6 +55,11 @@
       "paths": ["/v1/plain"],
       "methods": ["GET"],
       "upstreams": [{"endpoint": "http://localhost:9876"}]
+    },
+    "bearer": {
+      "paths": ["/v1/bearer"],
+      "methods": ["GET"],
+      "upstreams": [{"endpoint": "http://localhost:9876", "key": "bearerKey123", "authType": "BEARER"}]
     },
     "vector_store_query": {
       "paths": ["/v1/vector_store(/[^/]+)*$"],
@@ -39,35 +81,11 @@
       "methods": ["GET"],
       "userRoles": ["vstore_user", "vstore_admin"],
       "upstreams": [{"endpoint": "http://localhost:9876"}]
-    }
-  },
-  "addons": {
-    "search": {
-      "endpoint": "http://localhost:7010/search",
-      "displayName": "Search",
-      "iconUrl": "http://localhost:7001/search_addon.png",
-      "description": "Some description of the addon for testing"
     },
-    "forecast": {
-      "endpoint": "http://localhost:7010/forecast"
-    },
-    "calculator": {
-      "endpoint": "http://localhost:7010/calculator"
-    }
-  },
-  "assistant": {
-    "endpoint": "http://localhost:7001/openai/deployments/assistant/chat/completions",
-    "assistants": {
-      "search-assistant": {
-        "prompt": "Commands: sit_down, get_up, run_away",
-        "addons": ["search"],
-        "displayName": "Search Assistant",
-        "iconUrl": "http://localhost:7001/search_app.png",
-        "description": "Some description of the assistant for testing",
-        "features": {
-          "rateEndpoint": "http://localhost:7001/openai/deployments/search_assistant/rate_response"
-        }
-      }
+    "websocket-router": {
+      "paths": ["/v1/websocket"],
+      "methods": ["GET", "HEAD"],
+      "upstreams": [{"endpoint": "ws://localhost:9876"}]
     }
   },
   "applications": {
@@ -80,7 +98,9 @@
         "rateEndpoint": "http://localhost:7001/openai/deployments/10k/rate_response",
         "configurationEndpoint": "http://localhost:7001/openai/deployments/10k/config",
         "systemPromptSupported": false
-      }
+      },
+      "viewer_url": "http://some-host",
+      "editor_url": "http://some-host"
     },
     "app-route": {
       "endpoint": "http://localhost:7001/openai/deployments/10k/chat/completions",
@@ -97,7 +117,7 @@
           "paths": ["/v1/index(/[^/]+)*$"],
           "rewritePath": true,
           "methods": ["POST", "PUT", "DELETE"],
-          "upstreams": [{"endpoint": "http://localhost:4848"}],
+          "upstreams": [{"endpoint": "http://localhost:4848", "key": "indexSearchKey123", "authType": "BEARER"}],
           "attachmentPaths": {
             "requestBody": ["@.attachments[*].url"],
             "responseBody": ["@.result.attachedFiles"]
@@ -114,6 +134,11 @@
         "consentRequired": true
       },
       "userRoles": ["user"]
+    },
+    "app-responses": {
+      "endpoint": "http://localhost:7001/openai/deployments/app-responses/chat/completions",
+      "responses_endpoint": "http://localhost:7001/openai/deployments/app-responses/responses",
+      "display_name": "App with Responses API"
     }
   },
   "models": {
@@ -135,17 +160,20 @@
         {"endpoint": "http://localhost:7003", "key": "modelKey3"}
       ],
       "features": {
+        "configurationEndpoint": "http://localhost:7001/upstream/v1/deployments/gpt-35-turbo/model_config",
         "rateEndpoint": "http://localhost:7001/upstream/v1/deployments/gpt-35-turbo/rate_response",
         "tokenizeEndpoint": "http://localhost:7001/upstream/v1/deployments/gpt-35-turbo/tokenizer",
         "truncatePromptEndpoint": "http://localhost:7001/upstream/v1/deployments/gpt-35-turbo/trim_history",
         "toolsSupported": true,
         "seedSupported": true,
-        "urlAttachmentsSupported": true
+        "urlAttachmentsSupported": true,
+        "supportCommentInRateResponse": true
       }
     },
     "embedding-ada": {
       "type": "embedding",
       "endpoint" : "http://localhost:7001/openai/deployments/ada/embeddings",
+      "embeddingDimensions": 1536,
       "upstreams": [
         {"endpoint": "http://localhost:7001", "key": "modelKey4"}
       ]
@@ -161,9 +189,169 @@
     "gpt-3-turbo": {
       "type": "chat",
       "endpoint" : "http://localhost:4848/chat/completions",
+      "responsesEndpoint" : "http://localhost:4848/openai/v1/responses",
       "upstreams": [
-        {"endpoint": "http://localhost:7001", "key": "modelKey"}
+        {"endpoint": "http://chat/completions", "responsesEndpoint": "http://responses", "key": "modelKey", "id": "responses-upstream"}
       ]
+    },
+    "default-headers-model": {
+      "type": "chat",
+      "endpoint" : "http://localhost:4848/chat/completions",
+      "defaultHeaders": {
+        "x-dial-cache-policy": "cache-priority",
+        "x-dial-custom-header": "foo-bar"
+      },
+      "interfaces": {
+        "anthropicMessages": {
+          "base_url": "http://localhost:4848",
+          "defaultHeaders": {
+            "x-dial-custom-header": "foo-bar-2",
+            "x-dial-custom-header-2": "some-value"
+          }
+        }
+      }
+    },
+    "model-iface-only": {
+      "type": "chat",
+      "displayName": "Model configured via interfaces only",
+      "interfaces": {
+        "openaiChatCompletions": {"base_url": "http://localhost:4848"},
+        "openaiResponses": {"base_url": "http://localhost:4848"}
+      }
+    },
+    "responses-cache": {
+      "type": "chat",
+      "interfaces": { "openaiResponses": {"base_url": "http://localhost:4848"} },
+      "features": { "autoCachingSupported": true },
+      "upstreams": [
+        {"endpoint": "http://upstream-a", "responsesEndpoint": "http://upstream-a/v1/responses", "key": "keyA", "id": "up-a"},
+        {"endpoint": "http://upstream-b", "responsesEndpoint": "http://upstream-b/v1/responses", "key": "keyB", "id": "up-b"}
+      ]
+    },
+    "claude-ns": {
+      "type": "chat",
+      "interfaces": { "anthropicMessages": {"base_url": "http://localhost:4848"} }
+    },
+    "claude-stream": {
+      "type": "chat",
+      "interfaces": { "anthropicMessages": {"base_url": "http://localhost:4848"} }
+    },
+    "claude-count": {
+      "type": "chat",
+      "interfaces": { "anthropicMessages": {"base_url": "http://localhost:4848"} }
+    },
+    "claude-xapikey": {
+      "type": "chat",
+      "interfaces": { "anthropicMessages": {"base_url": "http://localhost:4848"} }
+    },
+    "claude-limited": {
+      "type": "chat",
+      "interfaces": { "anthropicMessages": {"base_url": "http://localhost:4848"} },
+      "limits": {
+        "maxPromptTokens": 100000,
+        "maxCompletionTokens": 8192
+      }
+    },
+    "claude-upstream": {
+      "type": "chat",
+      "interfaces": { "anthropicMessages": {"base_url": "http://localhost:4848"} },
+      "upstreams": [
+        {"endpoint": "http://messages-upstream/v1/messages", "key": "modelKey", "id": "messages-upstream"}
+      ]
+    },
+    "claude-upstream-interfaces": {
+      "type": "chat",
+      "interfaces": { "anthropicMessages": {"base_url": "http://localhost:4848"} },
+      "upstreams": [
+        {
+          "id": "messages-upstream-interfaces",
+          "baseUrl": "http://messages-upstream/inference",
+          "key": "modelKey",
+          "interfaces": { "openaiChatCompletions": {}, "anthropicMessages": {} }
+        }
+      ]
+    },
+    "claude-upstream-interface-endpoint": {
+      "type": "chat",
+      "interfaces": { "anthropicMessages": {"base_url": "http://localhost:4848"} },
+      "upstreams": [
+        {
+          "id": "messages-upstream-endpoint",
+          "baseUrl": "http://messages-upstream/inference",
+          "key": "modelKey",
+          "interfaces": {
+            "anthropicMessages": {"endpoint": "http://messages-upstream/something-else/v1/messages"}
+          }
+        }
+      ]
+    },
+    "claude-upstream-overrides": {
+      "type": "chat",
+      "interfaces": { "anthropicMessages": {"base_url": "http://localhost:4848"} },
+      "upstreams": [
+        {
+          "id": "messages-upstream-overrides",
+          "baseUrl": "http://messages-upstream/inference",
+          "key": "shared-key",
+          "extraData": {"region": "us-east-1"},
+          "interfaces": {
+            "openaiChatCompletions": {},
+            "anthropicMessages": {
+              "key": "anthropic-only-key",
+              "secretExtraData": {"region": "us-east-3"}
+            }
+          }
+        }
+      ]
+    },
+    "claude-cache": {
+      "type": "chat",
+      "interfaces": { "anthropicMessages": {"base_url": "http://localhost:4848"} },
+      "features": { "autoCachingSupported": true },
+      "upstreams": [
+        {"endpoint": "http://upstream-a/v1/messages", "key": "keyA", "id": "up-a"},
+        {"endpoint": "http://upstream-b/v1/messages", "key": "keyB", "id": "up-b"}
+      ]
+    },
+    "claude-override": {
+      "type": "chat",
+      "overrideName": "claude-sonnet-4-5-20250929",
+      "interfaces": { "anthropicMessages": {"base_url": "http://localhost:4848"} }
+    },
+    "claude-header-spoof": {
+      "type": "chat",
+      "overrideName": "claude-sonnet-4-5-20250929",
+      "interfaces": { "anthropicMessages": {"base_url": "http://localhost:4848"} },
+      "defaultHeaders": {
+        "X-UPSTREAM-ENDPOINT": "http://spoofed",
+        "X-UPSTREAM-KEY": "spoofed-key",
+        "X-UPSTREAM-EXTRA-DATA": "spoofed-extra-data",
+        "Api-Key": "spoofed-api-key",
+        "X-DIAL-DEPLOYMENT-ID": "spoofed-deployment",
+        "X-DIAL-OVERRIDE-NAME": "spoofed-override",
+        "X-DIAL-DEPLOYMENT-FEATURES": "spoofed-features",
+        "x-dial-custom-header": "applied"
+      },
+      "upstreams": [
+        {"endpoint": "http://messages-upstream/v1/messages", "key": "modelKey", "extraData": {"a": 1}, "id": "messages-upstream"}
+      ]
+    },
+    "claude-no-iface": {
+      "type": "chat",
+      "endpoint": "http://localhost:4848/v1/chat/completions"
+    },
+    "claude-to-chat-completions": {
+      "type": "chat",
+      "features": {
+        "max_tokens_supported": false,
+        "custom_temperature_supported": false,
+        "tools_supported": true
+      },
+      "interfaces": { "anthropicMessages": {"base_url": "http://localhost:4848/to-chat-completions"} }
+    },
+    "claude-to-responses": {
+      "type": "chat",
+      "interfaces": { "anthropicMessages": {"base_url": "http://localhost:4848/to-responses"} }
     }
   },
   "toolsets": {
@@ -171,7 +359,45 @@
       "transport": "http",
       "endpoint": "http://localhost:9876",
       "allowed_tools": ["branch", "remote"],
-      "description": "Git remote tool set"
+      "description": "Git remote tool set",
+      "forwardPerRequestKey": true
+    },
+    "my toolset 1": {
+      "display_name": "my toolset 1",
+      "endpoint": "http://localhost:9876",
+      "transport": "HTTP",
+      "auth_settings": {
+        "authentication_type": "API_KEY",
+        "api_key_header": "Authorization"
+      }
+    },
+    "my-toolset_2": {
+      "display_name": "my toolset 2",
+      "endpoint": "http://localhost:9876",
+      "transport": "HTTP",
+      "auth_settings": {
+        "authentication_type": "API_KEY",
+        "api_key_header": "Authorization"
+      },
+      "userRoles": [
+        "admin"
+      ]
+    },
+    "oauth-toolset": {
+      "display_name": "OAuth Toolset",
+      "endpoint": "http://localhost:9876",
+      "transport": "HTTP",
+      "auth_settings": {
+        "authentication_type": "OAUTH",
+        "client_id": "test-client-id",
+        "client_secret": "test-client-secret",
+        "authorization_endpoint": "http://localhost:9876/authorize",
+        "token_endpoint": "http://localhost:9876/token",
+        "redirect_uri": "http://localhost:3000/auth/signin"
+      },
+      "userRoles": [
+        "admin"
+      ]
     }
   },
   "keys": {
@@ -205,9 +431,23 @@
         "search": {},
         "forecast": {},
         "calculator": {},
-        "search-assistant": {},
         "app": {},
-        "gpt-3-turbo": {"minute": "100", "day": "1000"}
+        "gpt-3-turbo": {"minute": "100", "day": "1000"},
+        "default-headers-model": {"minute": "100000", "day": "10000000"},
+        "claude-ns": {"minute": "100000", "day": "10000000"},
+        "claude-stream": {"minute": "100000", "day": "10000000"},
+        "claude-count": {"minute": "100000", "day": "10000000"},
+        "claude-xapikey": {"minute": "100000", "day": "10000000"},
+        "claude-limited": {"minute": "10", "day": "10"},
+        "claude-upstream": {"minute": "100000", "day": "10000000"},
+        "claude-upstream-interfaces": {"minute": "100000", "day": "10000000"},
+        "claude-upstream-interface-endpoint": {"minute": "100000", "day": "10000000"},
+        "claude-upstream-overrides": {"minute": "100000", "day": "10000000"},
+        "claude-override": {"minute": "100000", "day": "10000000"},
+        "claude-header-spoof": {"minute": "100000", "day": "10000000"},
+        "claude-no-iface": {"minute": "100000", "day": "10000000"},
+        "claude-to-chat-completions": {"minute": "100000", "day": "10000000"},
+        "claude-to-responses": {"minute": "100000", "day": "10000000"}
       }
     },
     "vstore_user": {
@@ -224,11 +464,21 @@
   "applicationTypeSchemas": [
     {
       "$schema": "https://dial.epam.com/application_type_schemas/schema#",
+      "$id": "https://mydial.somewhere.com/custom_application_schemas/schema_endpoint",
+      "dial:applicationTypeEditorUrl": "https://mydial.somewhere.com/custom_application_schemas/schema",
+      "dial:applicationTypeViewerUrl": "https://mydial.somewhere.com/custom_application_schemas/viewer",
+      "dial:applicationTypeDisplayName": "Specific Application Type",
+      "dial:applicationTypeCompletionEndpoint": "http://specific_application_service/openai/v1/completion",
+      "dial:applicationTypeSchemaEndpoint": "http://localhost:4848/schema"
+    },
+    {
+      "$schema": "https://dial.epam.com/application_type_schemas/schema#",
       "$id": "https://mydial.somewhere.com/custom_application_schemas/specific_application_type",
       "dial:applicationTypeEditorUrl": "https://mydial.somewhere.com/custom_application_schemas/schema",
       "dial:applicationTypeViewerUrl": "https://mydial.somewhere.com/custom_application_schemas/viewer",
       "dial:applicationTypeDisplayName": "Specific Application Type",
       "dial:applicationTypeCompletionEndpoint": "http://specific_application_service/openai/v1/completion",
+      "dial:applicationTypeBucketCopy": "ENABLED",
       "dial:applicationTypeRoutes": {
         "data_sync": {
           "dial:paths": [
@@ -248,6 +498,10 @@
             "WRITE"
           ]
         }
+      },
+      "dial:applicationTypeMcp": {
+        "dial:endpoint": "http://localhost:4848/mcp",
+        "dial:transport": "HTTP"
       },
       "properties": {
         "property1": {
@@ -282,6 +536,87 @@
       "required": [
         "property1",
         "property2"
+      ]
+    },
+    {
+      "$schema": "https://dial.epam.com/application_type_schemas/schema#",
+      "$id": "https://mydial.somewhere.com/custom_application_schemas/specific_toolset_type",
+      "dial:applicationTypeEditorUrl": "https://mydial.somewhere.com/custom_application_schemas/schema",
+      "dial:applicationTypeViewerUrl": "https://mydial.somewhere.com/custom_application_schemas/viewer",
+      "dial:applicationTypeDisplayName": "Specific Application Type",
+      "dial:applicationTypeCompletionEndpoint": "http://specific_application_service/openai/v1/completion",
+      "dial:applicationTypeBucketCopy": "ENABLED",
+      "dial:applicationTypeMcp": {
+        "dial:endpoint": "http://localhost:9876/mcp",
+        "dial:transport": "HTTP",
+        "dial:allowedTools": ["classify_text"],
+        "dial:mcpConfigDelivery": "META",
+        "dial:forwardPerRequestKey": true
+      },
+      "properties": {
+        "property1": {
+          "title": "Property 1",
+          "type": "string",
+          "dial:meta": {
+            "dial:propertyKind": "client",
+            "dial:propertyOrder": 1
+          }
+        },
+        "property2": {
+          "title": "Property 2",
+          "type": "string",
+          "dial:meta": {
+            "dial:propertyKind": "server",
+            "dial:propertyOrder": 2
+          }
+        }
+      },
+      "required": [
+        "property1",
+        "property2"
+      ]
+    },
+    {
+      "$schema": "https://dial.epam.com/application_type_schemas/schema#",
+      "$id": "https://mydial.somewhere.com/custom_application_schemas/chained_application_type",
+      "dial:applicationTypeEditorUrl": "https://mydial.somewhere.com/custom_application_schemas/schema",
+      "dial:applicationTypeViewerUrl": "https://mydial.somewhere.com/custom_application_schemas/viewer",
+      "dial:applicationTypeDisplayName": "Chained Application Type",
+      "dial:applicationTypeCompletionEndpoint": "http://localhost:4848/chat/completions",
+      "properties": {
+        "property1": {
+          "title": "Property 1",
+          "type": "string",
+          "dial:meta": {
+            "dial:propertyKind": "client",
+            "dial:propertyOrder": 1
+          }
+        },
+        "deployments": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "dial:resource": true
+          },
+          "dial:meta": {
+            "dial:propertyKind": "server",
+            "dial:propertyOrder": 2
+          }
+        },
+        "prompts": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "dial:resource": true
+          },
+          "dial:meta": {
+            "dial:propertyKind": "server",
+            "dial:propertyOrder": 3
+          }
+        }
+      },
+      "required": [
+        "property1"
       ]
     }
   ]

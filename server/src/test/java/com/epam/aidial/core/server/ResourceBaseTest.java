@@ -1,15 +1,18 @@
 package com.epam.aidial.core.server;
 
 import com.epam.aidial.core.server.data.ApiKeyData;
+import com.epam.aidial.core.server.data.AutoSharedData;
 import com.epam.aidial.core.server.security.AccessTokenValidator;
 import com.epam.aidial.core.server.security.ApiKeyStore;
 import com.epam.aidial.core.server.security.EncryptionService;
 import com.epam.aidial.core.server.security.ExtractedClaims;
+import com.epam.aidial.core.server.security.IdpNotFoundException;
 import com.epam.aidial.core.server.service.NotificationService;
 import com.epam.aidial.core.server.util.ProxyUtil;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.vertx.core.Future;
 import io.vertx.core.http.HttpClientRequest;
 import io.vertx.core.http.HttpClientResponse;
@@ -17,6 +20,7 @@ import io.vertx.core.http.HttpHeaders;
 import io.vertx.core.http.HttpMethod;
 import io.vertx.core.http.RequestOptions;
 import io.vertx.core.json.Json;
+import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 import lombok.SneakyThrows;
 import org.apache.hc.client5.http.classic.methods.HttpUriRequest;
@@ -25,6 +29,7 @@ import org.apache.hc.client5.http.entity.mime.HttpMultipartMode;
 import org.apache.hc.client5.http.entity.mime.MultipartEntityBuilder;
 import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
 import org.apache.hc.client5.http.impl.classic.HttpClientBuilder;
+import org.apache.hc.core5.http.ClassicHttpResponse;
 import org.apache.hc.core5.http.ContentType;
 import org.apache.hc.core5.http.Header;
 import org.apache.hc.core5.http.io.entity.EntityUtils;
@@ -32,12 +37,14 @@ import org.apache.hc.core5.http.io.entity.StringEntity;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.TestInfo;
 import org.mockito.Mockito;
 import redis.embedded.RedisServer;
 
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -64,7 +71,6 @@ public class ResourceBaseTest {
             "temperature": 1,
             "folderId": "folder1",
             "messages": [],
-            "selectedAddons": ["R", "T", "G"],
             "assistantModelId": "assistantId",
             "lastActivityDate": 4848683153
             }
@@ -79,7 +85,6 @@ public class ResourceBaseTest {
             "temperature": 0,
             "folderId": "folder1",
             "messages": [],
-            "selectedAddons": [],
             "assistantModelId": "assistantId2",
             "lastActivityDate": 98746886446
             }
@@ -91,6 +96,18 @@ public class ResourceBaseTest {
             "name": "prompt",
             "folderId": "folder",
             "content": "content"
+            }
+            """;
+
+    public static final String TOOLSET_CREATE_REQEUST_BODY = """
+            {
+                "endpoint": "http://localhost:9876",
+                "transport": "HTTP",
+                "allowedTools": [],
+                "auth_settings": {
+                    "authentication_type": "API_KEY",
+                    "api_key_header": "Authorization"
+                }
             }
             """;
 
@@ -110,7 +127,7 @@ public class ResourceBaseTest {
     AccessTokenValidator validator = Mockito.mock(AccessTokenValidator.class);
 
     @BeforeEach
-    void init() throws Exception {
+    void init(TestInfo info) throws Exception {
         try {
             testDir = FileUtil.baseTestPath(ResourceApiTest.class);
             FileUtil.createDir(testDir.resolve("test"));
@@ -167,6 +184,16 @@ public class ResourceBaseTest {
 
             JsonObject settings = AiDial.settings()
                     .mergeIn(new JsonObject(overrides), true);
+            settings.mergeIn(additionalSettingsOverrides(), true);
+            DialConfigLocation configLocation = (DialConfigLocation) info.getTestMethod()
+                    .flatMap(method -> Arrays.stream(method.getDeclaredAnnotations())
+                            .filter(an -> an instanceof DialConfigLocation).findAny()).orElse(null);
+            if (configLocation != null) {
+                JsonObject config = settings.getJsonObject("config");
+                JsonArray files = new JsonArray();
+                files.add(configLocation.value());
+                config.put("files", files);
+            }
 
             Mockito.when(validator.extractClaims(Mockito.any()))
                     .thenAnswer(invocation -> {
@@ -177,6 +204,22 @@ public class ResourceBaseTest {
 
                         if (authorization.equals("user") || authorization.equals("admin")) {
                             return Future.succeededFuture(createClaims(authorization));
+                        }
+
+                        if (authorization.startsWith("azp:")) {
+                            return Future.succeededFuture(createWorkloadClaims(authorization.substring("azp:".length())));
+                        }
+
+                        if (authorization.startsWith("appid:")) {
+                            return Future.succeededFuture(createAppidClaims(authorization.substring("appid:".length())));
+                        }
+
+                        if (authorization.equals("no-subject")) {
+                            return Future.succeededFuture(createSubjectLessClaims());
+                        }
+
+                        if (authorization.equals("Bearer proxyKey1")) {
+                            return Future.failedFuture(new IdpNotFoundException("Idp not found"));
                         }
 
                         return Future.failedFuture("Not authorized");
@@ -204,13 +247,46 @@ public class ResourceBaseTest {
     }
 
     static ExtractedClaims createClaims(String role) {
-        return new ExtractedClaims(role, List.of(role), role, Map.of("title", List.of("Manager")), null, null);
+        ObjectNode claims = ProxyUtil.MAPPER.createObjectNode();
+        claims.put("title", "Manager");
+        return new ExtractedClaims(role, List.of(role), role, claims, null, role + " user");
+    }
+
+    // A workload (service-principal) JWT carrying an azp claim and no user roles.
+    static ExtractedClaims createWorkloadClaims(String azp) {
+        ObjectNode claims = ProxyUtil.MAPPER.createObjectNode();
+        claims.put("azp", azp);
+        return new ExtractedClaims(azp, List.of(), azp, claims, null, null);
+    }
+
+    // A token with neither a user id (no "sub") nor a project claim: nothing identifies the caller, so
+    // features that need a per-principal bucket have nothing to work with.
+    static ExtractedClaims createSubjectLessClaims() {
+        return new ExtractedClaims(null, List.of(), "hash", ProxyUtil.MAPPER.createObjectNode(), null, null);
+    }
+
+    // Token carrying only Azure v1 appid (no azp) — used to assert the appid fallback is not honored.
+    static ExtractedClaims createAppidClaims(String appid) {
+        ObjectNode claims = ProxyUtil.MAPPER.createObjectNode();
+        claims.put("appid", appid);
+        return new ExtractedClaims(appid, List.of(), appid, claims, null, null);
     }
 
     static ApiKeyData createAdminAppKey() {
         ApiKeyData perRequestKey = new ApiKeyData();
         perRequestKey.setExtractedClaims(createClaims("admin"));
         perRequestKey.setSourceDeployment("testapp");
+        perRequestKey.setTraceId("trace-id");
+        return perRequestKey;
+    }
+
+    static ApiKeyData createAppKey(String user,
+                                   Map<String, AutoSharedData> attachedToolSets) {
+        ApiKeyData perRequestKey = new ApiKeyData();
+        perRequestKey.setExtractedClaims(createClaims(user));
+        perRequestKey.setSourceDeployment("testapp");
+        perRequestKey.setAttachedDeployments(attachedToolSets);
+        perRequestKey.setTraceId("trace-id");
         return perRequestKey;
     }
 
@@ -235,6 +311,14 @@ public class ResourceBaseTest {
 
     protected String generate() {
         return "0" + id++;
+    }
+
+    /**
+     * Override in subclasses to inject additional settings overrides before {@code dial.start()}.
+     * Default returns an empty JsonObject. Merged into the runtime settings via {@code mergeIn(true)}.
+     */
+    protected JsonObject additionalSettingsOverrides() {
+        return new JsonObject();
     }
 
     static void verify(Response response, int status) {
@@ -324,17 +408,20 @@ public class ResourceBaseTest {
             request.setEntity(new StringEntity(body));
         }
 
-        return client.execute(request, response -> {
-            int status = response.getCode();
-            String answer = (response.getEntity() == null) ? null : EntityUtils.toString(response.getEntity());
-            Map<String, String> responseHeaders = new HashMap<>();
+        return client.execute(request, ResourceBaseTest::toResponse);
+    }
 
-            for (Header header : response.getHeaders()) {
-                responseHeaders.put(header.getName(), header.getValue());
-            }
+    @SneakyThrows
+    static Response toResponse(ClassicHttpResponse response) {
+        int status = response.getCode();
+        String answer = (response.getEntity() == null) ? null : EntityUtils.toString(response.getEntity());
+        Map<String, String> responseHeaders = new HashMap<>();
 
-            return new Response(status, answer, responseHeaders);
-        });
+        for (Header header : response.getHeaders()) {
+            responseHeaders.put(header.getName(), header.getValue());
+        }
+
+        return new Response(status, answer, responseHeaders);
     }
 
     @SneakyThrows
@@ -413,7 +500,7 @@ public class ResourceBaseTest {
         return stream;
     }
 
-    record Response(int status, String body, Map<String, String> headers) {
+    protected record Response(int status, String body, Map<String, String> headers) {
         public boolean ok() {
             return status() == 200;
         }

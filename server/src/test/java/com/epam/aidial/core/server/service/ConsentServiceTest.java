@@ -2,7 +2,9 @@ package com.epam.aidial.core.server.service;
 
 import com.epam.aidial.core.config.Application;
 import com.epam.aidial.core.config.Config;
+import com.epam.aidial.core.config.DeploymentInterface;
 import com.epam.aidial.core.config.Features;
+import com.epam.aidial.core.config.InterfaceType;
 import com.epam.aidial.core.server.ProxyContext;
 import com.epam.aidial.core.server.data.ApiKeyData;
 import com.epam.aidial.core.server.data.consent.Consent;
@@ -19,17 +21,21 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import lombok.SneakyThrows;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.util.List;
+import java.util.Map;
 import java.util.TreeMap;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -94,7 +100,7 @@ public class ConsentServiceTest {
                 """;
         Config config = buildConfig(jsonConfig);
         when(context.getConfig()).thenReturn(config);
-        when(context.getUserSub()).thenReturn("user-sub");
+        when(context.getUserId()).thenReturn("user-sub");
         when(deploymentService.findDeployment(eq(context), anyString())).thenCallRealMethod();
 
         ReviewConsentResponse response = service.buildConsent(context, "A");
@@ -157,7 +163,7 @@ public class ConsentServiceTest {
                 """;
         Config config = buildConfig(jsonConfig);
         when(context.getConfig()).thenReturn(config);
-        when(context.getUserSub()).thenReturn("user-sub");
+        when(context.getUserId()).thenReturn("user-sub");
         when(deploymentService.findDeployment(eq(context), anyString())).thenCallRealMethod();
         when(resourceService.getResource(any(ResourceDescriptor.class))).thenReturn("""
                {
@@ -242,7 +248,7 @@ public class ConsentServiceTest {
                 """;
         Config config = buildConfig(jsonConfig);
         when(context.getConfig()).thenReturn(config);
-        when(context.getUserSub()).thenReturn("user-sub");
+        when(context.getUserId()).thenReturn("user-sub");
         when(deploymentService.findDeployment(eq(context), anyString())).thenCallRealMethod();
         when(resourceService.getResource(any(ResourceDescriptor.class))).thenReturn("""
                {
@@ -311,7 +317,7 @@ public class ConsentServiceTest {
 
     @Test
     public void testAcceptConsent() {
-        when(context.getUserSub()).thenReturn("sub");
+        when(context.getUserId()).thenReturn("sub");
 
         service.acceptConsent(context, "id", new Consent());
 
@@ -324,6 +330,49 @@ public class ConsentServiceTest {
     }
 
     @Test
+    void interfaceCanDisableConsentWithoutAffectingOtherInterfaces() {
+        Application application = new Application();
+        application.setName("app");
+        Features features = new Features();
+        features.setConsentRequired(true);
+        application.setFeatures(features);
+        Features overrides = new Features();
+        overrides.setConsentRequired(false);
+        DeploymentInterface declared = new DeploymentInterface();
+        declared.setFeatures(overrides);
+        application.setInterfaces(Map.of(InterfaceType.OPENAI_CHAT_COMPLETIONS.getValue(), declared));
+
+        assertDoesNotThrow(() -> service.verifyUserConsent(context, application, InterfaceType.OPENAI_CHAT_COMPLETIONS));
+
+        when(context.getApiKeyData()).thenReturn(new ApiKeyData());
+        when(context.getUserId()).thenReturn("sub");
+        assertThrows(PermissionDeniedException.class,
+                () -> service.verifyUserConsent(context, application, InterfaceType.OPENAI_RESPONSES));
+    }
+
+    @Test
+    void consentReviewIncludesInterfaceRequirements() {
+        Application application = new Application();
+        application.setName("app");
+        Features overrides = new Features();
+        overrides.setConsentRequired(true);
+        DeploymentInterface declared = new DeploymentInterface();
+        declared.setFeatures(overrides);
+        application.setInterfaces(Map.of(InterfaceType.OPENAI_CHAT_COMPLETIONS.getValue(), declared));
+        when(deploymentService.findDeployment(context, "app")).thenReturn(application);
+        when(context.getUserId()).thenReturn("sub");
+
+        ReviewConsentResponse review = service.buildConsent(context, "app");
+
+        assertFalse(review.accepted());
+        assertTrue(review.consent().getDeployments().get("app").isConsentRequired());
+        when(context.getApiKeyData()).thenReturn(new ApiKeyData());
+        assertThrows(PermissionDeniedException.class,
+                () -> service.verifyUserConsent(context, application, InterfaceType.OPENAI_CHAT_COMPLETIONS));
+        assertDoesNotThrow(() -> service.verifyUserConsent(context, application, InterfaceType.OPENAI_RESPONSES));
+    }
+
+    @Test
     public void testVerifyUserConsent_WhenConsentIsMissed() {
         Application application = new Application();
         application.setName("app");
@@ -331,7 +380,28 @@ public class ConsentServiceTest {
         features.setConsentRequired(true);
         application.setFeatures(features);
 
-        when(context.getUserSub()).thenReturn("sub");
+        ApiKeyData apiKeyData = new ApiKeyData();
+        when(context.getApiKeyData()).thenReturn(apiKeyData);
+
+        when(context.getUserId()).thenReturn("sub");
+
+        assertThrows(PermissionDeniedException.class, () -> service.verifyUserConsent(context, application));
+    }
+
+    @Test
+    public void testVerifyUserConsent_WhenConsentIsNotFound() {
+        Application application = new Application();
+        application.setName("C");
+        Features features = new Features();
+        features.setConsentRequired(true);
+        application.setFeatures(features);
+
+        ApiKeyData apiKeyData = new ApiKeyData();
+        apiKeyData.setPerRequestKey("key");
+        apiKeyData.setExecutionPath(List.of("A", "B"));
+        when(context.getApiKeyData()).thenReturn(apiKeyData);
+
+        when(context.getUserId()).thenReturn("sub");
 
         assertThrows(PermissionDeniedException.class, () -> service.verifyUserConsent(context, application));
     }
@@ -344,7 +414,7 @@ public class ConsentServiceTest {
         features.setConsentRequired(true);
         application.setFeatures(features);
 
-        when(context.getUserSub()).thenReturn("sub");
+        when(context.getUserId()).thenReturn("sub");
 
         ApiKeyData apiKeyData = new ApiKeyData();
         when(context.getApiKeyData()).thenReturn(apiKeyData);
@@ -384,7 +454,7 @@ public class ConsentServiceTest {
         features.setConsentRequired(true);
         application.setFeatures(features);
 
-        when(context.getUserSub()).thenReturn("sub");
+        when(context.getUserId()).thenReturn("sub");
 
         String jsonConsent = """
                {
@@ -417,14 +487,14 @@ public class ConsentServiceTest {
     }
 
     @Test
-    public void testVerifyUserConsent_Success() {
+    public void testVerifyUserConsent_Success_RootIsCurrentDeployment() {
         Application application = new Application();
         application.setName("X");
         Features features = new Features();
         features.setConsentRequired(true);
         application.setFeatures(features);
 
-        when(context.getUserSub()).thenReturn("sub");
+        when(context.getUserId()).thenReturn("sub");
 
         String jsonConsent = """
                {
@@ -454,6 +524,85 @@ public class ConsentServiceTest {
         when(context.getApiKeyData()).thenReturn(apiKeyData);
 
         assertDoesNotThrow(() -> service.verifyUserConsent(context, application));
+    }
+
+    @Test
+    public void testVerifyUserConsent_Success_RootIsInPath() {
+        Application application = new Application();
+        application.setName("X");
+        Features features = new Features();
+        features.setConsentRequired(true);
+        application.setFeatures(features);
+
+        when(context.getUserId()).thenReturn("sub");
+
+        String jsonConsent = """
+               {
+                   "deployments" : {
+                      "A" : {
+                        "consentRequired" : false
+                      },
+                      "B" : {
+                        "consentRequired" : false
+                      },
+                      "C" : {
+                        "consentRequired" : false
+                      },
+                      "X" : {
+                        "consentRequired" : true
+                      },
+                      "Y" : {
+                        "consentRequired" : true
+                      }
+                   }
+               }
+                """;
+
+        when(resourceService.getResource(any(ResourceDescriptor.class))).thenReturn(jsonConsent);
+
+        ApiKeyData apiKeyData = new ApiKeyData();
+        apiKeyData.setPerRequestKey("key");
+        apiKeyData.setExecutionPath(List.of("A", "B"));
+        when(context.getApiKeyData()).thenReturn(apiKeyData);
+
+        Application root = new Application();
+        root.setName("A");
+
+        assertDoesNotThrow(() -> service.verifyUserConsent(context, application));
+    }
+
+    /**
+     * A deployment id is not a url. Here it is a config defined model name holding brackets, which are illegal
+     * in a URI path, so validating it as one used to fail before any storage access.
+     */
+    @Test
+    public void testAcceptConsent_DeploymentIdThatIsNotUriSafe() {
+        when(context.getUserId()).thenReturn("sub");
+
+        service.acceptConsent(context, "anthropic.claude-opus-4-8[1m]", new Consent());
+
+        assertEquals("anthropic.claude-opus-4-8[1m]", capturePutDescriptor().getName());
+    }
+
+    /**
+     * A custom application's id is an already encoded resource url, so the record path stays decoded the way it
+     * has always been - the read side derives it from that very same name.
+     */
+    @Test
+    public void testAcceptConsent_EncodedApplicationId() {
+        when(context.getUserId()).thenReturn("sub");
+
+        service.acceptConsent(context, "applications/buck/my%20app", new Consent());
+
+        ResourceDescriptor descriptor = capturePutDescriptor();
+        assertEquals("my app", descriptor.getName());
+        assertEquals(List.of("applications", "buck"), descriptor.getParentFolders());
+    }
+
+    private ResourceDescriptor capturePutDescriptor() {
+        ArgumentCaptor<ResourceDescriptor> captor = ArgumentCaptor.forClass(ResourceDescriptor.class);
+        verify(resourceService).putResource(captor.capture(), eq("{\"deployments\":{}}"), eq(EtagHeader.ANY));
+        return captor.getValue();
     }
 
     @SneakyThrows
