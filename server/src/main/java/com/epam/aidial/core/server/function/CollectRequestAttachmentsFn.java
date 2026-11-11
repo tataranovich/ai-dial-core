@@ -38,15 +38,25 @@ public abstract class CollectRequestAttachmentsFn extends BaseRequestFunction<Re
     protected abstract Set<String> collectAttachments(RequestObject tree);
 
     protected void tryToAutoShareAttachedFile(String url) {
+        shareAttachment(proxy, context, url, context.getProxyApiKeyData());
+    }
+
+    /**
+     * Gives {@code destApiKeyData} read access to a file or folder the request attaches. Fails the request with 403
+     * when the caller can read it neither through its own rights nor through a share its key carries.
+     */
+    public static void shareAttachment(Proxy proxy, ProxyContext context, String url, ApiKeyData destApiKeyData) {
         ResourceDescriptor resource = fromAnyUrl(url, proxy.getEncryptionService());
         if (resource == null) {
             return;
         }
         String resourceUrl = resource.getUrl();
         ApiKeyData sourceApiKeyData = context.getApiKeyData();
-        ApiKeyData destApiKeyData = context.getProxyApiKeyData();
         AccessService accessService = proxy.getAccessService();
-        if (sourceApiKeyData.getAttachedFiles().containsKey(resourceUrl) || accessService.hasReadAccess(resource, context)) {
+        boolean readable = resource.isFolder()
+                ? accessService.hasReadAccessToEverythingUnder(resource, context)
+                : accessService.hasReadAccess(resource, context);
+        if (sourceApiKeyData.getAttachedFiles().containsKey(resourceUrl) || readable) {
             if (resource.isFolder()) {
                 destApiKeyData.getAttachedFolders().put(resourceUrl, new AutoSharedData(ResourceAccessType.READ_ONLY));
             } else {

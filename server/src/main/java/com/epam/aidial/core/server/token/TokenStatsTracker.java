@@ -1,13 +1,12 @@
 package com.epam.aidial.core.server.token;
 
+import com.epam.aidial.core.config.Router;
 import com.epam.aidial.core.server.ProxyContext;
 import com.epam.aidial.core.server.util.ProxyUtil;
-import com.epam.aidial.core.server.util.ResourceDescriptorFactory;
 import com.epam.aidial.core.server.vertx.AsyncTaskExecutor;
-import com.epam.aidial.core.storage.resource.ResourceDescriptor;
-import com.epam.aidial.core.storage.resource.ResourceTypes;
-import com.epam.aidial.core.storage.service.ResourceService;
-import com.epam.aidial.core.storage.util.EtagHeader;
+import com.epam.aidial.core.storage.blobstore.BlobStorageUtil;
+import com.epam.aidial.core.storage.service.LockService;
+import com.epam.aidial.core.storage.tracing.BlockingCallTracer;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import io.vertx.core.Future;
 import lombok.AllArgsConstructor;
@@ -15,40 +14,69 @@ import lombok.Data;
 import lombok.NoArgsConstructor;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.redisson.api.RBucket;
+import org.redisson.api.RedissonClient;
+import org.redisson.client.codec.StringCodec;
 
 import java.math.BigDecimal;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-
-import static com.epam.aidial.core.storage.resource.ResourceDescriptor.PATH_SEPARATOR;
+import java.util.function.Function;
 
 @Slf4j
 @RequiredArgsConstructor
 public class TokenStatsTracker {
-    public static final String DEPLOYMENT_COST_STATS_BUCKET = "deployment_cost_stats";
-    public static final String DEPLOYMENT_COST_STATS_LOCATION = DEPLOYMENT_COST_STATS_BUCKET + PATH_SEPARATOR;
+    // not "deployment_cost_stats:": older versions keep a ResourceService hash of the trace under that key
+    static final String KEY_PREFIX = "deployment_cost_stats_tmp:";
 
     private final AsyncTaskExecutor taskExecutor;
-    private final ResourceService resourceService;
+    private final RedissonClient redis;
+    private final LockService lockService;
+    private final String prefix;
+    private final BlockingCallTracer blockingCallTracer;
+    // refreshed on every write: bounds records nobody deletes, and a request that reports its usage later than this
+    // after the trace's last write loses it
+    private final Duration ttl;
+    // for a trace whose root is a background Responses job, which outlives its HTTP request
+    private final Duration backgroundTtl;
 
     /**
-     * Starts current span.
-     * <p>
-     *     Note. The method is blocking and shouldn't be run in the event loop thread.
-     * </p>
+     * Adds the request to the usage record of its trace, creating the record if it does not exist.
+     *
+     * <p>The record is kept in Redis only, with a TTL, and is deleted when the root span ends.
+     * Losing it to eviction under a {@code volatile-*} policy or to a Redis restart loses the trace's roll-up;
+     * the costs each deployment reports for itself are not affected.
      */
     public Future<Void> startSpan(ProxyContext context) {
         return taskExecutor.submit(() -> {
-            ResourceDescriptor resource = toResource(context.getTraceId());
-            resourceService.computeResource(resource, json -> {
-                TraceContext traceContext = ProxyUtil.convertToObject(json, TraceContext.class);
-                if (traceContext == null) {
-                    traceContext = new TraceContext();
-                }
+            update(context.getTraceId(), true, traceContext -> {
                 traceContext.addSpan(context);
-                return ProxyUtil.convertToString(traceContext);
+                // only the root: its poller deletes the record when the job ends. A job started by a child
+                // reports into the record only while the root runs, and the root's endSpan deletes it
+                if (context.isBackgroundJob() && context.isOriginalRequest()) {
+                    traceContext.background = true;
+                }
+                return true;
+            });
+            return null;
+        });
+    }
+
+    /**
+     * Takes the deployment name off the context's span while its router decides again, so the calls the router makes
+     * then grow no candidate's aggregated-cost record.
+     */
+    public Future<Void> unnameSpan(ProxyContext context) {
+        return taskExecutor.submit(() -> {
+            update(context.getTraceId(), false, traceContext -> {
+                TokenStats span = traceContext.spans.get(context.getSpanId());
+                if (span != null) {
+                    span.deploymentName = null;
+                }
+                return true;
             });
             return null;
         });
@@ -59,23 +87,32 @@ public class TokenStatsTracker {
     }
 
     public Future<UsageStats> getUsageStats(ProxyContext context) {
+        return getUsageStats(context.getTraceId(), context.getSpanId());
+    }
+
+    public Future<UsageStats> getUsageStats(String traceId, String spanId) {
         return taskExecutor.submit(() -> {
-            ResourceDescriptor resource = toResource(context.getTraceId());
-            String json = resourceService.getResource(resource);
+            String json = blockingCallTracer.trace("cost_stats.get", () -> getBucket(traceId).get());
             TraceContext traceContext = ProxyUtil.convertToObject(json, TraceContext.class);
             if (traceContext == null) {
                 return UsageStats.EMPTY;
             }
-            return traceContext.getUsageStats(context.getSpanId());
+            return traceContext.getUsageStats(spanId);
         });
     }
 
+    /**
+     * Ends the root span of the trace: deletes its usage record.
+     */
     public Future<Void> endSpan(String traceId) {
-        ResourceDescriptor resource = toResource(traceId);
-        return taskExecutor.submit(() -> {
-            resourceService.deleteResource(resource, EtagHeader.ANY);
+        return taskExecutor.submit(() -> blockingCallTracer.trace("cost_stats.delete", () -> {
+            RBucket<String> bucket = getBucket(traceId);
+            // under the lock, so a racing update cannot write back the deleted record
+            try (var ignore = lockService.lock(bucket.getName())) {
+                bucket.delete();
+            }
             return null;
-        });
+        }));
     }
 
     /**
@@ -99,20 +136,36 @@ public class TokenStatsTracker {
      * read-modify-write so callers never need a separate read.
      */
     public Future<UsageStats> updateDeploymentStats(String traceId, String spanId, String deploymentName, TokenUsage tokenUsage) {
-        ResourceDescriptor resource = toResource(traceId);
+        return updateDeploymentStats(traceId, spanId, deploymentName, tokenUsage, false);
+    }
+
+    /**
+     * Same as {@link #updateDeploymentStats(String, String, String, TokenUsage)}.
+     *
+     * @param rootMayHaveEnded the report comes from a child span, which can report after the root's {@code endSpan}
+     *     has deleted the record: a missing record is then logged at debug, not warn
+     */
+    public Future<UsageStats> updateDeploymentStats(String traceId, String spanId, String deploymentName, TokenUsage tokenUsage,
+            boolean rootMayHaveEnded) {
         return taskExecutor.submit(() -> {
-            UsageStats[] result = {UsageStats.EMPTY};
-            resourceService.computeResource(resource, json -> {
-                TraceContext traceContext = ProxyUtil.convertToObject(json, TraceContext.class);
-                if (traceContext == null) {
+            UsageStats result = update(traceId, false, traceContext -> {
+                if (!traceContext.spans.containsKey(spanId)) {
                     return null;
                 }
                 List<AggregatedCost> aggregatedCosts = traceContext.updateStats(spanId, deploymentName, tokenUsage);
                 UsageStats usageStats = traceContext.getUsageStats(spanId);
-                result[0] = new UsageStats(usageStats.total(), usageStats.usagePerModel(), aggregatedCosts);
-                return ProxyUtil.convertToString(traceContext);
+                return new UsageStats(usageStats.total(), usageStats.usagePerModel(), aggregatedCosts);
             });
-            return result[0];
+            if (result == null) {
+                if (rootMayHaveEnded) {
+                    log.debug("Usage of span {} is not rolled up: trace {} has no record holding it", spanId, traceId);
+                } else {
+                    // the root has not deleted the record yet, so it was evicted, expired or lost in a Redis restart
+                    log.warn("Usage of span {} is lost: trace {} has no record holding it", spanId, traceId);
+                }
+                return UsageStats.EMPTY;
+            }
+            return result;
         });
     }
 
@@ -120,11 +173,22 @@ public class TokenStatsTracker {
     @JsonIgnoreProperties(ignoreUnknown = true)
     public static class TraceContext {
         Map<String, TokenStats> spans = new HashMap<>();
+        // the root span is a background Responses job: the record gets the background TTL
+        boolean background;
 
         void addSpan(ProxyContext context) {
             String spanId = context.getSpanId();
             String parentSpanId = context.getParentSpanId();
-            String deploymentName = context.getDeployment() == null ? null : context.getDeployment().getName();
+            // a router names no span: it is never charged limits, so what its calls cost goes to no aggregated-cost record
+            String deploymentName = context.getDeployment() == null || context.getDeployment() instanceof Router
+                    ? null : context.getDeployment().getName();
+            TokenStats existing = spans.get(spanId);
+            if (existing != null) {
+                // the pass is re-entered with a router's next candidate: what the failed candidate's children
+                // rolled up stays, and later reports credit the new candidate
+                existing.deploymentName = deploymentName;
+                return;
+            }
             TokenStats tokenStats = new TokenStats(new TokenUsage(), parentSpanId, deploymentName);
             spans.put(spanId, tokenStats);
         }
@@ -242,8 +306,33 @@ public class TokenStatsTracker {
         public static final UsageStats EMPTY = new UsageStats(null, List.of(), List.of());
     }
 
-    private static ResourceDescriptor toResource(String traceId) {
-        return ResourceDescriptorFactory.fromDecoded(
-                ResourceTypes.DEPLOYMENT_COST_STATS, DEPLOYMENT_COST_STATS_BUCKET, DEPLOYMENT_COST_STATS_LOCATION, traceId);
+    /**
+     * Applies {@code fn} to the usage record of the trace under its lock and stores the result with a fresh TTL.
+     *
+     * @return the result of {@code fn}, or {@code null} without writing if there is no record and {@code create}
+     *     is false, or if {@code fn} returns {@code null}.
+     */
+    private <T> T update(String traceId, boolean create, Function<TraceContext, T> fn) {
+        return blockingCallTracer.trace("cost_stats.update", () -> {
+            RBucket<String> bucket = getBucket(traceId);
+            try (var ignore = lockService.lock(bucket.getName())) {
+                TraceContext traceContext = ProxyUtil.convertToObject(bucket.get(), TraceContext.class);
+                if (traceContext == null && !create) {
+                    return null;
+                }
+                if (traceContext == null) {
+                    traceContext = new TraceContext();
+                }
+                T result = fn.apply(traceContext);
+                if (result != null) {
+                    bucket.set(ProxyUtil.convertToString(traceContext), traceContext.background ? backgroundTtl : ttl);
+                }
+                return result;
+            }
+        });
+    }
+
+    private RBucket<String> getBucket(String traceId) {
+        return redis.getBucket(KEY_PREFIX + BlobStorageUtil.toStoragePath(prefix, traceId), StringCodec.INSTANCE);
     }
 }

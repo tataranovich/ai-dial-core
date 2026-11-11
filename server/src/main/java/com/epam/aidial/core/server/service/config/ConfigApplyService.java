@@ -6,6 +6,8 @@ import com.epam.aidial.core.config.GlobalSettings;
 import com.epam.aidial.core.config.Interceptor;
 import com.epam.aidial.core.config.Key;
 import com.epam.aidial.core.config.Model;
+import com.epam.aidial.core.config.Route;
+import com.epam.aidial.core.config.Router;
 import com.epam.aidial.core.config.ToolSet;
 import com.epam.aidial.core.config.Translator;
 import com.epam.aidial.core.server.config.ConfigPostProcessor;
@@ -22,21 +24,25 @@ import com.epam.aidial.core.server.data.config.manifest.AdminInterceptorManifest
 import com.epam.aidial.core.server.data.config.manifest.AdminKeyManifest;
 import com.epam.aidial.core.server.data.config.manifest.AdminManifest;
 import com.epam.aidial.core.server.data.config.manifest.AdminModelManifest;
+import com.epam.aidial.core.server.data.config.manifest.AdminPolicyAssignmentManifest;
+import com.epam.aidial.core.server.data.config.manifest.AdminPolicyManifest;
 import com.epam.aidial.core.server.data.config.manifest.AdminRoleManifest;
 import com.epam.aidial.core.server.data.config.manifest.AdminRouteManifest;
+import com.epam.aidial.core.server.data.config.manifest.AdminRouterManifest;
 import com.epam.aidial.core.server.data.config.manifest.AdminSchemaManifest;
 import com.epam.aidial.core.server.data.config.manifest.AdminSettingsManifest;
 import com.epam.aidial.core.server.data.config.manifest.AdminToolSetManifest;
 import com.epam.aidial.core.server.data.config.manifest.AdminTranslatorManifest;
 import com.epam.aidial.core.server.security.ApiKeyStore;
 import com.epam.aidial.core.server.service.AdminManagedFieldsWriteMode;
+import com.epam.aidial.core.server.service.ApplicationSchemaService;
 import com.epam.aidial.core.server.service.ApplicationService;
 import com.epam.aidial.core.server.service.CatalogSchemaService;
 import com.epam.aidial.core.server.service.ToolSetService;
 import com.epam.aidial.core.server.service.config.ConfigManifestSupport.ParsedName;
+import com.epam.aidial.core.server.service.policy.PolicyService;
 import com.epam.aidial.core.server.util.ResourceDescriptorFactory;
 import com.epam.aidial.core.server.util.UpstreamExtraDataMerger;
-import com.epam.aidial.core.server.validation.CatalogSchemaValidationException;
 import com.epam.aidial.core.server.validation.ValidationUtil;
 import com.epam.aidial.core.storage.resource.ResourceDescriptor;
 import com.epam.aidial.core.storage.resource.ResourceTypes;
@@ -70,6 +76,8 @@ public class ConfigApplyService {
     private final ApplicationService applicationService;
     private final ToolSetService toolSetService;
     private final CatalogSchemaService catalogSchemaService;
+    private final ApplicationSchemaService applicationSchemaService;
+    private final PolicyService policyService;
 
     public ConfigApplyService(MergedConfigStore mergedConfigStore,
                               ResourceService resourceService,
@@ -78,7 +86,8 @@ public class ConfigApplyService {
                               ApiKeyStore apiKeyStore,
                               ApplicationService applicationService,
                               ToolSetService toolSetService,
-                              CatalogSchemaService catalogSchemaService) {
+                              CatalogSchemaService catalogSchemaService,
+                              ApplicationSchemaService applicationSchemaService) {
         this.mergedConfigStore = mergedConfigStore;
         this.resourceService = resourceService;
         this.secretFieldProcessor = secretFieldProcessor;
@@ -87,6 +96,8 @@ public class ConfigApplyService {
         this.applicationService = applicationService;
         this.toolSetService = toolSetService;
         this.catalogSchemaService = catalogSchemaService;
+        this.applicationSchemaService = applicationSchemaService;
+        this.policyService = new PolicyService(resourceService);
     }
 
     /**
@@ -125,10 +136,15 @@ public class ConfigApplyService {
             if (!pendingChanges.isEmpty()) {
                 Map<String, String> failures = mergedConfigStore.applyBatch(pendingChanges);
                 // Blobs are already written; if the in-memory swap of any entity failed (e.g. an
-                // unforeseen type coercion error not caught by precheck) the merged Config diverges
-                // from blob until the next full rebuild. Surface via log so operators see it.
+                // assignment whose policy another pod wrote and whose replica event has not arrived
+                // yet, or an unforeseen type coercion error not caught by precheck) the merged Config
+                // diverges from blob. This pod ignores the replica events of its own writes, so request
+                // a full rebuild to converge instead of waiting for the next periodic one.
                 failures.forEach((id, reason) ->
                         log.warn("Partial-update swap failed for {} after blob put: {}", id, reason));
+                if (!failures.isEmpty()) {
+                    mergedConfigStore.requestRebuild();
+                }
             }
             if (pendingSettings != null) {
                 mergedConfigStore.applySettingsWrite(pendingSettings);
@@ -147,6 +163,8 @@ public class ConfigApplyService {
                     applySchema(catalogSchema.spec(), id, parsed.name(), pending, ResourceTypes.CATALOG_SCHEMA, scratch);
             case AdminInterceptorManifest interceptor ->
                     applyManagedEntity(interceptor.spec(), id, parsed.name(), ResourceTypes.INTERCEPTOR, scratch, pending);
+            case AdminRouterManifest router ->
+                    applyManagedEntity(router.spec(), id, parsed.name(), ResourceTypes.ROUTER, scratch, pending);
             case AdminTranslatorManifest translator ->
                     applyTranslator(translator.spec(), id, parsed.name(), pending);
             case AdminRoleManifest role ->
@@ -158,6 +176,19 @@ public class ConfigApplyService {
             case AdminToolSetManifest toolSet -> applyToolSet(toolSet.spec(), id, parsed.name(), scratch, pending);
             case AdminApplicationManifest application ->
                     applyApplication(application.spec(), id, parsed.name(), scratch, pending);
+            case AdminPolicyManifest policy -> {
+                policyService.putPolicy(parsed.name().name(), policy.spec(), EtagHeader.ANY, null);
+                pending.add(new EntityChange(ResourceTypes.POLICY,
+                        MergedConfigStore.resolveMapKeyFor(PolicyService.describe(ResourceTypes.POLICY, parsed.name().name())), policy.spec()));
+                yield new EntityResult(id, AdminApplyStatus.APPLIED, null);
+            }
+            case AdminPolicyAssignmentManifest assignment -> {
+                policyService.putAssignment(parsed.name().name(), assignment.spec(), EtagHeader.ANY, null);
+                pending.add(new EntityChange(ResourceTypes.POLICY_ASSIGNMENT,
+                        MergedConfigStore.resolveMapKeyFor(PolicyService.describe(ResourceTypes.POLICY_ASSIGNMENT, parsed.name().name())),
+                        assignment.spec()));
+                yield new EntityResult(id, AdminApplyStatus.APPLIED, null);
+            }
         };
     }
 
@@ -200,7 +231,7 @@ public class ConfigApplyService {
                                                 ResourceTypes type, Config scratch, List<EntityChange> pending) {
         ResourceDescriptor descriptor = ResourceDescriptorFactory.fromDecoded(
                 type, parsed.bucket(), parsed.location(), parsed.name());
-        /// Deployment-id uniqueness only applies to INTERCEPTOR here — ROLE/ROUTE aren't deployments
+        /// Deployment-id uniqueness only applies to INTERCEPTOR and ROUTER here — ROLE/ROUTE aren't deployments
         // resolved through Config.selectDeployment, so they don't share the short-name namespace.
         if (type == ResourceTypes.INTERCEPTOR) {
             List<ValidationWarning> warnings = new ArrayList<>();
@@ -211,6 +242,23 @@ public class ConfigApplyService {
             String dupError = ConfigManifestSupport.validateDeploymentIdUniqueness(scratch, type, parsed);
             if (dupError != null) {
                 return new EntityResult(id, AdminApplyStatus.FAILED, dupError);
+            }
+        }
+        if (type == ResourceTypes.ROUTER) {
+            List<ValidationWarning> warnings = applicationSchemaService.validateRouter(scratch, parsed.name(), (Router) entity);
+            if (!warnings.isEmpty()) {
+                return new EntityResult(id, AdminApplyStatus.FAILED, ConfigManifestSupport.joinWarnings(warnings));
+            }
+            String dupError = ConfigManifestSupport.validateDeploymentIdUniqueness(scratch, type, parsed);
+            if (dupError != null) {
+                return new EntityResult(id, AdminApplyStatus.FAILED, dupError);
+            }
+        }
+        if (type == ResourceTypes.ROUTE) {
+            List<ValidationWarning> warnings = new ArrayList<>();
+            ConfigPostProcessor.validateRouteInvariants((Route) entity, warnings);
+            if (!warnings.isEmpty()) {
+                return new EntityResult(id, AdminApplyStatus.FAILED, ConfigManifestSupport.joinWarnings(warnings));
             }
         }
         secretFieldProcessor.encryptFields(entity, descriptor);
@@ -271,20 +319,13 @@ public class ConfigApplyService {
 
     private EntityResult applyModel(Model model, String id, ParsedName parsed, Config scratch, List<EntityChange> pending) {
         List<ValidationWarning> warnings = new ArrayList<>();
-        ConfigPostProcessor.validateOverridePaths(model, warnings);
-        boolean invalidOverridePaths = !warnings.isEmpty();
-        ConfigPostProcessor.validatePricing(model, warnings);
-        ConfigPostProcessor.validateUpstreamInterfaces(model, warnings);
-        ConfigPostProcessor.validateCrossReferences(model, scratch, warnings);
+        ConfigPostProcessor.validateModelInvariants(model, scratch.getTranslators(), warnings);
+        catalogSchemaService.validate(model, warnings);
+        boolean hardFailure = !warnings.isEmpty();
+        boolean softFailure = !ConfigPostProcessor.validateCrossReferences(model, scratch, warnings);
         UpstreamExtraDataMerger.validateNoOverlap(model);
-        boolean invalid = !warnings.isEmpty();
-        if (invalidOverridePaths || (invalid && !softValidation)) {
+        if (hardFailure || (softFailure && !softValidation)) {
             return new EntityResult(id, AdminApplyStatus.FAILED, ConfigManifestSupport.joinWarnings(warnings));
-        }
-        try {
-            catalogSchemaService.validate(model);
-        } catch (CatalogSchemaValidationException e) {
-            return new EntityResult(id, AdminApplyStatus.FAILED, "Catalog properties validation failed: " + e.getMessage());
         }
         ResourceDescriptor descriptor = ResourceDescriptorFactory.fromDecoded(
                 ResourceTypes.MODEL, parsed.bucket(), parsed.location(), parsed.name());
@@ -298,7 +339,7 @@ public class ConfigApplyService {
         // decrypt-in-place so partial-update receives plaintext upstream secrets.
         secretFieldProcessor.decryptFields(model, descriptor);
         pending.add(new EntityChange(ResourceTypes.MODEL, MergedConfigStore.resolveMapKeyFor(descriptor), model));
-        return new EntityResult(id, invalid ? AdminApplyStatus.APPLIED_INVALID : AdminApplyStatus.APPLIED, null);
+        return new EntityResult(id, softFailure ? AdminApplyStatus.APPLIED_INVALID : AdminApplyStatus.APPLIED, null);
     }
 
     private EntityResult applyApplication(Application application, String id, ParsedName parsed,

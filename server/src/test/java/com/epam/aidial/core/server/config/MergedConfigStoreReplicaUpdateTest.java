@@ -4,10 +4,14 @@ import com.epam.aidial.core.config.Config;
 import com.epam.aidial.core.config.GlobalSettings;
 import com.epam.aidial.core.config.Key;
 import com.epam.aidial.core.config.Model;
+import com.epam.aidial.core.config.Router;
+import com.epam.aidial.core.config.SpendingLimitMode;
+import com.epam.aidial.core.config.SpendingLimits;
 import com.epam.aidial.core.credentials.service.ResourceAuthSettingsEncryptionService;
 import com.epam.aidial.core.server.data.ApiKeyData;
 import com.epam.aidial.core.server.security.ApiKeyStore;
 import com.epam.aidial.core.server.service.ExternalServiceService;
+import com.epam.aidial.core.server.tracing.BackgroundOperationTracer;
 import com.epam.aidial.core.server.util.ResourceDescriptorFactory;
 import com.epam.aidial.core.server.vertx.AsyncTaskExecutor;
 import com.epam.aidial.core.storage.data.ResourceEvent;
@@ -59,7 +63,8 @@ public class MergedConfigStoreReplicaUpdateTest {
     private static final String KEY_JSON_NEW_SECRET =
             "{\"project\":\"proj-a\",\"role\":\"admin-role\",\"key\":\"secret-NEW\"}";
     private static final String SETTINGS_JSON =
-            "{\"globalInterceptors\":[\"api-overlay\"],\"retriableErrorCodes\":[503]}";
+            "{\"globalInterceptors\":[\"api-overlay\"],\"retriableErrorCodes\":[503],"
+                    + "\"spendingLimits\":{\"mode\":\"enforce\",\"defaultCostObject\":\"PERSONAL\"}}";
 
     @Mock
     private Vertx vertx;
@@ -83,6 +88,15 @@ public class MergedConfigStoreReplicaUpdateTest {
     // The real ReentrantLock the store adopts as its rebuildLock (== ApiKeyStore's mutationLock).
     // Captured here so lock-held-invariant tests can assert it is held at the mutation call sites.
     private ReentrantLock mutationLock;
+
+    private static BackgroundOperationTracer mockBackgroundTracer() {
+        BackgroundOperationTracer tracer = org.mockito.Mockito.mock(BackgroundOperationTracer.class);
+        org.mockito.Mockito.lenient().when(tracer.traceFuture(org.mockito.Mockito.any())).thenAnswer(inv -> {
+            java.util.function.Supplier<io.vertx.core.Future<?>> supplier = inv.getArgument(0);
+            return supplier.get();
+        });
+        return tracer;
+    }
 
     @BeforeEach
     public void setUpLockService() {
@@ -198,6 +212,7 @@ public class MergedConfigStoreReplicaUpdateTest {
         assertTrue(MergedConfigStore.isManagedEventUrl("keys/platform/proj-a"));
         assertTrue(MergedConfigStore.isManagedEventUrl("routes/public/rt-1"));
         assertTrue(MergedConfigStore.isManagedEventUrl("settings/platform/global"));
+        assertTrue(MergedConfigStore.isManagedEventUrl("routers/platform/r1"));
 
         assertFalse(MergedConfigStore.isManagedEventUrl("conversations/x"));
         assertFalse(MergedConfigStore.isManagedEventUrl("prompts/x"));
@@ -303,6 +318,7 @@ public class MergedConfigStoreReplicaUpdateTest {
         Config seeded = newConfig();
         seeded.setGlobalInterceptors(List.of("file-default"));
         seeded.setRetriableErrorCodes(Set.of(500));
+        seeded.setSpendingLimits(spendingLimits(SpendingLimitMode.SHADOW, "FILE"));
         MergedConfigStore store = initStore(seeded, MergedConfigStore.MODE_ABORT);
 
         ResourceDescriptor descriptor = ResourceDescriptorFactory.fromAnyUrl(SETTINGS_ID, null);
@@ -312,6 +328,7 @@ public class MergedConfigStoreReplicaUpdateTest {
 
         assertEquals(List.of("api-overlay"), store.get().getGlobalInterceptors());
         assertEquals(Set.of(503), store.get().getRetriableErrorCodes());
+        assertEquals(spendingLimits(SpendingLimitMode.ENFORCE, "PERSONAL"), store.get().getSpendingLimits());
         assertTrue(store.isSettingsFromApi());
     }
 
@@ -320,6 +337,7 @@ public class MergedConfigStoreReplicaUpdateTest {
         Config seeded = newConfig();
         seeded.setGlobalInterceptors(List.of("file-default"));
         seeded.setRetriableErrorCodes(Set.of(500));
+        seeded.setSpendingLimits(spendingLimits(SpendingLimitMode.SHADOW, "FILE"));
         when(fileConfigStore.get()).thenReturn(seeded);
         MergedConfigStore store = initStore(seeded, MergedConfigStore.MODE_ABORT);
 
@@ -327,6 +345,7 @@ public class MergedConfigStoreReplicaUpdateTest {
         GlobalSettings overlay = new GlobalSettings();
         overlay.setGlobalInterceptors(List.of("api-overlay"));
         overlay.setRetriableErrorCodes(Set.of(503));
+        overlay.setSpendingLimits(spendingLimits(SpendingLimitMode.ENFORCE, "PERSONAL"));
         store.applySettingsWrite(overlay);
         Mockito.reset(resourceService);
 
@@ -335,8 +354,22 @@ public class MergedConfigStoreReplicaUpdateTest {
 
         assertEquals(List.of("file-default"), store.get().getGlobalInterceptors());
         assertEquals(Set.of(500), store.get().getRetriableErrorCodes());
+        assertEquals(spendingLimits(SpendingLimitMode.SHADOW, "FILE"), store.get().getSpendingLimits());
         assertFalse(store.isSettingsFromApi());
         verify(resourceService, never()).getResource(any(ResourceDescriptor.class));
+    }
+
+    @Test
+    public void fullRebuildTakesSettingsFromTheBlob() {
+        Config seeded = newConfig();
+        seeded.setSpendingLimits(spendingLimits(SpendingLimitMode.SHADOW, "FILE"));
+        ResourceDescriptor descriptor = ResourceDescriptorFactory.fromAnyUrl(SETTINGS_ID, null);
+        lenient().when(resourceService.getResource(descriptor)).thenReturn(SETTINGS_JSON);
+
+        MergedConfigStore store = initStore(seeded, MergedConfigStore.MODE_ABORT);
+
+        assertEquals(spendingLimits(SpendingLimitMode.ENFORCE, "PERSONAL"), store.get().getSpendingLimits());
+        assertTrue(store.isSettingsFromApi());
     }
 
     @Test
@@ -374,6 +407,24 @@ public class MergedConfigStoreReplicaUpdateTest {
         assertEquals("GPT-4", applied.getDisplayName().getPlainValue());
         verify(secretFieldProcessor).decryptFields(any(Model.class), eq(descriptor));
         verifyNoInteractions(apiKeyStore);
+    }
+
+    @Test
+    public void routerCreateAndDeleteFromAnotherPodApplied() {
+        MergedConfigStore store = initStore(newConfig(), MergedConfigStore.MODE_ABORT);
+        ResourceDescriptor descriptor = ResourceDescriptorFactory.fromAnyUrl("routers/platform/r1", null);
+        when(resourceService.getResource(descriptor))
+                .thenReturn("{\"baseUrl\":\"http://router\",\"interfaces\":{\"openaiChatCompletions\":{}}}");
+
+        store.applyReplicaEvent(descriptor, ResourceEvent.Action.CREATE, null);
+
+        Router applied = store.get().getRouters().get("r1");
+        assertEquals("http://router", applied.getBaseUrl());
+        assertEquals("r1", applied.getName());
+
+        store.applyReplicaEvent(descriptor, ResourceEvent.Action.DELETE, null);
+
+        assertFalse(store.get().getRouters().containsKey("r1"));
     }
 
     @Test
@@ -457,9 +508,16 @@ public class MergedConfigStoreReplicaUpdateTest {
         MergedConfigStore store = new MergedConfigStore(
                 vertx, taskExecutor, resourceService, apiKeyStore, new PlatformEntityLocationStrategy(),
                 secretFieldProcessor, lockService, onInvalidEntity, false, POD_ID,
-                externalServiceService, resourceAuthSettingsEncryptionService);
+                externalServiceService, resourceAuthSettingsEncryptionService, mockBackgroundTracer());
         store.init(fileConfigStore);
         return store;
+    }
+
+    private static SpendingLimits spendingLimits(SpendingLimitMode mode, String defaultCostObject) {
+        SpendingLimits limits = new SpendingLimits();
+        limits.setMode(mode);
+        limits.setDefaultCostObject(defaultCostObject);
+        return limits;
     }
 
     private static Config newConfig() {

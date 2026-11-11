@@ -7,10 +7,12 @@ import com.epam.aidial.core.config.InterfacePathMapping;
 import com.epam.aidial.core.config.InterfaceType;
 import com.epam.aidial.core.config.Model;
 import com.epam.aidial.core.config.ModelType;
+import com.epam.aidial.core.config.Router;
 import com.epam.aidial.core.config.Translator;
 import com.epam.aidial.core.config.TranslatorRef;
 import com.epam.aidial.core.storage.util.UrlUtil;
 import lombok.experimental.UtilityClass;
+import org.apache.commons.lang3.Strings;
 
 import java.util.Map;
 import java.util.regex.Matcher;
@@ -37,6 +39,7 @@ public class DeploymentEndpointUtil {
             Pattern.compile("/deployments/(?<deployment>.+?)/(?<action>completions|chat/completions|embeddings)(?=$|\\?)");
 
     private static final String OPENAI_RESPONSES_BASE_PATH = "/openai/v1/responses";
+    private static final String DECIDE_PATH = "/decide";
 
     /**
      * The endpoint a request for the type is sent to, or null when the deployment has nothing serving it —
@@ -144,6 +147,16 @@ public class DeploymentEndpointUtil {
     }
 
     /**
+     * The absolute uri of a response item served by this Core itself, for {@code localBaseUrl} such as
+     * {@code http://localhost:8080}. The trailing slash of the base is dropped and {@code responseId} is
+     * escaped to stay inside one path segment.
+     */
+    public String resolveLocalResponseItemUri(String localBaseUrl, String responseId) {
+        return Strings.CS.removeEnd(localBaseUrl, "/")
+                + OPENAI_RESPONSES_BASE_PATH + "/" + UrlUtil.encodePathSegment(responseId);
+    }
+
+    /**
      * The Responses API base uri for the deployment. Callers append their own suffix and query, which is why
      * this cannot go through {@link #resolveRequestUri} — that one drops the ingress path in the
      * pre-{@code interfaces} flow, and an item operation still has to hang {@code /{id}/cancel} off the
@@ -165,6 +178,21 @@ public class DeploymentEndpointUtil {
         DeploymentInterface deploymentInterface = findInterface(deployment, type);
         InterfaceMode mode = deploymentInterface == null ? null : deploymentInterface.getMode();
         return mode == null ? InterfaceMode.PASSTHROUGH : mode;
+    }
+
+    /**
+     * Whether Core asks the router which deployment serves the type: the router is in decision mode and declares it.
+     */
+    public boolean decides(Router router, InterfaceType type) {
+        return router.getMode() == Router.Mode.DECISION && findInterface(router, type) != null;
+    }
+
+    /**
+     * Where a decision router is asked about the type: the interface's {@code base_url}, or the router's
+     * {@code baseUrl} when it declares none, followed by {@code /decide}.
+     */
+    public String resolveDecideUri(Router router, InterfaceType type) {
+        return resolveInterfaceBaseUrl(router, type, Map.of()) + DECIDE_PATH;
     }
 
     /**

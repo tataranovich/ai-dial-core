@@ -30,6 +30,7 @@ import com.epam.aidial.core.server.vertx.stream.BufferingReadStream;
 import com.epam.aidial.core.storage.exception.ResourceNotFoundException;
 import com.epam.aidial.core.storage.http.HttpException;
 import com.epam.aidial.core.storage.http.HttpStatus;
+import com.epam.aidial.core.storage.tracing.BlockingCallTracer;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.opentelemetry.api.trace.Span;
 import io.vertx.core.Future;
@@ -95,7 +96,6 @@ import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.mockStatic;
 import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -132,6 +132,7 @@ public class DeploymentPostControllerTest {
     void stubConfig() {
         // the controller resolves translator references against the request's config on every routing step
         lenient().when(context.getConfig()).thenReturn(new Config());
+        lenient().when(proxy.getBlockingCallTracer()).thenReturn(BlockingCallTracer.NOOP);
     }
 
     @SuppressWarnings("checkstyle:LineLength")
@@ -428,7 +429,7 @@ public class DeploymentPostControllerTest {
     @ParameterizedTest
     @NullSource
     @EnumSource(value = InterfaceMode.class, names = {"PASSTHROUGH", "TRANSLATOR"})
-    public void testHandleProxyRequest_NamesTheDeploymentForTranslators(InterfaceMode mode) {
+    public void testHandleProxyRequest_NamesTheDeploymentInEveryMode(InterfaceMode mode) {
         when(context.getRequest()).thenReturn(request);
 
         Model model = new Model();
@@ -451,10 +452,8 @@ public class DeploymentPostControllerTest {
 
         controller.handleProxyRequest(proxyRequest);
 
-        // the deployment id, not overrideName: it is what the translator calls Core back with
-        String expected = mode == InterfaceMode.TRANSLATOR ? "openai-gpt-5.4-mini" : null;
-        verify(proxyRequest, expected == null ? never() : times(1))
-                .putHeader(eq(Proxy.HEADER_DEPLOYMENT_ID), eq("openai-gpt-5.4-mini"));
+        // the deployment id, not overrideName: the path and the body's model carry overrideName
+        verify(proxyRequest).putHeader(eq(Proxy.HEADER_DEPLOYMENT_ID), eq("openai-gpt-5.4-mini"));
     }
 
     @Test
@@ -882,7 +881,7 @@ public class DeploymentPostControllerTest {
         when(context.getUpstreamRoute()).thenReturn(upstreamRoute);
         when(context.getResponseBody()).thenReturn(Buffer.buffer());
         when(proxy.getTokenStatsTracker()).thenReturn(tokenStatsTracker);
-        when(rateLimiter.increase(any(), any(), any(), any(), any(), any(), any())).thenReturn(Future.succeededFuture());
+        when(rateLimiter.increase(any(), any(), any(), any(), any(), any(), any(), any())).thenReturn(Future.succeededFuture());
         when(context.getRequest()).thenReturn(request);
         when(request.version()).thenReturn(HttpVersion.HTTP_1_1);
         when(request.method()).thenReturn(HttpMethod.POST);
@@ -895,7 +894,7 @@ public class DeploymentPostControllerTest {
         controller.handleResponse(bufferingReadStream);
 
         ArgumentCaptor<InterfaceType> interfaceTypeCaptor = ArgumentCaptor.forClass(InterfaceType.class);
-        verify(rateLimiter).increase(eq(model), any(), any(), any(), any(), interfaceTypeCaptor.capture(), any());
+        verify(rateLimiter).increase(eq(model), any(), any(), any(), any(), interfaceTypeCaptor.capture(), any(), any());
         assertEquals(InterfaceType.OPENAI_CHAT_COMPLETIONS, interfaceTypeCaptor.getValue());
         verify(context).setTokenUsage(any(TokenUsage.class));
         verify(logStore).save(any(AnalyticsLogContext.class));
@@ -917,7 +916,7 @@ public class DeploymentPostControllerTest {
         when(context.getUpstreamRoute()).thenReturn(upstreamRoute);
         when(context.getResponseBody()).thenReturn(Buffer.buffer());
         when(proxy.getTokenStatsTracker()).thenReturn(tokenStatsTracker);
-        when(rateLimiter.increase(any(), any(), any(), any(), any(), any(), any())).thenReturn(Future.succeededFuture());
+        when(rateLimiter.increase(any(), any(), any(), any(), any(), any(), any(), any())).thenReturn(Future.succeededFuture());
         when(context.getRequest()).thenReturn(request);
         when(request.version()).thenReturn(HttpVersion.HTTP_1_1);
         when(request.method()).thenReturn(HttpMethod.POST);
@@ -930,7 +929,7 @@ public class DeploymentPostControllerTest {
         controller.handleResponse(bufferingReadStream);
 
         ArgumentCaptor<InterfaceType> interfaceTypeCaptor = ArgumentCaptor.forClass(InterfaceType.class);
-        verify(rateLimiter).increase(eq(model), any(), any(), any(), any(), interfaceTypeCaptor.capture(), any());
+        verify(rateLimiter).increase(eq(model), any(), any(), any(), any(), interfaceTypeCaptor.capture(), any(), any());
         assertEquals(InterfaceType.OPENAI_EMBEDDINGS, interfaceTypeCaptor.getValue());
     }
 
@@ -965,7 +964,7 @@ public class DeploymentPostControllerTest {
         when(context.getUpstreamRoute()).thenReturn(upstreamRoute);
         when(context.getResponseBody()).thenReturn(Buffer.buffer("{}"));
         when(proxy.getTokenStatsTracker()).thenReturn(tokenStatsTracker);
-        when(rateLimiter.increase(any(), any(), any(), any(), any(), any(), any())).thenReturn(Future.succeededFuture());
+        when(rateLimiter.increase(any(), any(), any(), any(), any(), any(), any(), any())).thenReturn(Future.succeededFuture());
         when(context.getRequest()).thenReturn(request);
         when(request.version()).thenReturn(HttpVersion.HTTP_1_1);
         when(request.method()).thenReturn(HttpMethod.POST);
@@ -1008,7 +1007,7 @@ public class DeploymentPostControllerTest {
         when(context.getUpstreamRoute()).thenReturn(upstreamRoute);
         when(context.getResponseBody()).thenReturn(Buffer.buffer());
         when(proxy.getTokenStatsTracker()).thenReturn(tokenStatsTracker);
-        when(rateLimiter.increase(any(), any(), any(), any(), any(), any(), any())).thenReturn(Future.succeededFuture());
+        when(rateLimiter.increase(any(), any(), any(), any(), any(), any(), any(), any())).thenReturn(Future.succeededFuture());
         when(context.getRequest()).thenReturn(request);
         when(request.version()).thenReturn(HttpVersion.HTTP_1_1);
         when(request.method()).thenReturn(HttpMethod.POST);
@@ -1022,7 +1021,7 @@ public class DeploymentPostControllerTest {
 
         // an interface declaring no mode is what every config written before mode existed is: still charged
         verify(rateLimiter).increase(
-                eq(model), any(), any(), any(), any(), eq(InterfaceType.OPENAI_CHAT_COMPLETIONS), any());
+                eq(model), any(), any(), any(), any(), eq(InterfaceType.OPENAI_CHAT_COMPLETIONS), any(), any());
     }
 
     @ParameterizedTest
@@ -1078,7 +1077,7 @@ public class DeploymentPostControllerTest {
         controller.handleResponse(bufferingReadStream);
 
         // the translator calls Core back for the completion; that inner request carries the usage to limits
-        verify(rateLimiter, never()).increase(any(), any(), any(), any(), any(), any(), any());
+        verify(rateLimiter, never()).increase(any(), any(), any(), any(), any(), any(), any(), any());
         verify(context).setTokenUsage(any(TokenUsage.class));
         verify(logStore).save(any(AnalyticsLogContext.class));
         verify(bufferingReadStream).end(response);
@@ -1109,7 +1108,7 @@ public class DeploymentPostControllerTest {
 
         controller.handleResponse(bufferingReadStream);
 
-        verify(rateLimiter, never()).increase(any(), any(), any(), any(), any(), any(), any());
+        verify(rateLimiter, never()).increase(any(), any(), any(), any(), any(), any(), any(), any());
         verify(tokenStatsTracker).getUsageStats(eq(context));
         verify(context).setTokenUsage(any(TokenUsage.class));
         verify(context).setUsagePerModel(any());
@@ -1155,7 +1154,7 @@ public class DeploymentPostControllerTest {
 
         controller.handleResponse(bufferingReadStream);
 
-        verify(rateLimiter, never()).increase(any(), any(), any(), any(), any(), any(), any());
+        verify(rateLimiter, never()).increase(any(), any(), any(), any(), any(), any(), any(), any());
         verify(rateLimiter).recordAggregatedCost(eq("inner-app"), any(), eq(new BigDecimal("0.40")));
         verify(rateLimiter).recordAggregatedCost(eq("router-app"), any(), eq(new BigDecimal("0.40")));
         verify(bufferingReadStream).end(response);
@@ -1338,5 +1337,26 @@ public class DeploymentPostControllerTest {
         verify(proxyRequest).putHeader(eq(HEADER_APPLICATION_ID), eq("customApp"));
 
         verify(proxyRequest, never()).putHeader(eq(HEADER_APPLICATION_PROPERTIES), anyString());
+    }
+
+    @Test
+    public void testInterceptorReentryDispatchesToNextInterceptorWithoutReadingBody() throws Exception {
+        ApiKeyData apiKeyData = new ApiKeyData();
+        apiKeyData.setInterceptors(List.of("interceptor1", "interceptor2"));
+        apiKeyData.setInterceptorIndex(0);
+
+        when(context.getRequest()).thenReturn(request);
+        when(request.getHeader(eq(HttpHeaders.CONTENT_TYPE))).thenReturn(HEADER_CONTENT_TYPE_APPLICATION_JSON);
+        when(request.path()).thenReturn("/openai/deployments/interceptor/chat/completions");
+        when(context.getApiKeyData()).thenReturn(apiKeyData);
+        when(context.getInterceptors()).thenReturn(apiKeyData.getInterceptors());
+        when(context.respond(NOT_FOUND, "Interceptor is not found")).thenReturn(Future.succeededFuture());
+
+        controller.handle("interceptor");
+
+        // the body is read by the interceptor controller itself, not on reentry
+        verify(request, never()).body();
+        // interceptor2 is not declared in the config, so reaching this response proves it was dispatched to
+        verify(context).respond(NOT_FOUND, "Interceptor is not found");
     }
 }

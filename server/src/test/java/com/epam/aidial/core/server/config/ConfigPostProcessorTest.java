@@ -8,19 +8,25 @@ import com.epam.aidial.core.config.Interceptor;
 import com.epam.aidial.core.config.InterfaceMode;
 import com.epam.aidial.core.config.Model;
 import com.epam.aidial.core.config.Operator;
+import com.epam.aidial.core.config.OrgUnitPermission;
+import com.epam.aidial.core.config.OrgUnitRole;
 import com.epam.aidial.core.config.Pricing;
 import com.epam.aidial.core.config.PricingRate;
 import com.epam.aidial.core.config.Role;
 import com.epam.aidial.core.config.Route;
+import com.epam.aidial.core.config.Router;
 import com.epam.aidial.core.config.ToolSet;
 import com.epam.aidial.core.config.Translator;
 import com.epam.aidial.core.config.TranslatorRef;
 import com.epam.aidial.core.config.Upstream;
+import com.epam.aidial.core.config.UpstreamAuthConfig;
 import com.epam.aidial.core.config.UpstreamAuthType;
 import com.epam.aidial.core.config.UpstreamInterface;
 import com.epam.aidial.core.storage.resource.ResourceTypes;
 import org.junit.jupiter.api.Test;
 
+import java.net.URI;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -42,6 +48,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * structural slash-keyed-name rejection and semantic skip|abort routing.
  */
 public class ConfigPostProcessorTest {
+
+    @Test
+    void testOrgUnitRolesCoreCannotEvaluateFailTheLoad() {
+        Config config = new Config();
+        config.setOrgUnitRoles(Map.of("auditor", new OrgUnitRole("x", List.of(new OrgUnitPermission(List.of("read"), "rules/**")))));
+
+        IllegalArgumentException error = assertThrows(IllegalArgumentException.class, () -> ConfigPostProcessor.process(config, null));
+        assertTrue(error.getMessage().startsWith("orgUnitRoles.auditor: pathPattern"), error.getMessage());
+    }
 
     @Test
     void testStructuralDropsSlashKeyedNamesAcrossAllTypes() {
@@ -234,7 +249,7 @@ public class ConfigPostProcessorTest {
         Config config = newMutableConfig();
         Upstream upstream = new Upstream();
         upstream.setEndpoint("https://openrouter.ai/api/v1/chat/completions");
-        upstream.setAuthType(UpstreamAuthType.BEARER);
+        upstream.setAuthType(UpstreamAuthConfig.fromString("BEARER"));
         Route route = new Route();
         route.setUpstreams(List.of(upstream));
         config.getRoutes().put("openrouter", route);
@@ -249,7 +264,7 @@ public class ConfigPostProcessorTest {
         Upstream upstream = new Upstream();
         upstream.setEndpoint("https://openrouter.ai/api/v1/chat/completions");
         upstream.setKey("openrouter-key");
-        upstream.setAuthType(UpstreamAuthType.BEARER);
+        upstream.setAuthType(UpstreamAuthConfig.fromString("BEARER"));
         Route route = new Route();
         route.setUpstreams(List.of(upstream));
         config.getRoutes().put("openrouter", route);
@@ -257,6 +272,36 @@ public class ConfigPostProcessorTest {
         ConfigPostProcessor.processSemantic(config, null, Map.of(), Map.of(), null);
 
         assertTrue(config.getRoutes().containsKey("openrouter"));
+    }
+
+    @Test
+    void testSemanticAbortThrowsOnRouteCustomHeaderUpstreamWithoutKey() {
+        Config config = newMutableConfig();
+        Upstream upstream = new Upstream();
+        upstream.setEndpoint("https://example.com/api");
+        upstream.setAuthType(new UpstreamAuthConfig(UpstreamAuthType.CUSTOM_HEADER, "X-Api-Token"));
+        Route route = new Route();
+        route.setUpstreams(List.of(upstream));
+        config.getRoutes().put("custom", route);
+
+        assertThrows(InvalidEntityException.class,
+                () -> ConfigPostProcessor.processSemantic(config, null, Map.of(), Map.of(), null));
+    }
+
+    @Test
+    void testSemanticAllowsRouteCustomHeaderUpstreamWithKey() {
+        Config config = newMutableConfig();
+        Upstream upstream = new Upstream();
+        upstream.setEndpoint("https://example.com/api");
+        upstream.setKey("secret");
+        upstream.setAuthType(new UpstreamAuthConfig(UpstreamAuthType.CUSTOM_HEADER, "X-Api-Token"));
+        Route route = new Route();
+        route.setUpstreams(List.of(upstream));
+        config.getRoutes().put("custom", route);
+
+        ConfigPostProcessor.processSemantic(config, null, Map.of(), Map.of(), null);
+
+        assertTrue(config.getRoutes().containsKey("custom"));
     }
 
     @Test
@@ -718,11 +763,275 @@ public class ConfigPostProcessorTest {
                 () -> ConfigPostProcessor.validateSingleInterceptor(config, "interceptor", null));
     }
 
+    @Test
+    void testRouterWithInterceptorsRejected() {
+        Config config = newMutableConfig();
+        Router router = router("http://router", "openaiChatCompletions", new DeploymentInterface());
+        router.setInterceptors(List.of("i1"));
+        config.getRouters().put("r1", router);
+
+        InvalidEntityException error = assertThrows(InvalidEntityException.class,
+                () -> ConfigPostProcessor.processSemantic(config, null, Map.of(), Map.of(), null));
+        assertTrue(error.getMessage().contains("A router declares no interceptors"), error.getMessage());
+    }
+
+    @Test
+    void testRouterWithNullInterceptorsLoadsWithEmptyList() {
+        Config config = newMutableConfig();
+        Router router = router("http://router", "openaiChatCompletions", new DeploymentInterface());
+        router.setInterceptors(null);
+        config.getRouters().put("r1", router);
+
+        ConfigPostProcessor.processSemantic(config, null, Map.of(), Map.of(), null);
+
+        assertEquals(List.of(), config.getRouters().get("r1").getInterceptors());
+    }
+
+    @Test
+    void testRouterWithLegacyEndpointRejected() {
+        Config config = newMutableConfig();
+        Router router = router(null, "openaiChatCompletions", new DeploymentInterface());
+        router.setEndpoint("http://router/chat");
+        config.getRouters().put("r1", router);
+
+        InvalidEntityException error = assertThrows(InvalidEntityException.class,
+                () -> ConfigPostProcessor.processSemantic(config, null, Map.of(), Map.of(), null));
+        assertTrue(error.getMessage().contains("A router declares interfaces, not endpoint"), error.getMessage());
+    }
+
+    @Test
+    void testRouterPassThroughEntryWithNoUrlAnywhereRejected() {
+        Config config = newMutableConfig();
+        config.getRouters().put("r1", router(null, "openaiChatCompletions", new DeploymentInterface()));
+
+        InvalidEntityException error = assertThrows(InvalidEntityException.class,
+                () -> ConfigPostProcessor.processSemantic(config, null, Map.of(), Map.of(), null));
+        assertEquals("Router 'r1': Interface 'openaiChatCompletions' declares no base_url and the router declares no baseUrl", error.getMessage());
+    }
+
+    @Test
+    void testRouterTranslatorWithoutModeRejected() {
+        Config config = newMutableConfig();
+        DeploymentInterface anthropic = new DeploymentInterface();
+        anthropic.setTranslator(TranslatorRef.inline(new Translator(null, OPENAI_CHAT_COMPLETIONS, "http://t")));
+        config.getRouters().put("r1", router("http://router", "anthropicMessages", anthropic));
+
+        InvalidEntityException error = assertThrows(InvalidEntityException.class,
+                () -> ConfigPostProcessor.processSemantic(config, null, Map.of(), Map.of(), null));
+        assertTrue(error.getMessage().contains("Router 'r1': A translator requires mode 'translator'"), error.getMessage());
+    }
+
+    @Test
+    void testRouterSkippedUnderSkipModeAndValidRouterNamed() {
+        Config config = newMutableConfig();
+        config.getRouters().put("bad", router(null, "openaiChatCompletions", new DeploymentInterface()));
+        config.getRouters().put("good", router("http://router", "openaiChatCompletions", new DeploymentInterface()));
+        AtomicReference<ResourceTypes> capturedType = new AtomicReference<>();
+
+        ConfigPostProcessor.processSemantic(config, null, Map.of(), Map.of(), (type, error) -> capturedType.set(type));
+
+        assertEquals(ResourceTypes.ROUTER, capturedType.get());
+        assertFalse(config.getRouters().containsKey("bad"));
+        assertEquals("good", config.getRouters().get("good").getName());
+        assertTrue(ConfigPostProcessor.isDeploymentIdTakenByAnotherDeploymentType(config, ResourceTypes.MODEL, "good"));
+    }
+
+    @Test
+    void testValidateSingleRouterDropsAnInvalidRouterUnderSkip() {
+        Config config = newMutableConfig();
+        config.getRouters().put("bad", router(null, "openaiChatCompletions", new DeploymentInterface()));
+        AtomicReference<ResourceTypes> capturedType = new AtomicReference<>();
+
+        ConfigPostProcessor.validateSingleRouter(config, "bad", (type, error) -> capturedType.set(type));
+
+        assertEquals(ResourceTypes.ROUTER, capturedType.get());
+        assertFalse(config.getRouters().containsKey("bad"));
+    }
+
+    @Test
+    void testValidateSingleRouterThrowsInAbortMode() {
+        Config config = newMutableConfig();
+        Router router = router("http://router", "openaiChatCompletions", new DeploymentInterface());
+        router.setInterceptors(List.of("i1"));
+        config.getRouters().put("r1", router);
+
+        InvalidEntityException error = assertThrows(InvalidEntityException.class,
+                () -> ConfigPostProcessor.validateSingleRouter(config, "r1", null));
+        assertTrue(error.getMessage().contains("Router 'r1': A router declares no interceptors"), error.getMessage());
+    }
+
+    @Test
+    void testValidateRouterInvariantsNamesTheRouterAndEmptiesNullInterceptors() {
+        Router router = router("http://router", "openaiChatCompletions", new DeploymentInterface());
+        router.setInterceptors(null);
+        List<ValidationWarning> warnings = new ArrayList<>();
+
+        ConfigPostProcessor.validateRouterInvariants("r1", router, Map.of(), warnings);
+
+        assertTrue(warnings.isEmpty(), warnings.toString());
+        assertEquals("r1", router.getName());
+        assertEquals(List.of(), router.getInterceptors());
+    }
+
+    @Test
+    void testRouterPropertiesWithoutSchemaRejected() {
+        Router router = router("http://router", "openaiChatCompletions", new DeploymentInterface());
+        router.setApplicationProperties(Map.of("tier", "medium"));
+        List<ValidationWarning> warnings = new ArrayList<>();
+
+        ConfigPostProcessor.validateRouterInvariants("r1", router, Map.of(), warnings);
+
+        assertEquals(1, warnings.size(), warnings.toString());
+        assertEquals("applicationProperties", warnings.getFirst().getField());
+        assertTrue(warnings.getFirst().getMessage().contains(
+                "A router declares applicationTypeSchemaId and applicationProperties together"), warnings.toString());
+    }
+
+    @Test
+    void testRouterSchemaWithoutPropertiesRejected() {
+        Router router = router("http://router", "openaiChatCompletions", new DeploymentInterface());
+        router.setApplicationTypeSchemaId(URI.create("https://dial.test/router-type"));
+        List<ValidationWarning> warnings = new ArrayList<>();
+
+        ConfigPostProcessor.validateRouterInvariants("r1", router, Map.of(), warnings);
+
+        assertEquals(1, warnings.size(), warnings.toString());
+        assertEquals("applicationTypeSchemaId", warnings.getFirst().getField());
+    }
+
+    @Test
+    void testRouterWithSchemaAndEmptyPropertiesPasses() {
+        // {} counts as set: the pairing rule is about presence, the schema decides what the properties must hold
+        Router router = router("http://router", "openaiChatCompletions", new DeploymentInterface());
+        router.setApplicationTypeSchemaId(URI.create("https://dial.test/router-type"));
+        router.setApplicationProperties(Map.of());
+        List<ValidationWarning> warnings = new ArrayList<>();
+
+        ConfigPostProcessor.validateRouterInvariants("r1", router, Map.of(), warnings);
+
+        assertTrue(warnings.isEmpty(), warnings.toString());
+    }
+
+    @Test
+    void testStructuralDropsSlashKeyedRouter() {
+        Config config = newMutableConfig();
+        config.getRouters().put("bad/router", new Router());
+
+        ConfigPostProcessor.processStructural(config);
+
+        assertTrue(config.getRouters().isEmpty());
+    }
+
+    @Test
+    void testDecisionSettingsNeedDecisionMode() {
+        Config config = newMutableConfig();
+        Router router = router("http://router", "openaiChatCompletions", new DeploymentInterface());
+        router.setDecision(decision(null, 2));
+        config.getRouters().put("r1", router);
+
+        InvalidEntityException error = assertThrows(InvalidEntityException.class,
+                () -> ConfigPostProcessor.processSemantic(config, null, Map.of(), Map.of(), null));
+        assertTrue(error.getMessage().contains("decision requires mode 'decision'"), error.getMessage());
+    }
+
+    @Test
+    void testDecisionRouterNeedsUrlForEachInterface() {
+        Config config = newMutableConfig();
+        config.getRouters().put("r1", decisionRouter(null, null));
+
+        InvalidEntityException error = assertThrows(InvalidEntityException.class,
+                () -> ConfigPostProcessor.processSemantic(config, null, Map.of(), Map.of(), null));
+        assertTrue(error.getMessage().contains("declares no base_url and the router declares no baseUrl"), error.getMessage());
+    }
+
+    @Test
+    void testDecisionRouterWithTranslatorRejected() {
+        Config config = newMutableConfig();
+        Router router = decisionRouter("http://router", null);
+        router.setInterfaces(Map.of("anthropicMessages", translated(TranslatorRef.inline(new Translator(null, OPENAI_CHAT_COMPLETIONS, "http://t")))));
+        config.getRouters().put("r1", router);
+
+        InvalidEntityException error = assertThrows(InvalidEntityException.class,
+                () -> ConfigPostProcessor.processSemantic(config, null, Map.of(), Map.of(), null));
+        assertTrue(error.getMessage().contains("A router in mode 'decision' serves no interface through a translator"), error.getMessage());
+    }
+
+    @Test
+    void testMaxDecisionsOutOfRangeRejected() {
+        for (int value : new int[] {0, 11}) {
+            Config config = newMutableConfig();
+            config.getRouters().put("r1", decisionRouter("http://router", decision(null, value)));
+
+            InvalidEntityException error = assertThrows(InvalidEntityException.class,
+                    () -> ConfigPostProcessor.processSemantic(config, null, Map.of(), Map.of(), null));
+            assertTrue(error.getMessage().contains("decision.maxDecisions must be between 1 and 10"), error.getMessage());
+        }
+    }
+
+    @Test
+    void testMaxDecisionsAtTheCapAccepted() {
+        Config config = newMutableConfig();
+        config.getRouters().put("r1", decisionRouter("http://router", decision(null, 10)));
+
+        ConfigPostProcessor.processSemantic(config, null, Map.of(), Map.of(), null);
+
+        assertTrue(config.getRouters().containsKey("r1"));
+    }
+
+    @Test
+    void testDecisionTimeoutMustBePositive() {
+        Config config = newMutableConfig();
+        config.getRouters().put("r1", decisionRouter("http://router", decision(0L, null)));
+
+        InvalidEntityException error = assertThrows(InvalidEntityException.class,
+                () -> ConfigPostProcessor.processSemantic(config, null, Map.of(), Map.of(), null));
+        assertTrue(error.getMessage().contains("decision.timeoutMs must be positive"), error.getMessage());
+    }
+
+    @Test
+    void testValidDecisionRouterAccepted() {
+        Config config = newMutableConfig();
+        Router router = decisionRouter(null, decision(200L, null));
+        // an interface's base_url serves a router that declares no baseUrl
+        router.setInterfaces(Map.of("openaiChatCompletions", new DeploymentInterface("http://router")));
+        config.getRouters().put("r1", router);
+
+        ConfigPostProcessor.processSemantic(config, null, Map.of(), Map.of(), null);
+
+        assertTrue(config.getRouters().containsKey("r1"));
+    }
+
+    @Test
+    void testModelInterfaceMessageUnchanged() {
+        Config config = newMutableConfig();
+        Model model = new Model();
+        model.setInterfaces(Map.of("openaiChatCompletions", new DeploymentInterface()));
+        config.getModels().put("m", model);
+
+        InvalidEntityException error = assertThrows(InvalidEntityException.class,
+                () -> ConfigPostProcessor.processSemantic(config, null, Map.of(), Map.of(), null));
+        assertEquals("Model 'm': Interface 'openaiChatCompletions' declares no base_url and the model declares no baseUrl", error.getMessage());
+    }
+
     private static DeploymentInterface translated(TranslatorRef translator) {
         DeploymentInterface declared = new DeploymentInterface();
         declared.setMode(InterfaceMode.TRANSLATOR);
         declared.setTranslator(translator);
         return declared;
+    }
+
+    private static Router decisionRouter(String baseUrl, Router.Decision decision) {
+        Router router = router(baseUrl, "openaiChatCompletions", new DeploymentInterface());
+        router.setMode(Router.Mode.DECISION);
+        router.setDecision(decision);
+        return router;
+    }
+
+    private static Router.Decision decision(Long timeoutMs, Integer maxDecisions) {
+        Router.Decision decision = new Router.Decision();
+        decision.setTimeoutMs(timeoutMs);
+        decision.setMaxDecisions(maxDecisions);
+        return decision;
     }
 
     private static Config newMutableConfig() {
@@ -731,7 +1040,15 @@ public class ConfigPostProcessorTest {
         config.setApplications(new HashMap<>());
         config.setInterceptors(new HashMap<>());
         config.setToolsets(new LinkedHashMap<>());
+        config.setRouters(new LinkedHashMap<>());
         return config;
+    }
+
+    private static Router router(String baseUrl, String interfaceType, DeploymentInterface declared) {
+        Router router = new Router();
+        router.setBaseUrl(baseUrl);
+        router.setInterfaces(Map.of(interfaceType, declared));
+        return router;
     }
 
     private static PricingRate flatRate(String rate) {
@@ -766,5 +1083,114 @@ public class ConfigPostProcessorTest {
         ConfigPostProcessor.process(config, null);
 
         assertEquals(List.of("good"), List.copyOf(config.getModels().keySet()));
+    }
+
+    // --- validateModelInvariants: the shared set every pre-write surface must call ---------------
+    // These guard the anti-drift contract. processModels/validateSingleModel and the three pre-write
+    // sites all route through validateModelInvariants, so a write can never be admitted that the
+    // next rebuild would reject.
+
+    /**
+     * The abort-mode rebuild and {@code validateModelInvariants} must report identical warnings,
+     * so a validator added only to {@link ConfigPostProcessor#processModels} fails here — provided
+     * {@code maximallyInvalidModel} trips it; extend that fixture when adding a rule.
+     */
+    @Test
+    void testValidateModelInvariantsReportsExactlyWhatTheRebuildReports() {
+        Config config = newMutableConfig();
+        config.getModels().put("model", maximallyInvalidModel());
+
+        InvalidEntityException rebuild = assertThrows(InvalidEntityException.class,
+                () -> ConfigPostProcessor.processSemantic(config, null, Map.of(), Map.of(), null));
+
+        Model standalone = maximallyInvalidModel();
+        standalone.setName("model");
+        List<ValidationWarning> preWrite = new ArrayList<>();
+        ConfigPostProcessor.validateModelInvariants(standalone, config.getTranslators(), preWrite);
+
+        assertEquals(rebuild.getWarnings(), preWrite,
+                () -> "rebuild and pre-write validation diverged — a validator was added to "
+                        + "processModels but not to validateModelInvariants (or vice versa).\n"
+                        + "rebuild:  " + rebuild.getWarnings() + "\npre-write: " + preWrite);
+
+        // Non-empty, so an accidentally-valid fixture can't make the comparison vacuous.
+        List<String> fields = preWrite.stream().map(ValidationWarning::getField).toList();
+        assertTrue(fields.contains("pricing"), () -> "expected a pricing warning: " + fields);
+        assertTrue(fields.contains("upstreams[0].id"), () -> "expected an upstream id warning: " + fields);
+        assertTrue(fields.contains("interfaces.openaiChatCompletions"),
+                () -> "expected a deployment-interface warning: " + fields);
+    }
+
+    /**
+     * A model violating every rule in the shared set at once. One rule per family, so the
+     * differential comparison above has something to compare on each.
+     */
+    private static Model maximallyInvalidModel() {
+        Model model = new Model();
+
+        Pricing pricing = new Pricing();
+        pricing.setUnit("char_without_whitespace");
+        pricing.setCacheRead(flatRate("0.01"));
+        model.setPricing(pricing);
+
+        Upstream upstream = new Upstream();
+        upstream.setInterfaces(Map.of("openaiChatCompletions", new UpstreamInterface()));
+        model.setUpstreams(List.of(upstream));
+
+        model.setInterfaces(Map.of("openaiChatCompletions", new DeploymentInterface()));
+        return model;
+    }
+
+    @Test
+    void testValidateModelInvariantsWithEmptyTranslatorMapToleratesUnresolvedName() {
+        // A name with no entry leaves the interface unserved, not the model invalid — so a partial
+        // translator map can only yield fewer warnings, never spurious ones. This is what makes it
+        // safe to validate against the live snapshot / batch scratch rather than the merged config.
+        Model model = new Model();
+        model.setName("model");
+        model.setInterfaces(Map.of("anthropicMessages", translated(TranslatorRef.named("not-registered-yet"))));
+
+        List<ValidationWarning> warnings = new ArrayList<>();
+        ConfigPostProcessor.validateModelInvariants(model, Map.of(), warnings);
+
+        assertTrue(warnings.isEmpty(), () -> "unresolved translator name must not warn: " + warnings);
+    }
+
+    @Test
+    void testValidateModelInvariantsDoesNotDuplicateOverridePathWarnings() {
+        // validateDeploymentInterfaces already runs the per-entry override-path check, so callers
+        // must not also call validateOverridePaths(Deployment, ...) — this pins that contract.
+        Model model = new Model();
+        model.setName("model");
+        model.setBaseUrl("http://model");
+        DeploymentInterface declared = new DeploymentInterface();
+        declared.setOverridePaths(Map.of("postAnthropicMessages", "/v1/messages"));
+        model.setInterfaces(Map.of("openaiChatCompletions", declared));
+
+        List<ValidationWarning> warnings = new ArrayList<>();
+        ConfigPostProcessor.validateModelInvariants(model, Map.of(), warnings);
+
+        assertEquals(1, warnings.size(), () -> "override-path warning reported more than once: " + warnings);
+    }
+
+    @Test
+    void testValidateCrossReferencesReportsOnlyItsOwnWarnings() {
+        Config config = newMutableConfig();
+        config.getInterceptors().put("known", new Interceptor());
+        Model model = new Model();
+        model.setName("model");
+        model.setInterceptors(List.of("known"));
+
+        List<ValidationWarning> warnings = new ArrayList<>();
+        warnings.add(new ValidationWarning("pricing", "pre-existing hard failure"));
+
+        assertTrue(ConfigPostProcessor.validateCrossReferences(model, config, warnings),
+                () -> "resolved refs must report true regardless of earlier warnings: " + warnings);
+        assertEquals(1, warnings.size());
+
+        model.setInterceptors(List.of("known", "missing"));
+        assertFalse(ConfigPostProcessor.validateCrossReferences(model, config, warnings));
+        assertEquals(2, warnings.size());
+        assertEquals("interceptors[1]", warnings.get(1).getField());
     }
 }

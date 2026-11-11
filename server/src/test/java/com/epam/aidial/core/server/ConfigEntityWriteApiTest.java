@@ -104,6 +104,30 @@ public class ConfigEntityWriteApiTest extends ResourceBaseTest {
             }
             """;
 
+    private static final String ROUTE_BODY_BEARER = """
+            {
+              "paths": ["/foo"],
+              "methods": ["GET"],
+              "upstreams": [{"endpoint": "http://localhost:7001", "authType": "BEARER", "key": "route-key"}]
+            }
+            """;
+
+    private static final String ROUTE_BODY_BEARER_NO_KEY = """
+            {
+              "paths": ["/foo"],
+              "methods": ["GET"],
+              "upstreams": [{"endpoint": "http://localhost:7001", "authType": "BEARER"}]
+            }
+            """;
+
+    private static final String ROUTE_BODY_CUSTOM_HEADER_NO_KEY = """
+            {
+              "paths": ["/foo"],
+              "methods": ["GET"],
+              "upstreams": [{"endpoint": "http://localhost:7001", "authType": {"type": "CUSTOM_HEADER", "headerName": "X-Api-Token"}}]
+            }
+            """;
+
     private static final String SCHEMA_BODY = """
             {
               "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -262,6 +286,21 @@ public class ConfigEntityWriteApiTest extends ResourceBaseTest {
         Response put = send(HttpMethod.PUT, "/v1/translators/platform/no-such-translator", null,
                 TRANSLATOR_BODY, "authorization", "admin");
         verify(put, 200);
+    }
+
+    @Test
+    void testApplicationPutWithDecisionModeRejected() {
+        // decision mode is a router setting: no interface of any deployment kind takes it
+        String body = """
+                {
+                  "endpoint": "http://localhost:7003/chat",
+                  "interfaces": {"openaiChatCompletions": {"mode": "decision", "base_url": "http://r"}}
+                }
+                """;
+        Response put = send(HttpMethod.PUT, "/v1/applications/platform/a", null, body, "authorization", "admin");
+        verify(put, 400);
+
+        verify(send(HttpMethod.GET, "/v1/applications/platform/a", null, "", "authorization", "admin"), 404);
     }
 
     @Test
@@ -670,6 +709,37 @@ public class ConfigEntityWriteApiTest extends ResourceBaseTest {
         Response put = send(HttpMethod.PUT, "/v1/routes/platform/no-such-route-create", null,
                 ROUTE_BODY, "authorization", "admin");
         verify(put, 200);
+    }
+
+    @Test
+    void testRoutePutUpstreamWithoutKeyRejected() {
+        for (String body : new String[] {ROUTE_BODY_BEARER_NO_KEY, ROUTE_BODY_CUSTOM_HEADER_NO_KEY}) {
+            Response put = send(HttpMethod.PUT, "/v1/routes/platform/test-route-no-key", null,
+                    body, "authorization", "admin", "If-None-Match", "*");
+            verify(put, 422);
+            assertTrue(put.body().contains("upstreams[0].authType") && put.body().contains("requires a key"),
+                    () -> "Expected the authType warning: " + put.body());
+
+            Response get = send(HttpMethod.GET, "/v1/routes/platform/test-route-no-key", null, "",
+                    "authorization", "admin");
+            verify(get, 404);
+        }
+
+        // If-None-Match: * answers 412 when a blob exists, so a 200 shows the refused PUTs wrote nothing.
+        verify(send(HttpMethod.PUT, "/v1/routes/platform/test-route-no-key", null,
+                ROUTE_BODY_BEARER, "authorization", "admin", "If-None-Match", "*"), 200);
+    }
+
+    @Test
+    void testRoutePutOmittedUpstreamKeyKeptOnUpdate() {
+        verify(send(HttpMethod.PUT, "/v1/routes/platform/test-route-keep-key", null,
+                ROUTE_BODY_BEARER, "authorization", "admin", "If-None-Match", "*"), 200);
+
+        verify(send(HttpMethod.PUT, "/v1/routes/platform/test-route-keep-key", null,
+                ROUTE_BODY_BEARER_NO_KEY, "authorization", "admin"), 200);
+
+        verify(send(HttpMethod.GET, "/v1/routes/platform/test-route-keep-key", null, "",
+                "authorization", "admin"), 200);
     }
 
     @Test

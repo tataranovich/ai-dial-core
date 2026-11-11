@@ -1,18 +1,18 @@
 # Static Setting for Tracing
 
 DIAL Core always emits OpenTelemetry spans for incoming requests. The `tracing` section of
-`aidial.settings.json` adds *opt-in* enrichment on top of that: [OTel GenAI semantic-convention](https://opentelemetry.io/docs/specs/semconv/gen-ai/)
+`aidial.settings.json` controls the enrichment on top of that: [OTel GenAI semantic-convention](https://opentelemetry.io/docs/specs/semconv/gen-ai/)
 attributes, a conversation/session correlation id taken from a request header, and response
 headers that hand the caller Core's own trace and span ids.
 
-Everything here is off by default, and nothing here ever publishes prompts, completions, tool
+Everything here is on by default, and nothing here ever publishes prompts, completions, tool
 payloads, API keys, arbitrary headers, or upstream provider names.
 
 These are static settings, so they are read once at startup: changing them needs a restart.
 
 > This section used to live in the dynamic config (`aidial.config.json`). A leftover `tracing` block
-> there is ignored rather than rejected, so move it to `aidial.settings.json` or the enrichment
-> silently stays off.
+> there is ignored rather than rejected, so move it to `aidial.settings.json` or your settings are
+> silently replaced by the defaults.
 
 ## tracing
 
@@ -24,7 +24,10 @@ These are static settings, so they are read once at startup: changing them needs
   them. Nothing is emitted when Core has no valid span context — with no OpenTelemetry SDK attached
   the ids are all zeros, and a `traceparent` built from those is malformed.
 * `conversationIdHeaders`: Request headers, in priority order, that may carry a conversation or
-  session id. The first usable one present is published as `gen_ai.conversation.id`. Matching is
+  session id. The first usable one present is published as `gen_ai.conversation.id`. The same value
+  is written to each analytics log entry as `"session":{"id":"..."}`, right after `chat`, regardless
+  of `genAiSpanAttributes` and even for secured API keys; the member is omitted when no header
+  matches. A Responses API background job resolves it when the job is created. Matching is
   case-insensitive and values are trimmed; a value longer than 256 characters is skipped rather than
   truncated — truncating one would correlate unrelated requests — and the next header on the list
   still gets its turn. Blank entries and the known credential headers (`authorization`,
@@ -94,22 +97,145 @@ Which request attributes apply depends on the API surface: `stop_sequences`, `ch
 `frequency_penalty`, `presence_penalty` and `seed` come from Chat Completions,
 `previous_response.id` from Responses, `encoding_formats` from Embeddings.
 
+## Route on log lines and analytics
+
+A request served by a global route or by an application route records which route handled it:
+
+| Where                                           | Fields                                      |
+|-------------------------------------------------|---------------------------------------------|
+| Request span and console JSON log lines         | `dial.route.name`, `dial.route.type`        |
+| Analytics log entry (flat fields)               | `route_name`, `route_type`                  |
+
+`dial.route.type` and `route_type` are `global` (a route from `routes`) or `application` (a route from
+`applications.<name>.routes`). The fields are omitted when no route served the request.
+
+The route is published regardless of `genAiSpanAttributes`. Metric labels, `http.route` and trace/span ids
+are unchanged.
+
 ## Storage and rate-limit spans
 
-Core adds child spans for the blocking work a request does off the event loop. They are emitted
+Core adds child spans for the storage, Redis, identity and key-management work a request does. They are emitted
 only inside a traced request, so background jobs (resource sync, sweeps, bulk loads on their own
 executor) start no traces of their own. They do not depend on `genAiSpanAttributes`.
 
 | Span                                                     | Covers                                                                        | Attributes                                    |
 |----------------------------------------------------------|-------------------------------------------------------------------------------|-----------------------------------------------|
+| `auth.api_key.lookup`                                    | Reading a per-request API key from Redis                                      |                                               |
+| `auth.api_key.assign`                                    | Storing the per-request API key handed to the upstream deployment             |                                               |
+| `auth.jwks.fetch`                                        | Fetching an identity provider's signing key; once per key id while it is cached |                                             |
+| `deployment.resolve`                                     | Finding the requested deployment and checking access and user consent         |                                               |
 | `rate_limit.check`                                       | The token, request and cost limit checks before a request is forwarded        | `dial.deployment`, `dial.rate_limit.status`   |
+| `rate_limit.read_spend`                                  | Reading the caller's spend caps, unchecked, for a translated Anthropic request |                                              |
+| `oauth.request`                                          | A call to an authorization server: token exchange, metadata discovery, registration | `http.request.method`, `server.address`, `http.response.status_code` |
+| `kms.encrypt`, `kms.decrypt`                             | A call to the configured AWS, Azure or GCP key management service             |                                               |
 | `resource.get`, `resource.compute`, `resource.put`, `resource.delete` | A `ResourceService` operation, including Redis access and lock waits | `dial.resource.type`; `resource.get` also has `dial.cache.hit` (`false` when the value was read from blob storage) |
+| `cost_stats.get`, `cost_stats.update`, `cost_stats.delete` | Reading, creating or updating, or deleting the per-trace usage record kept in Redis only; `update` and `delete` include the lock wait |  |
 | `blob.<operation>`                                       | One blob storage call: `load`, `store`, `meta`, `exists`, `delete`, `copy`, `list`, and the multipart upload calls | `blob.load`: `dial.blob.found`; `blob.store`: `dial.blob.size` |
 
 `blob.load` ends when the blob storage returns the blob, so it does not include reading the payload
-stream. Redis calls get no spans of their own: the time a `resource.*` span spends outside its
+stream. The per-trace usage record (cost and token counts, created before every upstream call, updated
+with each deployment's usage and deleted when the trace's root ends, or, if no root deletes it, `deploymentStats.ttlMs` after its last write;
+at least `backgroundJob.jobTtlMs` + `backgroundJob.scanIntervalMs` for a trace whose root is a background Responses job) is kept in Redis only
+and shows up as `cost_stats.*` spans. The Redis access inside a `resource.*` span gets no spans of its own: the time it spends outside its
 `blob.*` children is Redis access and lock waits.
 
 The same blob storage calls are measured by the `dial_blob_operation` timer, tagged by `operation`
 and `outcome` (`success` or `error`), with buckets from 5 ms to 5 s. Unlike the spans, the timer
 also records calls made outside a request.
+
+## Wait metrics
+
+These metrics show where Core waits rather than works. The timers have buckets from 100 µs to 30 s.
+Locks and async tasks each have queue-size gauges and timers for the wait and the work; the event loops have a
+queue-size gauge only. The event-loop gauges are only registered when a Prometheus or OTLP registry is enabled. The
+analytics log writer has a gauge of the bodies its queue holds and a counter of rows written without them; the counter
+stays at 0 unless `analytics.maxPendingBodyHeapPercent` is set.
+
+| Metric                                | Type  | Measures                                                                                                       |
+|---------------------------------------|-------|----------------------------------------------------------------------------------------------------------------|
+| `dial_lock_wait{phase="local"}`       | timer | Time `LockService.lock()` waits for other threads of this pod that hold the same key                           |
+| `dial_lock_wait{phase="redis"}`       | timer | Time `lock()` spends on the Redis lock: one round-trip, plus the backoff spin while another holder has the key |
+| `dial_lock_queue_size{phase="local"}` | gauge | Threads of this pod blocked in `lock()` until another thread of this pod releases the key                      |
+| `dial_lock_queue_size{phase="redis"}` | gauge | Threads of this pod spinning in `lock()` until another holder releases the Redis key                           |
+| `dial_lock_hold`                      | timer | Time a lock taken with `lock()` is held                                                                        |
+| `dial_async_tasks_queued`             | gauge | `AsyncTaskExecutor` tasks submitted and not started yet                                                        |
+| `dial_async_task_start_delay`         | timer | Time from `AsyncTaskExecutor.submit()` until the task starts running                                           |
+| `dial_async_task_duration`            | timer | Time an `AsyncTaskExecutor` task runs, from its start until it returns or throws                               |
+| `netty_eventexecutor_tasks_pending`   | gauge | Tasks queued on each event loop, tagged with the loop thread `name` (Micrometer `NettyEventExecutorMetrics`)   |
+| `netty_eventexecutor_workers`         | gauge | Number of event loops (Micrometer `NettyEventExecutorMetrics`)                                                 |
+| `dial_analytics_log_pending_body_bytes` | gauge | Bytes of request and response bodies held by analytics log rows that wait to be written, with or without `analytics.maxPendingBodyHeapPercent` |
+| `dial_analytics_log_bodies_skipped_total` | counter | Analytics log rows written without bodies because the waiting bodies reached `analytics.maxPendingBodyHeapPercent` |
+
+Locks:
+
+- `dial_lock_wait` is tagged with `outcome`: `success`, or `error` when the `redis` phase throws, e.g. while Redis is
+  down. The `local` phase always succeeds.
+  The waits are recorded when `lock()` returns or throws, the hold when the lock is released.
+- A thread that takes a free lock is not queued. A thread waiting for the Redis key counts in
+  `dial_lock_queue_size{phase="redis"}` while it spins, not during the first round-trip.
+- Locks taken with `tryLock()` (resource sync to blob storage, sweeps, application deployment, code interpreter
+  session cleanup) never wait, and their holds are not measured. They skip the local lock, so a `lock()` on a key
+  held by a `tryLock()` of the same pod waits in the `redis` phase.
+
+Async tasks:
+
+- A task's duration is wall time: blocking calls inside it (Redis, blob storage) count.
+- With virtual threads, `dial_async_tasks_queued` stays near zero unless every carrier thread is busy or pinned.
+- In worker-pool mode (`asyncTaskExecutor.useVirtualThreads=false`) the Vert.x `vertx_pool_*` metrics report the same
+  pool as the `dial_async_*` metrics.
+
+Event loops:
+
+- `netty_eventexecutor_tasks_pending` counts the loop's task queue (callbacks such as `AsyncTaskExecutor` results and
+  `runOnContext`; Redisson replies arrive on its own threads), not incoming I/O. It is read once per scrape, so it
+  misses short bursts.
+- A loop blocked by a single long task is reported by the Vert.x blocked thread checker in the log. Netty has no
+  public per-task timing, so there is no event-loop counterpart to `dial_async_task_duration`.
+
+Prometheus adds the unit to the names: a timer is exported as `<name>_seconds_count`, `_sum`, `_max` and `_bucket`.
+The values are fractional seconds, so `_sum` and `_max` keep nanosecond precision, and the `dial_lock_*` and
+`dial_async_task_*` buckets start at 100 µs (`le="0.0001"`).
+
+## Trace context after the response
+
+The request's trace context stays on the request after the response is sent, so work the request
+still does afterwards (cleanup such as `resource.delete`, an upstream retry after the client
+disconnected, an application deployment that continues after `200`) is part of the same trace: its
+spans are children of the server span and can start after it ends, and its log lines keep the
+trace id. On a WebSocket route this work can run for as long as the socket is open, and on a
+deployment for minutes; with tail sampling in the collector, spans that arrive after the sampling
+decision has left its cache can be exported as a separate trace fragment. The request also keeps
+the ended server span, with its attributes and events, referenced for as long as the request's
+context lives, so an open WebSocket holds its server span in memory until the socket closes.
+
+Core keeps the context by starting the server span on a scratch duplicate of the request's Vert.x
+context and copying the span's OTel context onto the request's context itself, so the scope the
+Vert.x tracer closes when the response ends resets only the scratch copy. Restoring the context
+after the response has ended was rejected because a worker thread of the same request can read the
+root context in between. The scratch copy's empty locals lose nothing: every server-span start in
+Vert.x 4.5.30 already hands in a freshly duplicated context, so the incoming `traceparent` is the
+only parent source either way.
+
+## Background operations
+
+Periodic work that no request started has no trace of its own, so its log lines would carry no trace id. Core
+gives every run of the background job poll and scan, the complex resource sweep, the code interpreter session
+check and the merged config rebuild a trace id of its own, so the log lines of one run, in the console JSON and
+in the OTel log records, can be found and grouped by it.
+
+These runs record no spans of their own. The trace context of a run is not sampled, so with the default parent-based
+sampler nothing is exported as a trace and the storage calls a run makes export no `blob.*` or `resource.*` spans.
+With a sampler that ignores the parent decision, such as `always_on`, the storage calls and the HTTP calls a run makes
+(a job poll) do export spans under the run's trace id. Their parent is the run, which is never exported, so a trace
+viewer shows them without a root; use a parent-based sampler (the OpenTelemetry default, `parentbased_always_on`) to
+avoid this. Tracing a run as a span would be a separate change.
+
+`BackgroundOperationTracer` keeps each run's trace context on a duplicate of the timer's Vert.x context that only
+that run uses, the same way a request keeps its own. The context a timer fires on is shared by every run and by
+anything else created from it, so writing the trace context there and restoring it later would let overlapping
+runs, or callbacks on other threads, read each other's trace id. Work the run submits (`AsyncTaskExecutor`) and the
+callbacks of the future `traceFuture` returns capture the duplicate, so they log with the run's trace id.
+The console JSON layout reads the run's trace id, span id and trace flags from that duplicate, but only when the span
+stored there is the run's own `BackgroundSpan`: it never takes them from the span of a request, and a log line without
+a request and outside a run keeps empty identifiers.
+`pollJobs` starts the poll of each claimed job from inside the run; the poll and its failure handling keep the run's trace id.

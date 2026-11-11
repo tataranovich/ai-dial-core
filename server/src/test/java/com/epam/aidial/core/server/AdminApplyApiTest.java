@@ -1,5 +1,6 @@
 package com.epam.aidial.core.server;
 
+import com.epam.aidial.core.config.Application;
 import com.epam.aidial.core.config.Route;
 import com.epam.aidial.core.server.config.MergedConfigStore;
 import com.epam.aidial.core.server.util.ProxyUtil;
@@ -12,6 +13,9 @@ import io.vertx.core.http.HttpMethod;
 import io.vertx.core.json.JsonObject;
 import lombok.SneakyThrows;
 import org.junit.jupiter.api.Test;
+
+import java.util.ArrayList;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -174,6 +178,162 @@ public class AdminApplyApiTest extends ResourceBaseTest {
 
     @Test
     @SneakyThrows
+    void testApplyRejectsModelWithUnservedInterface() {
+        // Hard mode rejects the whole batch with a 422 envelope; the soft-mode twin
+        // testApplySoftValidationStillRejectsUnservedInterface pins the 200-envelope shape.
+        String body = """
+                {
+                  "manifests": [
+                    {
+                      "kind": "Model",
+                      "name": "models/platform/apply-unserved-interface",
+                      "spec": {
+                        "type": "chat",
+                        "endpoint": "http://localhost:7001/openai/deployments/test/chat/completions",
+                        "interfaces": {"openaiChatCompletions": {}}
+                      }
+                    }
+                  ]
+                }
+                """;
+        Response response = send(HttpMethod.POST, "/v1/admin/apply", null, body, "authorization", "admin");
+        verify(response, 422);
+        JsonNode results = ProxyUtil.MAPPER.readTree(response.body()).get("results");
+        assertEquals(1, results.size());
+        assertEquals("FAILED", results.get(0).get("status").asText());
+        verify(send(HttpMethod.GET, "/v1/models/platform/apply-unserved-interface", null, "",
+                "authorization", "admin"), 404);
+    }
+
+    @Test
+    @SneakyThrows
+    void testApplyAcceptsModelWithInBatchTranslator() {
+        // Manifest lists the Model first on purpose: DEPENDENCY_ORDER_COMPARATOR sorts Translator (2)
+        // ahead of Model (8), and mutateScratch stages each success, so the translator is in scratch
+        // by the time the model is validated. Author order must not matter.
+        String body = """
+                {
+                  "manifests": [
+                    {
+                      "kind": "Model",
+                      "name": "models/platform/apply-batch-translated",
+                      "spec": {
+                        "type": "chat",
+                        "baseUrl": "http://localhost:7001",
+                        "interfaces": {
+                          "openaiChatCompletions": {},
+                          "anthropicMessages": {"mode": "translator", "translator": "batch-translator"}
+                        }
+                      }
+                    },
+                    {
+                      "kind": "Translator",
+                      "name": "translators/platform/batch-translator",
+                      "spec": {
+                        "in": "anthropicMessages",
+                        "out": "openaiChatCompletions",
+                        "baseUrl": "http://localhost:7001/translate"
+                      }
+                    }
+                  ]
+                }
+                """;
+        Response response = send(HttpMethod.POST, "/v1/admin/apply", null, body, "authorization", "admin");
+        verify(response, 200);
+        JsonNode results = ProxyUtil.MAPPER.readTree(response.body()).get("results");
+        for (JsonNode result : results) {
+            assertEquals("APPLIED", result.get("status").asText(),
+                    () -> "Body: " + response.body());
+        }
+    }
+
+    @Test
+    @SneakyThrows
+    void testApplyRouterWithItsInBatchTranslator() {
+        // input order model, router, translator; processing order translator (2), router (4), model (8)
+        String body = """
+                {"manifests": [
+                  {"kind": "Model", "name": "models/platform/apply-order-model",
+                   "spec": {"type": "chat", "endpoint": "http://localhost:4848/chat"}},
+                  {"kind": "Router", "name": "routers/platform/r-batch",
+                   "spec": {"baseUrl": "http://localhost:4848", "interfaces": {"openaiChatCompletions": {},
+                     "anthropicMessages": {"mode": "translator", "translator": "t-batch"}}}},
+                  {"kind": "Translator", "name": "translators/platform/t-batch",
+                   "spec": {"in": "anthropicMessages", "out": "openaiChatCompletions", "baseUrl": "http://localhost:4848/translate"}}
+                ]}
+                """;
+        Response response = send(HttpMethod.POST, "/v1/admin/apply", null, body, "authorization", "admin");
+        verify(response, 200);
+        JsonNode results = ProxyUtil.MAPPER.readTree(response.body()).get("results");
+        List<String> order = new ArrayList<>();
+        for (JsonNode result : results) {
+            assertEquals("APPLIED", result.get("status").asText(), response::body);
+            order.add(result.get("entityId").asText());
+        }
+        assertEquals(List.of("translators/platform/t-batch", "routers/platform/r-batch", "models/platform/apply-order-model"), order);
+        verify(send(HttpMethod.GET, "/v1/routers/platform/r-batch", null, "", "authorization", "admin"), 200);
+    }
+
+    @Test
+    @SneakyThrows
+    void testApplyTypedRouterWithItsInBatchSchema() {
+        String body = """
+                {"manifests": [
+                  {"kind": "Router", "name": "routers/platform/r-typed-batch",
+                   "spec": {"baseUrl": "http://localhost:4848", "applicationTypeSchemaId": "https://dial.test/batch-type",
+                     "applicationProperties": {"tier": "medium"}, "interfaces": {"openaiChatCompletions": {}}}},
+                  {"kind": "Schema", "name": "schemas/platform/batch-type",
+                   "spec": {"$schema": "https://dial.epam.com/application_type_schemas/schema#", "$id": "https://dial.test/batch-type",
+                     "dial:applicationTypeDisplayName": "Batch router type",
+                     "properties": {"tier": {"type": "string", "dial:meta": {"dial:propertyKind": "server", "dial:propertyOrder": 1}}},
+                     "required": ["tier"]}}
+                ]}
+                """;
+        Response response = send(HttpMethod.POST, "/v1/admin/apply", null, body, "authorization", "admin");
+        verify(response, 200);
+        for (JsonNode result : ProxyUtil.MAPPER.readTree(response.body()).get("results")) {
+            assertEquals("APPLIED", result.get("status").asText(), response::body);
+        }
+        verify(send(HttpMethod.GET, "/v1/routers/platform/r-typed-batch", null, "", "authorization", "admin"), 200);
+    }
+
+    @Test
+    @SneakyThrows
+    void testApplyRouterWithLegacyEndpointFailsWithoutPrecheck() {
+        String body = """
+                {"precheck": false, "manifests": [{"kind": "Router", "name": "routers/platform/r-bad",
+                  "spec": {"endpoint": "http://router/chat", "interfaces": {"openaiChatCompletions": {}}}}]}
+                """;
+        Response response = send(HttpMethod.POST, "/v1/admin/apply", null, body, "authorization", "admin");
+        verify(response, 200);
+        JsonNode result = ProxyUtil.MAPPER.readTree(response.body()).get("results").get(0);
+        assertEquals("FAILED", result.get("status").asText());
+        assertTrue(result.get("error").asText().contains("A router declares interfaces, not endpoint"), response::body);
+        verify(send(HttpMethod.GET, "/v1/routers/platform/r-bad", null, "", "authorization", "admin"), 404);
+    }
+
+    @Test
+    @SneakyThrows
+    void testApplyPrecheckRejectsBatchWithFailingRouterAtomically() {
+        String body = """
+                {"manifests": [
+                  {"kind": "Translator", "name": "translators/platform/t-mixed",
+                   "spec": {"in": "anthropicMessages", "out": "openaiChatCompletions", "baseUrl": "http://localhost:4848/translate"}},
+                  {"kind": "Router", "name": "routers/platform/r-mixed",
+                   "spec": {"baseUrl": "http://localhost:4848", "interceptors": ["i1"], "interfaces": {"openaiChatCompletions": {}}}}
+                ]}
+                """;
+        Response response = send(HttpMethod.POST, "/v1/admin/apply", null, body, "authorization", "admin");
+        verify(response, 422);
+        List<String> statuses = new ArrayList<>();
+        ProxyUtil.MAPPER.readTree(response.body()).get("results").forEach(r -> statuses.add(r.get("status").asText()));
+        assertEquals(List.of("SKIPPED", "FAILED"), statuses, response::body);
+        verify(send(HttpMethod.GET, "/v1/translators/platform/t-mixed", null, "", "authorization", "admin"), 404);
+        verify(send(HttpMethod.GET, "/v1/routers/platform/r-mixed", null, "", "authorization", "admin"), 404);
+    }
+
+    @Test
+    @SneakyThrows
     void testApplyPrecheckMixedBatchRejectedAtomically() {
         String body = """
                 {
@@ -256,6 +416,44 @@ public class AdminApplyApiTest extends ResourceBaseTest {
         verify(send(HttpMethod.GET, "/v1/models/platform/apply-partial-good", null, "",
                 "authorization", "admin"), 200);
         verify(send(HttpMethod.GET, "/v1/models/platform/apply-partial-bad", null, "",
+                "authorization", "admin"), 404);
+    }
+
+    @Test
+    @SneakyThrows
+    void testApplyRouteUpstreamWithoutKeyFails() {
+        String body = """
+                {
+                  "precheck": false,
+                  "manifests": [
+                    {
+                      "kind": "Interceptor",
+                      "name": "interceptors/platform/apply-route-nokey-int",
+                      "spec": {"endpoint": "http://localhost:7001/forward"}
+                    },
+                    {
+                      "kind": "Route",
+                      "name": "routes/platform/apply-route-nokey",
+                      "spec": {
+                        "paths": ["/v1/apply-route-nokey"],
+                        "methods": ["GET"],
+                        "upstreams": [{"endpoint": "http://localhost:9876", "authType": "BEARER"}]
+                      }
+                    }
+                  ]
+                }
+                """;
+        Response response = send(HttpMethod.POST, "/v1/admin/apply", null, body, "authorization", "admin");
+        verify(response, 200);
+        JsonNode parsed = ProxyUtil.MAPPER.readTree(response.body());
+        assertEquals(1, parsed.get("applied").asInt(), () -> "Body: " + response.body());
+        assertEquals(1, parsed.get("failed").asInt());
+        JsonNode routeResult = parsed.get("results").get(1);
+        assertEquals("FAILED", routeResult.get("status").asText(), () -> "Body: " + response.body());
+        assertTrue(routeResult.get("error").asText().contains("requires a key"), () -> "Body: " + response.body());
+        verify(send(HttpMethod.GET, "/v1/interceptors/platform/apply-route-nokey-int", null, "",
+                "authorization", "admin"), 200);
+        verify(send(HttpMethod.GET, "/v1/routes/platform/apply-route-nokey", null, "",
                 "authorization", "admin"), 404);
     }
 
@@ -994,6 +1192,55 @@ public class AdminApplyApiTest extends ResourceBaseTest {
 
     @Test
     @SneakyThrows
+    void testApplyApplicationRouteEncryptsUpstreamSecretAtRest() {
+        String body = """
+                {
+                  "manifests": [
+                    {
+                      "kind": "Application",
+                      "name": "applications/platform/apply-app-route-secret",
+                      "spec": {
+                        "endpoint": "http://example.com/v1/completions",
+                        "display_name": "Apply App Route Secret",
+                        "routes": {
+                          "apply-route": {
+                            "paths": ["/v1/apply-route"],
+                            "methods": ["GET"],
+                            "upstreams": [
+                              {"endpoint": "http://localhost:9876", "key": "app-route-secret-1"}
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  ]
+                }
+                """;
+        Response response = send(HttpMethod.POST, "/v1/admin/apply", null, body, "authorization", "admin");
+        verify(response, 200);
+        JsonNode parsed = ProxyUtil.MAPPER.readTree(response.body());
+        assertEquals(1, parsed.get("applied").asInt(), () -> "Body: " + response.body());
+
+        // Raw blob must never carry the plaintext secret — only its ENC[...] envelope.
+        ResourceService resourceService = dial.getProxy().getResourceService();
+        ResourceDescriptor descriptor = ResourceDescriptorFactory.fromDecoded(ResourceTypes.APPLICATION,
+                ResourceDescriptor.PLATFORM_BUCKET, ResourceDescriptor.PLATFORM_LOCATION, "apply-app-route-secret");
+        String rawBlob = resourceService.getResource(descriptor);
+        assertNotNull(rawBlob, "Application blob must exist");
+        assertTrue(rawBlob.contains("ENC["), () -> "Route upstream secret must be encrypted at rest: " + rawBlob);
+        assertFalse(rawBlob.contains("app-route-secret-1"), () -> "Plaintext upstream key must not appear in blob: " + rawBlob);
+
+        // The merged in-memory Config must hold the plaintext — this is what the live routing path reads.
+        MergedConfigStore store = (MergedConfigStore) dial.getProxy().getConfigStore();
+        Application application = store.get().getApplications().get("apply-app-route-secret");
+        assertNotNull(application, "Applied application must be present in merged config");
+        Route route = application.getRoutes().get("apply-route");
+        assertNotNull(route, "Application route must be present");
+        assertEquals("app-route-secret-1", route.getUpstreams().get(0).getKey());
+    }
+
+    @Test
+    @SneakyThrows
     void batchKeyRotationRemovesOldSecret() {
         // FINDING #2: applying a key with a changed secret via /v1/admin/apply must revoke the
         // old auth bearer.
@@ -1198,7 +1445,8 @@ public class AdminApplyApiTest extends ResourceBaseTest {
                     {
                       "kind": "Settings",
                       "name": "settings/platform/global",
-                      "spec": {"globalInterceptors": ["interceptor1"], "retriableErrorCodes": []}
+                      "spec": {"globalInterceptors": ["interceptor1"], "retriableErrorCodes": [],
+                               "spendingLimits": {"mode": "enforce"}}
                     }
                   ]
                 }
@@ -1219,6 +1467,7 @@ public class AdminApplyApiTest extends ResourceBaseTest {
         assertNotNull(globalInterceptors);
         assertEquals(1, globalInterceptors.size());
         assertEquals("interceptor1", globalInterceptors.get(0).asText());
+        assertEquals("enforce", settings.get("spendingLimits").get("mode").asText());
     }
 
     @Test
@@ -1256,6 +1505,37 @@ public class AdminApplyApiTest extends ResourceBaseTest {
                     .put("config", new JsonObject()
                             .put("write", new JsonObject().put("softValidation", true))
                             .put("onInvalidEntity", "skip"));
+        }
+
+        @Test
+        @SneakyThrows
+        void testApplySoftValidationStillRejectsUnservedInterface() {
+            // Previously this returned APPLIED_INVALID with the blob written — a model the rebuild
+            // discards every time. Only cross-references stay soft-tolerable.
+            String body = """
+                    {
+                      "precheck": false,
+                      "manifests": [
+                        {
+                          "kind": "Model",
+                          "name": "models/platform/apply-soft-unserved",
+                          "spec": {
+                            "type": "chat",
+                            "endpoint": "http://localhost:7001/openai/deployments/test/chat/completions",
+                            "interfaces": {"openaiChatCompletions": {}}
+                          }
+                        }
+                      ]
+                    }
+                    """;
+            // Soft mode reports the failure in the result row with a 200 envelope; the hard-mode
+            // twin testApplyRejectsModelWithUnservedInterface pins the 422 envelope.
+            Response response = send(HttpMethod.POST, "/v1/admin/apply", null, body, "authorization", "admin");
+            JsonNode parsed = ProxyUtil.MAPPER.readTree(response.body());
+            assertEquals("FAILED", parsed.get("results").get(0).get("status").asText(),
+                    () -> "Body: " + response.body());
+            verify(send(HttpMethod.GET, "/v1/models/platform/apply-soft-unserved", null, "",
+                    "authorization", "admin"), 404);
         }
 
         @Test

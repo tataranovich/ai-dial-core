@@ -1,5 +1,6 @@
 package com.epam.aidial.core.server.config;
 
+import com.epam.aidial.core.config.Alias;
 import com.epam.aidial.core.config.Application;
 import com.epam.aidial.core.config.Config;
 import com.epam.aidial.core.config.Deployment;
@@ -18,16 +19,22 @@ import com.epam.aidial.core.config.ResourceAuthSettings;
 import com.epam.aidial.core.config.Role;
 import com.epam.aidial.core.config.RoleBasedEntity;
 import com.epam.aidial.core.config.Route;
+import com.epam.aidial.core.config.Router;
 import com.epam.aidial.core.config.ToolSet;
 import com.epam.aidial.core.config.Translator;
 import com.epam.aidial.core.config.TranslatorRef;
 import com.epam.aidial.core.config.Upstream;
 import com.epam.aidial.core.config.UpstreamAuthType;
 import com.epam.aidial.core.config.UpstreamInterface;
+import com.epam.aidial.core.config.policy.Policy;
+import com.epam.aidial.core.config.policy.PolicyAssignment;
+import com.epam.aidial.core.config.policy.PolicyAssignmentValidator;
 import com.epam.aidial.core.credentials.service.ResourceAuthSettingsChangeMode;
 import com.epam.aidial.core.credentials.validation.AuthSettingsValidator;
 import com.epam.aidial.core.credentials.validation.AuthSettingsValidatorFactory;
+import com.epam.aidial.core.server.alias.AliasTargets;
 import com.epam.aidial.core.server.security.ApiKeyStore;
+import com.epam.aidial.core.server.service.OrgUnitRoles;
 import com.epam.aidial.core.server.util.DeploymentEndpointUtil;
 import com.epam.aidial.core.server.util.PathTemplateUtil;
 import com.epam.aidial.core.storage.resource.ResourceTypes;
@@ -39,6 +46,7 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.BiConsumer;
@@ -101,6 +109,8 @@ public final class ConfigPostProcessor {
         rejectSlashKeyedNames(config.getRoles(), "roles");
         rejectSlashKeyedNames(config.getRoutes(), "routes");
         rejectSlashKeyedNames(config.getToolsets(), "toolsets");
+        rejectSlashKeyedNames(config.getRouters(), "routers");
+        rejectSlashKeyedNames(config.getAliases(), "aliases");
     }
 
     /**
@@ -120,6 +130,9 @@ public final class ConfigPostProcessor {
         processRoles(config);
         processInterceptors(config, deploymentIds, onSkip);
         processToolSets(config, deploymentIds, onSkip);
+        processRouters(config, deploymentIds, onSkip);
+        processAliases(config, deploymentIds, onSkip);
+        OrgUnitRoles.validate(config.getOrgUnitRoles());
 
         if (apiKeyStore != null) {
             apiKeyStore.addProjectKeys(fileKeysBySecret, apiKeysByCanonicalId);
@@ -163,9 +176,7 @@ public final class ConfigPostProcessor {
         }
         model.setName(mapKey);
         List<ValidationWarning> warnings = new ArrayList<>();
-        validatePricing(model, warnings);
-        validateUpstreamInterfaces(model, warnings);
-        validateDeploymentInterfaces(model, config.getTranslators(), warnings);
+        validateModelInvariants(model, config.getTranslators(), warnings);
         if (onSkip != null) {
             validateCrossReferences(model, config, warnings);
         }
@@ -200,6 +211,62 @@ public final class ConfigPostProcessor {
         }
         config.getTranslators().remove(mapKey);
         onSkip.accept(ResourceTypes.TRANSLATOR, new InvalidEntityException(ResourceTypes.TRANSLATOR, mapKey, warnings));
+    }
+
+    /**
+     * Validates every policy and assignment of the rebuilt {@link Config}: policies first, so that an
+     * assignment of a policy dropped here is dropped as dangling.
+     */
+    static void processPolicies(Config config, @Nullable BiConsumer<ResourceTypes, InvalidEntityException> onSkip) {
+        for (String path : List.copyOf(config.getPolicies().keySet())) {
+            validateSinglePolicy(config, path, onSkip);
+        }
+        for (String path : List.copyOf(config.getPolicyAssignments().keySet())) {
+            validateSingleAssignment(config, path, onSkip);
+        }
+    }
+
+    static void validateSinglePolicy(Config config, String mapKey,
+                                     @Nullable BiConsumer<ResourceTypes, InvalidEntityException> onSkip) {
+        Policy policy = config.getPolicies().get(mapKey);
+        if (policy == null) {
+            return;
+        }
+        String error = PolicyAssignmentValidator.validatePolicy(policy);
+        if (error == null && policy.isSelfApplying() && mapKey.indexOf('/') < 0) {
+            error = "A policy that pins both subject and costObject applies by itself and must live in the folder of its cost object";
+        }
+        if (error != null) {
+            rejectPolicyRecord(ResourceTypes.POLICY, config.getPolicies(), mapKey, error, onSkip);
+        }
+    }
+
+    /**
+     * Besides the record's own checks, an assignment whose policy is missing is invalid.
+     */
+    static void validateSingleAssignment(Config config, String mapKey,
+                                         @Nullable BiConsumer<ResourceTypes, InvalidEntityException> onSkip) {
+        PolicyAssignment assignment = config.getPolicyAssignments().get(mapKey);
+        if (assignment == null) {
+            return;
+        }
+        String error = PolicyAssignmentValidator.validateAssignment(assignment);
+        if (error == null && !config.getPolicies().containsKey(assignment.getPolicy())) {
+            error = "Policy '" + assignment.getPolicy() + "' does not exist";
+        }
+        if (error != null) {
+            rejectPolicyRecord(ResourceTypes.POLICY_ASSIGNMENT, config.getPolicyAssignments(), mapKey, error, onSkip);
+        }
+    }
+
+    private static void rejectPolicyRecord(ResourceTypes type, Map<String, ?> records, String mapKey, String error,
+                                           @Nullable BiConsumer<ResourceTypes, InvalidEntityException> onSkip) {
+        InvalidEntityException exception = new InvalidEntityException(type, mapKey, List.of(new ValidationWarning("body", error)));
+        if (onSkip == null) {
+            throw exception;
+        }
+        records.remove(mapKey);
+        onSkip.accept(type, exception);
     }
 
     /**
@@ -247,7 +314,7 @@ public final class ConfigPostProcessor {
 
     /**
      * Targeted per-type helper for {@link MergedConfigStore}'s partial-update path — validates the
-     * single written route's upstreams via {@link #validateRouteUpstreams}, after the route sort that
+     * single written route via {@link #validateRouteInvariants}, after the route sort that
      * already runs for every ROUTE write ({@link #sortRoutesInPlace}).
      */
     static void validateSingleRoute(Config config, String mapKey,
@@ -257,7 +324,7 @@ public final class ConfigPostProcessor {
             return;
         }
         List<ValidationWarning> warnings = new ArrayList<>();
-        validateRouteUpstreams("Route", mapKey, route, warnings);
+        validateRouteInvariants(route, warnings);
         if (warnings.isEmpty()) {
             return;
         }
@@ -340,7 +407,7 @@ public final class ConfigPostProcessor {
     /**
      * Validates every top-level route's upstreams. Routes have no deployment-id namespace to
      * dedupe (the config map key is already unique), so unlike {@link #processModels} this only
-     * runs {@link #validateRouteUpstreams}.
+     * runs {@link #validateRouteInvariants}.
      */
     private static void processRoutes(Config config, @Nullable BiConsumer<ResourceTypes, InvalidEntityException> onSkip) {
         Iterator<Map.Entry<String, Route>> iterator = config.getRoutes().entrySet().iterator();
@@ -349,7 +416,7 @@ public final class ConfigPostProcessor {
             String name = entry.getKey();
             Route route = entry.getValue();
             List<ValidationWarning> warnings = new ArrayList<>();
-            validateRouteUpstreams("Route", name, route, warnings);
+            validateRouteInvariants(route, warnings);
             if (warnings.isEmpty()) {
                 continue;
             }
@@ -362,21 +429,30 @@ public final class ConfigPostProcessor {
     }
 
     /**
-     * Validates an upstream declaring {@code authType: BEARER}: it must also carry a {@code key}, or
-     * the route-forwarding path silently falls back to sending the caller's own per-request DIAL key
-     * under {@code API-KEY} instead, ignoring {@code authType} entirely.
+     * Route checks the rebuild enforces unconditionally; pre-write paths call this so nothing is stored that
+     * the next rebuild would reject.
      */
-    public static void validateRouteUpstreams(String entityLabel, @Nullable String entityName, Route route,
-                                              List<ValidationWarning> warnings) {
+    public static void validateRouteInvariants(Route route, List<ValidationWarning> warnings) {
+        validateRouteUpstreams(route, warnings);
+    }
+
+    /**
+     * Validates an upstream declaring an {@code authType} other than {@code API_KEY} ({@code BEARER} or
+     * {@code CUSTOM_HEADER}): it must also carry a {@code key}, or the route-forwarding path silently falls
+     * back to sending the caller's own per-request DIAL key under {@code API-KEY} instead, ignoring
+     * {@code authType} entirely.
+     */
+    public static void validateRouteUpstreams(Route route, List<ValidationWarning> warnings) {
         List<Upstream> upstreams = route.getUpstreams();
         if (upstreams == null) {
             return;
         }
         for (int i = 0; i < upstreams.size(); i++) {
             Upstream upstream = upstreams.get(i);
-            if (upstream.getAuthType() == UpstreamAuthType.BEARER && upstream.getKey() == null) {
+            UpstreamAuthType authType = upstream.getAuthType().type();
+            if (authType != UpstreamAuthType.API_KEY && upstream.getKey() == null) {
                 warnings.add(new ValidationWarning("upstreams[" + i + "].authType",
-                        messageWithEntityPrefix(entityLabel, entityName, "authType 'BEARER' requires a key")));
+                        messageWithEntityPrefix("Route", route.getName(), "authType '" + authType + "' requires a key")));
             }
         }
     }
@@ -394,9 +470,7 @@ public final class ConfigPostProcessor {
             model.setName(name);
             log.debug("Loading {}", model);
             List<ValidationWarning> warnings = new ArrayList<>();
-            validatePricing(model, warnings);
-            validateUpstreamInterfaces(model, warnings);
-            validateDeploymentInterfaces(model, config.getTranslators(), warnings);
+            validateModelInvariants(model, config.getTranslators(), warnings);
             // Cross-ref check is skip-mode-only — file-loaded abort-mode path (onSkip == null)
             // preserves design 02 §4.2's allowance for pre-existing file-side inconsistency.
             // Strict-mode 422 is enforced at the write controller, not here. Pricing validation
@@ -427,14 +501,28 @@ public final class ConfigPostProcessor {
             return true;
         }
         Map<String, Interceptor> interceptors = config.getInterceptors();
+        boolean resolved = true;
         for (int i = 0; i < refs.size(); i++) {
             String ref = refs.get(i);
             if (ref == null || !interceptors.containsKey(ref)) {
                 warnings.add(new ValidationWarning("interceptors[" + i + "]",
                         messageWithEntityPrefix("Model", model.getName(), "Interceptor '" + ref + "' not found in config")));
+                resolved = false;
             }
         }
-        return warnings.isEmpty();
+        return resolved;
+    }
+
+    /**
+     * Model checks the rebuild enforces unconditionally; pre-write paths call this so nothing is
+     * stored that the next rebuild would reject. Excludes cross-references and already covers
+     * override paths. Translator names missing from {@code translators} are not reported.
+     */
+    public static void validateModelInvariants(Model model, Map<String, Translator> translators,
+                                               List<ValidationWarning> warnings) {
+        validatePricing(model, warnings);
+        validateUpstreamInterfaces(model, warnings);
+        validateDeploymentInterfaces(model, translators, warnings);
     }
 
     /**
@@ -447,7 +535,7 @@ public final class ConfigPostProcessor {
      * {@code prompt}/{@code completion} rate has no such restriction, since it's just a per-character
      * price under that unit.
      */
-    public static void validatePricing(Model model, List<ValidationWarning> warnings) {
+    private static void validatePricing(Model model, List<ValidationWarning> warnings) {
         Pricing pricing = model.getPricing();
         if (pricing == null || "token".equals(pricing.getUnit())) {
             return;
@@ -473,7 +561,7 @@ public final class ConfigPostProcessor {
      * identifies an upstream to {@code X-UPSTREAM-ID} routing and to prompt-cache pinning, and this
      * shape does not have one.
      */
-    public static void validateUpstreamInterfaces(Model model, List<ValidationWarning> warnings) {
+    private static void validateUpstreamInterfaces(Model model, List<ValidationWarning> warnings) {
         List<Upstream> upstreams = model.getUpstreams();
         for (int i = 0; i < upstreams.size(); i++) {
             Upstream upstream = upstreams.get(i);
@@ -542,9 +630,10 @@ public final class ConfigPostProcessor {
      * Named translator references are resolved against {@code translators} — the registry of the config the
      * model is entering — exactly as the request path resolves them.
      */
-    public static void validateDeploymentInterfaces(Model model, Map<String, Translator> translators,
+    private static void validateDeploymentInterfaces(Deployment deployment, Map<String, Translator> translators,
                                                     List<ValidationWarning> warnings) {
-        Map<String, DeploymentInterface> interfaces = model.getInterfaces();
+        String entityLabel = deployment.getClass().getSimpleName();
+        Map<String, DeploymentInterface> interfaces = deployment.getInterfaces();
         if (interfaces == null) {
             return;
         }
@@ -556,21 +645,21 @@ public final class ConfigPostProcessor {
             }
             String field = "interfaces." + entry.getKey();
             if (declared.getMode() == InterfaceMode.TRANSLATOR) {
-                validateTranslatedInterface(model, entry.getKey(), declared, translators, field, warnings);
+                validateTranslatedInterface(deployment, entry.getKey(), declared, translators, field, warnings);
             } else if (declared.getTranslator() != null) {
-                warnings.add(new ValidationWarning(field, messageWithEntityPrefix("Model", model.getName(), "A translator requires mode 'translator'")));
-            } else if (declared.getBaseUrl() == null && model.getBaseUrl() == null) {
-                warnings.add(new ValidationWarning(field,
-                        messageWithEntityPrefix("Model", model.getName(), "Interface '" + entry.getKey() + "' declares no base_url and the model declares no baseUrl")));
+                warnings.add(new ValidationWarning(field, messageWithEntityPrefix(entityLabel, deployment.getName(), "A translator requires mode 'translator'")));
+            } else if (declared.getBaseUrl() == null && deployment.getBaseUrl() == null) {
+                warnings.add(new ValidationWarning(field, messageWithEntityPrefix(entityLabel, deployment.getName(), "Interface '" + entry.getKey()
+                        + "' declares no base_url and the " + entityLabel.toLowerCase(Locale.ROOT) + " declares no baseUrl")));
             }
-            validateOverridePaths(model, entry.getKey(), declared, field, warnings);
+            validateOverridePaths(deployment, entry.getKey(), declared, field, warnings);
         }
     }
 
     /**
-     * Validates every interface entry's {@code overridePaths} on a deployment whose interfaces get no
-     * other semantic validation — applications and interceptors. Models run the same per-entry check
-     * inside {@link #validateDeploymentInterfaces}. Shared by every write surface, each of which turns
+     * Validates every interface entry's {@code overridePaths} on a deployment whose interfaces get no other semantic
+     * validation — applications, interceptors and toolsets. Models and routers run the same per-entry check inside
+     * {@link #validateDeploymentInterfaces}. Shared by every write surface, each of which turns
      * the warnings into its own layer's failure: a result object for the admin services, a response
      * status for the controllers.
      */
@@ -633,16 +722,17 @@ public final class ConfigPostProcessor {
         }
     }
 
-    private static void validateTranslatedInterface(Model model, String type, DeploymentInterface declared,
+    private static void validateTranslatedInterface(Deployment deployment, String type, DeploymentInterface declared,
                                                     Map<String, Translator> translators,
                                                     String field, List<ValidationWarning> warnings) {
+        String entityLabel = deployment.getClass().getSimpleName();
         if (declared.getBaseUrl() != null) {
             warnings.add(new ValidationWarning(field,
-                    messageWithEntityPrefix("Model", model.getName(), "An interface is served either by a translator or by a base_url, not by both")));
+                    messageWithEntityPrefix(entityLabel, deployment.getName(), "An interface is served either by a translator or by a base_url, not by both")));
         }
         TranslatorRef translator = declared.getTranslator();
         if (translator == null) {
-            warnings.add(new ValidationWarning(field, messageWithEntityPrefix("Model", model.getName(), "Mode 'translator' requires a translator")));
+            warnings.add(new ValidationWarning(field, messageWithEntityPrefix(entityLabel, deployment.getName(), "Mode 'translator' requires a translator")));
             return;
         }
         // a name with no entry to resolve to leaves the interface unserved rather than the model invalid:
@@ -656,17 +746,17 @@ public final class ConfigPostProcessor {
         }
         if (definition.getIn() != null && definition.getIn() != InterfaceType.find(type)) {
             warnings.add(new ValidationWarning(field,
-                    messageWithEntityPrefix("Model", model.getName(), "Translator converts from '" + definition.getIn().getValue() + "', not from '" + type + "'")));
+                    messageWithEntityPrefix(entityLabel, deployment.getName(), "Translator converts from '" + definition.getIn().getValue() + "', not from '" + type + "'")));
         }
         // a definition written inline names no in: the interface it sits under is what it converts from
         String in = definition.getIn() != null ? definition.getIn().getValue() : type;
         if (in.equals(definition.getOut().getValue())) {
             warnings.add(new ValidationWarning(field,
-                    messageWithEntityPrefix("Model", model.getName(), "A translator cannot convert '" + in
+                    messageWithEntityPrefix(entityLabel, deployment.getName(), "A translator cannot convert '" + in
                             + "' to itself: its output would arrive back on the interface it came from")));
             return;
         }
-        validateTranslatorOutput(model, definition, translators, field, warnings);
+        validateTranslatorOutput(deployment, definition, translators, field, warnings);
     }
 
     /**
@@ -679,19 +769,21 @@ public final class ConfigPostProcessor {
      * would have to be the second hop of a chain this rule already refuses. Which leaves the one-interface
      * cycle, a translator converting an interface to itself, rejected by the caller.
      */
-    private static void validateTranslatorOutput(Model model, Translator definition, Map<String, Translator> translators,
+    private static void validateTranslatorOutput(Deployment deployment, Translator definition, Map<String, Translator> translators,
                                                  String field, List<ValidationWarning> warnings) {
+        String entityLabel = deployment.getClass().getSimpleName();
+        String kind = entityLabel.toLowerCase(Locale.ROOT);
         InterfaceType out = definition.getOut();
-        if (DeploymentEndpointUtil.resolveMode(model, out) == InterfaceMode.TRANSLATOR) {
+        if (DeploymentEndpointUtil.resolveMode(deployment, out) == InterfaceMode.TRANSLATOR) {
             warnings.add(new ValidationWarning(field,
-                    messageWithEntityPrefix("Model", model.getName(), "The model serves '" + out.getValue()
+                    messageWithEntityPrefix(entityLabel, deployment.getName(), "The " + kind + " serves '" + out.getValue()
                             + "' through a translator of its own, which the translator here converts to: "
                             + "the callback would arrive on a translated interface and be handed to a translator again")));
             return;
         }
-        if (DeploymentEndpointUtil.resolveServingEndpoint(model, out, translators) == null) {
+        if (DeploymentEndpointUtil.resolveServingEndpoint(deployment, out, translators) == null) {
             warnings.add(new ValidationWarning(field,
-                    messageWithEntityPrefix("Model", model.getName(), "The model does not serve '" + out.getValue() + "', which the translator converts to")));
+                    messageWithEntityPrefix(entityLabel, deployment.getName(), "The " + kind + " does not serve '" + out.getValue() + "', which the translator converts to")));
         }
     }
 
@@ -806,6 +898,110 @@ public final class ConfigPostProcessor {
         }
     }
 
+    /**
+     * The rules a router must satisfy wherever it enters the config: the file load, a Configuration API write, a
+     * validate or apply manifest and a replica event. Names the router (the messages carry its name, and a request
+     * body or manifest spec has none) and turns an explicit {@code "interceptors": null} into an empty list, which
+     * the request path iterates. Duplicate ids are checked by the callers against the namespace they see.
+     */
+    public static void validateRouterInvariants(String name, Router router, Map<String, Translator> translators,
+                                                List<ValidationWarning> warnings) {
+        router.setName(name);
+        if (router.getInterceptors() == null) {
+            router.setInterceptors(List.of());
+        } else if (!router.getInterceptors().isEmpty()) {
+            warnings.add(new ValidationWarning("interceptors", messageWithEntityPrefix("Router", name, "A router declares no interceptors")));
+        }
+        if (router.getEndpoint() != null || router.getResponsesEndpoint() != null) {
+            warnings.add(new ValidationWarning("endpoint", messageWithEntityPrefix("Router", name, "A router declares interfaces, not endpoint")));
+        }
+        if ((router.getApplicationTypeSchemaId() == null) != (router.getApplicationProperties() == null)) {
+            String field = router.getApplicationTypeSchemaId() == null ? "applicationProperties" : "applicationTypeSchemaId";
+            warnings.add(new ValidationWarning(field, messageWithEntityPrefix("Router", name,
+                    "A router declares applicationTypeSchemaId and applicationProperties together")));
+        }
+        validateDecision(name, router, warnings);
+        validateDeploymentInterfaces(router, translators, warnings);
+    }
+
+    /**
+     * A router in decision mode never forwards the client's request, so no interface of it is served by a translator.
+     * The decide request settings are read in decision mode only: on a router in proxy mode they would do nothing.
+     */
+    private static void validateDecision(String name, Router router, List<ValidationWarning> warnings) {
+        Router.Decision decision = router.getDecision();
+        if (router.getMode() != Router.Mode.DECISION) {
+            if (decision != null) {
+                warnings.add(new ValidationWarning("decision", messageWithEntityPrefix("Router", name, "decision requires mode 'decision'")));
+            }
+            return;
+        }
+        if (router.getInterfaces() != null) {
+            router.getInterfaces().forEach((type, declared) -> {
+                if (declared != null && (declared.getMode() == InterfaceMode.TRANSLATOR || declared.getTranslator() != null)) {
+                    warnings.add(new ValidationWarning("interfaces." + type, messageWithEntityPrefix("Router", name,
+                            "A router in mode 'decision' serves no interface through a translator")));
+                }
+            });
+        }
+        if (decision == null) {
+            return;
+        }
+        if (decision.getTimeoutMs() != null && decision.getTimeoutMs() <= 0) {
+            warnings.add(new ValidationWarning("decision.timeoutMs", messageWithEntityPrefix("Router", name, "decision.timeoutMs must be positive")));
+        }
+        if (decision.getMaxDecisions() != null && (decision.getMaxDecisions() < 1 || decision.getMaxDecisions() > 10)) {
+            warnings.add(new ValidationWarning("decision.maxDecisions",
+                    messageWithEntityPrefix("Router", name, "decision.maxDecisions must be between 1 and 10")));
+        }
+    }
+
+    /**
+     * Targeted per-type helper for {@link MergedConfigStore}'s partial-update path: validates the single written
+     * router with {@link #validateRouterInvariants}.
+     */
+    static void validateSingleRouter(Config config, String mapKey,
+                                     @Nullable BiConsumer<ResourceTypes, InvalidEntityException> onSkip) {
+        Router router = config.getRouters().get(mapKey);
+        if (router == null) {
+            return;
+        }
+        List<ValidationWarning> warnings = new ArrayList<>();
+        validateRouterInvariants(mapKey, router, config.getTranslators(), warnings);
+        if (warnings.isEmpty()) {
+            return;
+        }
+        if (onSkip == null) {
+            throw new InvalidEntityException(ResourceTypes.ROUTER, mapKey, warnings);
+        }
+        config.getRouters().remove(mapKey);
+        onSkip.accept(ResourceTypes.ROUTER, new InvalidEntityException(ResourceTypes.ROUTER, mapKey, warnings));
+    }
+
+    private static void processRouters(Config config, Set<String> deploymentIds,
+                                       @Nullable BiConsumer<ResourceTypes, InvalidEntityException> onSkip) {
+        Iterator<Map.Entry<String, Router>> iterator = config.getRouters().entrySet().iterator();
+        while (iterator.hasNext()) {
+            Map.Entry<String, Router> entry = iterator.next();
+            String name = entry.getKey();
+            if (skipOnDuplicate(name, ResourceTypes.ROUTER, deploymentIds, onSkip, iterator)) {
+                continue;
+            }
+            Router router = entry.getValue();
+            List<ValidationWarning> warnings = new ArrayList<>();
+            validateRouterInvariants(name, router, config.getTranslators(), warnings);
+            if (!warnings.isEmpty()) {
+                if (onSkip == null) {
+                    throw new InvalidEntityException(ResourceTypes.ROUTER, name, warnings);
+                }
+                iterator.remove();
+                onSkip.accept(ResourceTypes.ROUTER, new InvalidEntityException(ResourceTypes.ROUTER, name, warnings));
+                continue;
+            }
+            log.debug("Loading {}", router);
+        }
+    }
+
     private static void processToolSets(Config config, Set<String> deploymentIds,
                                         @Nullable BiConsumer<ResourceTypes, InvalidEntityException> onSkip) {
         Iterator<Map.Entry<String, ToolSet>> iterator = config.getToolsets().entrySet().iterator();
@@ -824,6 +1020,52 @@ public final class ConfigPostProcessor {
                 iterator.remove();
             }
         }
+    }
+
+    /**
+     * Runs after every other deployment type, so the name check sees all of them and a target is looked up in maps
+     * already cleared of invalid entries. A target the config does not have is only a warning: one broken alias must
+     * not stop the config from loading, and calls of it answer 503.
+     */
+    private static void processAliases(Config config, Set<String> deploymentIds,
+                                       @Nullable BiConsumer<ResourceTypes, InvalidEntityException> onSkip) {
+        Iterator<Map.Entry<String, Alias>> iterator = config.getAliases().entrySet().iterator();
+        while (iterator.hasNext()) {
+            Map.Entry<String, Alias> entry = iterator.next();
+            String name = entry.getKey();
+            if (skipOnDuplicate(name, ResourceTypes.ALIAS, deploymentIds, onSkip, iterator)) {
+                continue;
+            }
+            Alias alias = entry.getValue();
+            alias.setName(name);
+            List<ValidationWarning> warnings = AliasTargets.validate(alias, config);
+            if (!warnings.isEmpty()) {
+                if (onSkip == null) {
+                    throw new InvalidEntityException(ResourceTypes.ALIAS, name, warnings);
+                }
+                iterator.remove();
+                onSkip.accept(ResourceTypes.ALIAS, new InvalidEntityException(ResourceTypes.ALIAS, name, warnings));
+                continue;
+            }
+            if (AliasTargets.isTargetMissing(alias, config)) {
+                log.warn("Alias {} points to a missing deployment {}", name, alias.getTarget().getPath());
+            }
+            warnOnLimitsUnderAliasName(config, name);
+            log.debug("Loading {}", alias);
+        }
+    }
+
+    /**
+     * A call through an alias is limited under its target's name, so a role limit keyed by the alias's name has no
+     * effect; it is most likely a mistake.
+     */
+    private static void warnOnLimitsUnderAliasName(Config config, String aliasName) {
+        config.getRoles().forEach((roleName, role) -> {
+            if (role != null && role.getLimits() != null && role.getLimits().containsKey(aliasName)) {
+                log.warn("Role {} defines a limit under alias {}, which has no effect: define it under the alias's target",
+                        roleName, aliasName);
+            }
+        });
     }
 
     /**
@@ -849,7 +1091,7 @@ public final class ConfigPostProcessor {
 
     /**
      * Returns {@code true} if {@code shortName} is already claimed by a MODEL, APPLICATION,
-     * TOOL_SET, or INTERCEPTOR other than {@code type} — those four entity types share one
+     * TOOL_SET, INTERCEPTOR, ROUTER or ALIAS other than {@code type} — those six entity types share one
      * flat deployment-id namespace.
      */
     public static boolean isDeploymentIdTakenByAnotherDeploymentType(Config config,
@@ -859,7 +1101,9 @@ public final class ConfigPostProcessor {
                 ResourceTypes.MODEL, config.getModels(),
                 ResourceTypes.APPLICATION, config.getApplications(),
                 ResourceTypes.TOOL_SET, config.getToolsets(),
-                ResourceTypes.INTERCEPTOR, config.getInterceptors());
+                ResourceTypes.INTERCEPTOR, config.getInterceptors(),
+                ResourceTypes.ROUTER, config.getRouters(),
+                ResourceTypes.ALIAS, config.getAliases());
         if (!deploymentIdSpaces.containsKey(type)) {
             throw new IllegalArgumentException("Not a deployment type: " + type);
         }

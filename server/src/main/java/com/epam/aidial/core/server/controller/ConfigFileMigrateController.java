@@ -73,11 +73,12 @@ public class ConfigFileMigrateController {
     public static final int KEY_HASH_LENGTH = 12;
 
     private static final List<String> ALL_TYPES = List.of(
-            "settings", "schemas", "catalog_schemas", "interceptors", "translators", "roles", "keys", "routes",
+            "settings", "schemas", "catalog_schemas", "interceptors", "routers", "translators", "roles", "keys", "routes",
             "models", "toolsets", "applications");
 
     private static final List<ManagedTypeSpec> MANAGED_TYPE_SPECS = List.of(
             new ManagedTypeSpec("interceptors", "Interceptor", ResourceTypes.INTERCEPTOR, Config::getInterceptors),
+            new ManagedTypeSpec("routers", "Router", ResourceTypes.ROUTER, Config::getRouters),
             new ManagedTypeSpec("translators", "Translator", ResourceTypes.TRANSLATOR, Config::getTranslators),
             new ManagedTypeSpec("roles", "Role", ResourceTypes.ROLE, Config::getRoles),
             new ManagedTypeSpec("routes", "Route", ResourceTypes.ROUTE, Config::getRoutes),
@@ -454,6 +455,7 @@ public class ConfigFileMigrateController {
         settings.setGlobalInterceptors(fileConfig.getGlobalInterceptors());
         settings.setRetriableErrorCodes(fileConfig.getRetriableErrorCodes());
         settings.setRateLimitSchedule(fileConfig.getRateLimitSchedule());
+        settings.setSpendingLimits(fileConfig.getSpendingLimits());
         JsonNode spec = ProxyUtil.MAPPER.valueToTree(settings);
         collect(new AdminManifest("Settings", canonicalId, spec), null, scratch, dryRun, toApply, results);
     }
