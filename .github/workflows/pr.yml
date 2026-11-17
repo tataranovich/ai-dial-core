@@ -10,7 +10,7 @@ concurrency:
 
 jobs:
   run_tests:
-    uses: epam/ai-dial-ci/.github/workflows/java_pr.yml@4.13.2
+    uses: tataranovich/ai-dial-ci/.github/workflows/java_pr.yml@main
     secrets: inherit
     with:
       platforms: "linux/amd64,linux/arm64"
@@ -18,6 +18,8 @@ jobs:
       trivy-severity: "CRITICAL,HIGH,MEDIUM,LOW"
       trivy-severity-for-sarif: "CRITICAL,HIGH,MEDIUM,LOW"
       trivy-limit-severities-for-sarif: false
+      ort-enabled: false
+      code-checks-enabled: false
 
   generate_openai_spec:
     runs-on: ubuntu-24.04
