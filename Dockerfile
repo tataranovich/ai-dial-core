@@ -42,3 +42,5 @@ RUN mkdir -p "$LOG_DIR" && \
     chown -R appuser:appuser "$STORAGE_DIR"
 
 ENTRYPOINT ["docker-entrypoint.sh"]
+
+# Dummy change for PR
