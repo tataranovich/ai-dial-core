@@ -7,6 +7,8 @@ import io.vertx.core.json.JsonObject;
 import lombok.SneakyThrows;
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -299,6 +301,32 @@ public class AdminValidateApiTest extends ResourceBaseTest {
 
     @Test
     @SneakyThrows
+    void testValidateRejectsInvalidResourceDependencies() {
+        String body = """
+                {
+                  "manifests": [
+                    {
+                      "kind": "Application",
+                      "name": "applications/platform/validate-invalid-deps",
+                      "spec": {
+                        "endpoint": "http://example.com/v1/completions",
+                        "resourceDependencies": [
+                          {"kind": "dial.resourceLink", "link_id": "lnk_1", "target": {"url": "users/bob/files/f/"}, "access": ["read"]}
+                        ]
+                      }
+                    }
+                  ]
+                }
+                """;
+        Response response = send(HttpMethod.POST, "/v1/admin/validate", null, body, "authorization", "admin");
+        verify(response, 422);
+        JsonNode result = ProxyUtil.MAPPER.readTree(response.body()).get("results").get(0);
+        assertEquals("FAILED", result.get("status").asText(), () -> "Body: " + response.body());
+        assertTrue(result.get("error").asText().startsWith("Invalid resource dependencies"), () -> "Body: " + response.body());
+    }
+
+    @Test
+    @SneakyThrows
     void testValidateRejectsModelWhoseInBatchTranslatorDisagrees() {
         // Proves the in-batch translator is actually consulted, not merely tolerated: the model
         // attaches it to anthropicMessages while the translator converts from openaiResponses.
@@ -335,6 +363,48 @@ public class AdminValidateApiTest extends ResourceBaseTest {
         assertTrue(response.body().contains("Translator converts from"),
                 () -> "Expected the translator mismatch message: " + response.body());
         assertEquals(1, parsed.get("failed").asInt());
+    }
+
+    @Test
+    @SneakyThrows
+    void testValidateAcceptsPluginManifest() {
+        String body = """
+                {
+                  "manifests": [
+                    {
+                      "kind": "Plugin",
+                      "name": "plugins/platform/validate-plugin",
+                      "spec": {"type": "test-echo", "settings": {"greeting": "hi"}}
+                    }
+                  ]
+                }
+                """;
+        Response response = send(HttpMethod.POST, "/v1/admin/validate", null, body, "authorization", "admin");
+        verify(response, 200);
+        JsonNode parsed = ProxyUtil.MAPPER.readTree(response.body());
+        assertEquals(1, parsed.get("valid").asInt(), response::body);
+        assertEquals("VALID", parsed.get("results").get(0).get("status").asText(), response::body);
+    }
+
+    @Test
+    @SneakyThrows
+    void testValidateRejectsPluginWithRejectedSettings() {
+        String body = """
+                {
+                  "manifests": [
+                    {
+                      "kind": "Plugin",
+                      "name": "plugins/platform/validate-plugin-bad",
+                      "spec": {"type": "test-echo", "settings": {}}
+                    }
+                  ]
+                }
+                """;
+        Response response = send(HttpMethod.POST, "/v1/admin/validate", null, body, "authorization", "admin");
+        verify(response, 422);
+        JsonNode result = ProxyUtil.MAPPER.readTree(response.body()).get("results").get(0);
+        assertEquals("FAILED", result.get("status").asText(), response::body);
+        assertTrue(result.get("error").asText().contains("settings.greeting"), response::body);
     }
 
     @Test
@@ -1380,5 +1450,27 @@ public class AdminValidateApiTest extends ResourceBaseTest {
             verify(send(HttpMethod.GET, "/v1/models/platform/validate-soft-cache-pricing", null, "",
                     "authorization", "admin"), 404);
         }
+    }
+
+    // deployment-interfaces-config "Plugin url in responsesEndpoint refused by validate and apply"
+    @Test
+    @SneakyThrows
+    void testPluginUrlInResponsesEndpointFails() {
+        String manifests = """
+                "manifests": [{"kind": "Model", "name": "models/platform/validate-plugin-url",
+                               "spec": {"type": "chat", "endpoint": "http://localhost:7001/openai/deployments/m/chat/completions",
+                                        "responsesEndpoint": "dial-plugin://p1"}}]
+                """;
+        Response validate = send(HttpMethod.POST, "/v1/admin/validate", null, "{" + manifests + "}", "authorization", "admin");
+        Response apply = send(HttpMethod.POST, "/v1/admin/apply", null, "{\"precheck\": false, " + manifests + "}",
+                "authorization", "admin");
+
+        verify(validate, 422);
+        for (Response response : List.of(validate, apply)) {
+            JsonNode result = ProxyUtil.MAPPER.readTree(response.body()).get("results").get(0);
+            assertEquals("FAILED", result.get("status").asText(), response.body());
+            assertTrue(result.get("error").asText().contains("A plugin url is only accepted in a base url"), response.body());
+        }
+        verify(send(HttpMethod.GET, "/v1/models/platform/validate-plugin-url", null, "", "authorization", "admin"), 404);
     }
 }

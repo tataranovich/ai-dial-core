@@ -4,6 +4,7 @@ import com.epam.aidial.core.config.Route;
 import com.epam.aidial.core.config.Upstream;
 import com.epam.aidial.core.server.Proxy;
 import com.epam.aidial.core.server.ProxyContext;
+import com.epam.aidial.core.server.alias.AliasPass;
 import com.epam.aidial.core.server.data.BackgroundJobRecord;
 import com.epam.aidial.core.server.data.RouteType;
 import com.epam.aidial.core.server.data.RouterDecision;
@@ -90,11 +91,15 @@ public class AnalyticsLogContext {
         return toBuilder().requestBody(null).responseBody(null).assembledStreamingResponse(null).bodiesOmitted(true).build();
     }
 
+    /**
+     * The row of a pass. An alias pass has no bodies in its row: it relays its target's answer, and the target pass's
+     * row logs them once. Every other pass, one Core serves in process included, logs its bodies.
+     */
     public static AnalyticsLogContext from(ProxyContext context, String assembledStreamingResponse) {
         Buffer responseBody = context.getResponseBody();
         Route route = context.getRoute();
         RouteType routeType = context.getRouteType();
-        return AnalyticsLogContext.builder()
+        AnalyticsLogContext row = AnalyticsLogContext.builder()
                 .traceId(context.getTraceId())
                 .spanId(context.getSpanId())
                 // the pass that asked the router is the router row's child
@@ -133,6 +138,8 @@ public class AnalyticsLogContext {
                 .usagePerModel(context.getUsagePerModel())
                 .operationDurationMs(context.calculateOperationDurationMs())
                 .build();
+        // an alias relays its target's answer: the target pass's row logs the bodies once
+        return context.getDeployment() instanceof AliasPass ? row.withoutBodies() : row;
     }
 
     public static AnalyticsLogContext from(BackgroundJobRecord record, ResponsesApiClient.TerminalResult result, List<UsagePerModel> usagePerModel) {
