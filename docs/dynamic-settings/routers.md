@@ -36,6 +36,7 @@ An object containing the routers and their [parameters](#routersrouter_name).
 * `displayName`, `displayVersion`, `iconUrl`, `description`, `intro`, `reference`, `descriptionKeywords`, `author`, `createdAt`, `updatedAt`: Display fields, as for a model.
 * `features`, `defaults`, `defaultHeaders`, `overrideName`, `forwardAuthToken`, `maxRetryAttempts`: As for a model.
 * `applicationTypeSchemaId`, `applicationProperties`: An app-type schema and the properties it validates, as for a schema-rich application. Set both or neither. See [Type schema and properties](#type-schema-and-properties).
+* `editorUrl` (or `editor_url`): The URL of the router's admin UI, which DIAL Admin can embed on the router's page. DIAL Core does not validate it and never calls it. It is returned with the router by the [Configuration API](#configuration-api) and the file config endpoints, and not by the [listings](#listing). A DIAL Core version without this field rejects a router that sets it, so remove the field before a downgrade.
 
 A router declares nothing of another deployment kind. DIAL Core rejects a router that has `upstreams`, `limits`, `pricing`, any other application field, `interceptors` (`A router declares no interceptors`), or `endpoint` / `responsesEndpoint` (`A router declares interfaces, not endpoint`).
 
@@ -100,9 +101,12 @@ They have their own listing too:
 * `GET /v1/routers`: `{"data": [...]}` with one entry per router the caller's roles allow.
 * `GET /v1/routers/{router_name}`: that entry; `404` for an unknown name, `403` when the caller's roles do not allow it.
 
-Routers do not appear in the model listings: `GET /openai/models`, `/openai/deployments`, `/openai/applications` and `/anthropic/v1/models`.
+An [alias](aliases.md) of type `router` (`presentAs: router`, or over a router without `presentAs`) is listed with the routers, here and in
+`/v1/deployments` and `/v1/deployment-names`, under its own name.
 
-An entry carries `id`, `object: "router"`, `display_name`, `display_version`, `icon_url`, `description`, `intro`, `reference`, `features`, `defaults`, `description_keywords`, `interfaces` (`chat` and `embedding` as above, then the declared interface types), `created_at` and `updated_at`. It never carries the router's url.
+Routers do not appear in the model listings: `GET /openai/models`, `/openai/deployments`, `/openai/applications` and `/anthropic/v1/models`. To list a router under a model name, point an [alias](aliases.md) with `presentAs: model` to it.
+
+An entry carries `id`, `object: "router"`, `display_name`, `display_version`, `icon_url`, `description`, `intro`, `reference`, `features`, `defaults`, `description_keywords`, `interfaces` (`chat` and `embedding` as above, then the declared interface types), `created_at` and `updated_at`. It never carries the router's url or its `editorUrl`.
 
 ## Identity
 
@@ -119,7 +123,11 @@ The mode is the router's: every interface the router declares is decided. A rout
 * `decision.timeoutMs`: How long the decide request may take, connecting included. Default `5000`; must be positive.
 * `decision.maxDecisions`: How many decide requests one client request may need, the first included (see [Fallback and re-decide](#fallback-and-re-decide)). Default `3`; from 1 to 10.
 
-The decide request of an interface goes to its `base_url`, or to the router's `baseUrl` when it declares none, followed by `/decide`. DIAL Core rejects a `decision` object on a router in proxy mode (`decision requires mode 'decision'`) and a translated interface on a router in decision mode (`A router in mode 'decision' serves no interface through a translator`).
+The decide request of an interface goes to its `base_url`, or to the router's `baseUrl` when it declares none, followed by `/decide`. DIAL Core rejects a `decision` object on a router in proxy mode (`decision requires mode 'decision'`) and, on a router in decision mode, a translated interface (`A router in mode 'decision' serves no interface through a translator`).
+
+An interface whose base URL is a plugin URL (`{"base_url": "dial-plugin://<name>"}`, or the router's `baseUrl`) is decided in process by that [origin plugin](plugins.md#deciding-for-a-router) instead of over HTTP. Plugins are in preview and may change incompatibly. The plugin receives the decide request DIAL Core would send to the URL, with the path `/decide` (after any path that follows the plugin's name), the same headers and the same body, and answers it as a router service does: the verdict, the same `decision.timeoutMs`, the same failure statuses. A plugin answering a decide request may call DIAL Core's create operations through its host; those calls carry the decide request's key, and when the decide call ends DIAL Core cancels the ones still open and answers later ones `401`. A notice request carries no key, so the calls a plugin makes while answering one are answered `401`. The plugin gets the caller's identity with the request, so it needs no `GET /v1/user/info`. With `decision.body: true` the plugin gets the client's bytes as the request body, the same buffer and no copy, and the parsed body as its `bodyTree`, a copy of its own that it may change without changing what the chosen deployment receives; it reads the fields it needs without parsing the body again.
+
+When an origin plugin's in-process call reaches a router in decision mode, the call has a parsed tree and no bytes. DIAL Core serializes that tree once, before the first candidate, and uses the serialization where it uses a client's bytes: as the decide body with `decision.body: true`, the re-decide included, and as the request each fallback candidate is served from.
 
 **Example**: `r1` decides chat completions and Messages requests at `http://localhost:4848/decide`, and embeddings at `http://localhost:4949/decide`.
 
@@ -161,13 +169,13 @@ A `200` answer with a JSON body naming the candidates in order of preference, on
 {"candidates": ["gpt-4", "claude"]}
 ```
 
-DIAL Core ignores other fields. A body without a non-empty `candidates` array, `{"deployment": "gpt-4"}` included, is an invalid verdict (`502`). A candidate must not be a router.
+DIAL Core ignores other fields. A body without a non-empty `candidates` array, `{"deployment": "gpt-4"}` included, is an invalid verdict (`502`). A candidate must not be a router or an alias over one.
 
 ### Serving the chosen deployment
 
 DIAL Core serves the first usable candidate as if the client had called it: the caller's roles, consent and per-request-key access to it, its limits against the caller, its interceptors, one per-request key, its `defaultHeaders`, `defaults` and `overrideName`. On `/openai/v1/chat/completions`, `/openai/v1/responses` and `/anthropic/v1/messages` (`count_tokens` included) DIAL Core sets the body `model` to the candidate's name before applying its `overrideName`, and sends the candidate's name in `X-DIAL-DEPLOYMENT-ID` on Messages.
 
-The client sees the router's name in the answer's `model`, as with an alias: DIAL Core replaces the `model` of chat completions, Responses and Messages answers, streamed and buffered, with the router's name, and does the same when a stored response is read back. Analytics still names the deployment that served, in `deployment`. Embeddings, a buffered legacy completion and a buffered answer relayed through the chosen deployment's interceptors keep the upstream's `model`, because DIAL Core passes those bodies through unparsed.
+The client sees the router's name in the answer's `model`, or the alias's name when it called the router through an [alias](aliases.md): DIAL Core replaces the `model` of chat completions, Responses and Messages answers, streamed and buffered, with that name, and does the same when a stored response is read back. Analytics still names the deployment that served, in `deployment`. Embeddings, a buffered legacy completion and a buffered answer relayed through the chosen deployment's interceptors keep the upstream's `model`, because DIAL Core passes those bodies through unparsed.
 
 ### Fallback and re-decide
 
@@ -196,7 +204,7 @@ Three ways to use it:
 | The router is unreachable, or answers `5xx` | `502` |
 | The `200` body is not a verdict | `502` |
 | The router answers `4xx` | The router's status and body |
-| The verdict names a router, or its last usable candidate does not exist | `502` |
+| The verdict names a router or an alias over one, or its last usable candidate does not exist | `502` |
 | A deployment the router chose calls the router back | `502` |
 
 These are the answers to the first decide request; in each case DIAL Core sends nothing to any candidate and writes no analytics row. A later decide request that fails ends the walk with the last candidate's failure instead.

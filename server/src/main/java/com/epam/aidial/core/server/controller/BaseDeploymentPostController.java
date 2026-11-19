@@ -17,8 +17,12 @@ import com.epam.aidial.core.server.data.FeaturesData;
 import com.epam.aidial.core.server.data.RouterDecision;
 import com.epam.aidial.core.server.function.CollectResponseAttachmentsFn;
 import com.epam.aidial.core.server.function.RouterModelFn;
+import com.epam.aidial.core.server.function.request.RequestObject;
 import com.epam.aidial.core.server.limiter.RateLimitResult;
 import com.epam.aidial.core.server.log.AnalyticsLogContext;
+import com.epam.aidial.core.server.proxy.ProxyRequest;
+import com.epam.aidial.core.server.proxy.ProxyResponse;
+import com.epam.aidial.core.server.proxy.embedded.VertxHostDelegate;
 import com.epam.aidial.core.server.token.TokenStatsTracker;
 import com.epam.aidial.core.server.token.TokenUsage;
 import com.epam.aidial.core.server.token.TokenUsageParser;
@@ -35,14 +39,13 @@ import com.epam.aidial.core.server.util.UsagePerModelInjector;
 import com.epam.aidial.core.server.vertx.stream.BufferingReadStream;
 import com.epam.aidial.core.storage.http.HttpException;
 import com.epam.aidial.core.storage.http.HttpStatus;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.netty.buffer.ByteBufInputStream;
 import io.vertx.core.Future;
 import io.vertx.core.MultiMap;
 import io.vertx.core.buffer.Buffer;
-import io.vertx.core.http.HttpClientRequest;
-import io.vertx.core.http.HttpClientResponse;
 import io.vertx.core.http.HttpHeaders;
 import io.vertx.core.http.HttpServerRequest;
 import io.vertx.core.http.HttpServerResponse;
@@ -56,6 +59,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 import java.util.function.Supplier;
+import javax.annotation.Nullable;
 
 import static com.epam.aidial.core.server.Proxy.HEADER_APPLICATION_ID;
 import static com.epam.aidial.core.server.Proxy.HEADER_APPLICATION_PROPERTIES;
@@ -76,7 +80,7 @@ public class BaseDeploymentPostController {
         this.decisions = new RouterDecisionFlow(proxy, context);
     }
 
-    protected BufferingReadStream createResponseStream(HttpClientResponse proxyResponse,
+    protected BufferingReadStream createResponseStream(ProxyResponse proxyResponse,
                                                        Supplier<BufferingReadStream.BaseEventListener> listenerSupplier) {
         BufferingReadStream.BaseEventListener eventListener = null;
         if (isEventStreamResponse(proxyResponse)) {
@@ -85,7 +89,7 @@ public class BaseDeploymentPostController {
         return new BufferingReadStream(proxyResponse, ProxyUtil.contentLength(proxyResponse, 1024), eventListener);
     }
 
-    protected boolean isEventStreamResponse(HttpClientResponse proxyResponse) {
+    protected boolean isEventStreamResponse(ProxyResponse proxyResponse) {
         String contentType = proxyResponse.getHeader(HttpHeaders.CONTENT_TYPE);
         return Strings.CI.contains(contentType, "text/event-stream") && context.isStreamingRequest();
     }
@@ -132,8 +136,34 @@ public class BaseDeploymentPostController {
         GenAiTraceAttributes.setUpstreamAttempts(context, attemptCount);
     }
 
+    /**
+     * Sets the request's body once the chain has run: {@code request} serialised, when the chain changed it or the
+     * pass has no body yet, as the pass of an in-process call has not. For an interface served by a plugin the tree stays on the
+     * context too, and its plugin gets it as {@code bodyTree} instead of parsing the body again. An alias pass whose
+     * target pass runs in process keeps the tree and does not serialize ({@link #isInProcessAliasHop}).
+     */
+    protected void setProcessedRequestBody(RequestObject request, boolean changed, InterfaceType type) throws JsonProcessingException {
+        if (isInProcessAliasHop()) {
+            // the target pass takes the tree, and the alias row has no bodies: no one reads serialized bytes. A pass
+            // with none (itself served in process) gets an empty buffer for the Content-Length the send sets
+            context.setRequestTree(request.getTree());
+            if (context.getRequestBody() == null) {
+                context.setRequestBody(Buffer.buffer());
+            }
+            return;
+        }
+        if (changed || context.getRequestBody() == null) {
+            context.setRequestBody(Buffer.buffer(request.serialize()));
+        }
+        if (DeploymentEndpointUtil.resolvePlugin(context.getDeployment(), type, context.getConfig().getTranslators()) != null) {
+            context.setRequestTree(request.getTree());
+        }
+    }
+
     protected void finalizeRequest() {
-        // every terminal path of all four LLM surfaces reaches here, including the respond(...) helpers above
+        // every terminal path of all four LLM surfaces reaches here, including the respond(...) helpers above;
+        // ResponseItemController, which is not one of them, closes its child passes in its own finalizeRequest
+        context.closeHostDelegates();
         GenAiTraceAttributes.setLatencyAttributes(context);
         // the router row reads the span's stats, which a root's endSpan deletes
         decisions.writeRouterRow()
@@ -406,7 +436,7 @@ public class BaseDeploymentPostController {
             return body;
         }
         if (context.getDecision() != null) {
-            RouterModelFn.rewrite(object, context.getDecision().getRouterName());
+            RouterModelFn.rewrite(object, context.getDecision().getAnswerName());
         }
         List<UsagePerModel> usagePerModel = context.getUsagePerModel();
         if (usagePerModel == null || usagePerModel.isEmpty()) {
@@ -418,11 +448,22 @@ public class BaseDeploymentPostController {
     }
 
     /**
-     * Low-level: build and issue the proxy request to an already-resolved absolute URI.
+     * Low-level: build and issue the proxy request to an already-resolved absolute URI, over HTTP.
      */
-    protected Future<HttpClientRequest> createProxyRequest(String absoluteUri) {
+    protected Future<ProxyRequest> createProxyRequest(String absoluteUri) {
+        return createProxyRequest(absoluteUri, null);
+    }
+
+    /**
+     * Low-level: build and issue the proxy request to an already-resolved absolute URI: a call to {@code plugin} when an
+     * interface names one, an HTTP request otherwise.
+     */
+    protected Future<ProxyRequest> createProxyRequest(String absoluteUri, @Nullable String plugin) {
         HttpServerRequest request = context.getRequest();
         context.setProxyRequestUri(absoluteUri);
+        if (plugin != null) {
+            return proxy.getProxyClient().embedded(context, request.method(), absoluteUri, plugin);
+        }
         RequestOptions options = new RequestOptions()
                 .setAbsoluteURI(absoluteUri)
                 .setMethod(request.method())
@@ -430,25 +471,40 @@ public class BaseDeploymentPostController {
                 .setConnectTimeout(proxy.getClientOptions().getConnectTimeout())
                 .setIdleTimeout(proxy.getClientOptions().getIdleTimeout());
 
-        return proxy.getClient().request(options);
+        return proxy.getProxyClient().http(options);
     }
 
-    protected Future<HttpClientRequest> createProxyRequest(InterfaceType type) {
+    protected Future<ProxyRequest> createProxyRequest(InterfaceType type) {
         HttpServerRequest request = context.getRequest();
-        return createProxyRequest(
-                DeploymentEndpointUtil.resolveRequestUri(
-                        context.getDeployment(),
-                        type, context.getConfig().getTranslators(),
-                        request.path(),
-                        request.query()
-                )
-        );
+        Deployment deployment = context.getDeployment();
+        String uri = DeploymentEndpointUtil.resolveRequestUri(deployment, type, context.getConfig().getTranslators(),
+                request.path(), request.query());
+        if (isInProcessAliasHop()) {
+            context.setProxyRequestUri(uri);
+            // the base the uri was resolved on: the alias pass's interface base url, Core's own address
+            String baseUrl = DeploymentEndpointUtil.resolveServingEndpoint(deployment, type, context.getConfig().getTranslators());
+            return proxy.getProxyClient().aliasTarget(context, request.method(), baseUrl, uri);
+        }
+        return createProxyRequest(uri, DeploymentEndpointUtil.resolvePlugin(deployment, type, context.getConfig().getTranslators()));
     }
 
-    protected Future<HttpClientResponse> sendProxyRequest(HttpClientRequest proxyRequest, InterfaceType type) {
+    /**
+     * Whether the alias pass's request to its target is served in process; otherwise it goes over HTTP to Core's own
+     * address. In process when the deployment is an alias pass, the pass is not a background job, and the request's
+     * path is one an in-process call serves (Messages {@code count_tokens} is not). The request's path classifies as the
+     * target's does: an override path keeps the action, and {@code count_tokens} stays {@code count_tokens}. The send and
+     * the body follow this one check: an HTTP send of bytes the alias pass did not serialize from the tree would name
+     * the alias in {@code model} and reach the alias again.
+     */
+    private boolean isInProcessAliasHop() {
+        return context.getDeployment() instanceof AliasPass && !context.isBackgroundJob()
+                && VertxHostDelegate.servesCall(context.getRequest().path());
+    }
+
+    protected Future<ProxyResponse> sendProxyRequest(ProxyRequest proxyRequest, InterfaceType type) {
         log.info("Connected to origin. Deployment: {}. Address: {}",
                 context.getDeployment().getName(),
-                proxyRequest.connection().remoteAddress());
+                proxyRequest.remoteAddress());
 
         MultiMap excludeHeaders = MultiMap.caseInsensitiveMultiMap();
         if (!context.getDeployment().isForwardAuthToken()) {
@@ -458,7 +514,7 @@ public class BaseDeploymentPostController {
         excludeHeaders.add(HEADER_APPLICATION_ID, "whatever");
 
         ProxyUtil.copyHeaders(context.getRequest().headers(), proxyRequest.headers(), excludeHeaders);
-        ProxyUtil.setOverrideNameHeader(proxyRequest, context.getDeployment());
+        ProxyUtil.setOverrideNameHeader(proxyRequest.headers(), context.getDeployment());
 
         proxyRequest.headers().add(Proxy.HEADER_API_KEY, context.getProxyApiKeyData().getPerRequestKey());
 
@@ -506,7 +562,7 @@ public class BaseDeploymentPostController {
      * Hook for route-specific headers. Invoked after the client headers have been copied, so anything set
      * here replaces the value a client may have sent under the same name.
      */
-    protected void enrichProxyRequestHeaders(HttpClientRequest proxyRequest) {
+    protected void enrichProxyRequestHeaders(ProxyRequest proxyRequest) {
         // no additional headers by default
     }
 

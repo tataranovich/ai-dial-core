@@ -98,9 +98,8 @@ class AliasPublicApiTest extends ResourceBaseTest {
 
     @Test
     @DialConfigLocation(CONFIG)
-    void aliasesLiveDirectlyInThePublicBucket() {
+    void aliasesLiveDirectlyInThePublicOrPlatformBucket() {
         assertEquals(404, admin(HttpMethod.PUT, "/v1/aliases/" + bucket + "/pub-v1", MODEL_ALIAS).status());
-        assertEquals(404, admin(HttpMethod.PUT, "/v1/aliases/platform/pub-v1", MODEL_ALIAS).status());
         assertEquals(400, putAlias("folder/pub-v1", MODEL_ALIAS).status());
         assertEquals(400, putAlias("bad%20name", MODEL_ALIAS).status());
         // the generic resource API does not serve aliases
@@ -111,6 +110,7 @@ class AliasPublicApiTest extends ResourceBaseTest {
     @DialConfigLocation(CONFIG)
     void invalidBodiesAreRefusedAndNothingIsWritten() {
         assertBadRequest("{\"userRoles\":{\"role\":\"default-user\"},\"target\":{\"path\":\"models/gpt-4-internal\"}}");
+        assertBadRequest("{\"defaultHeaders\":[\"X-Team\"],\"target\":{\"path\":\"models/gpt-4-internal\"}}");
         assertBadRequest("{\"endpoint\":\"http://x\",\"target\":{\"path\":\"models/gpt-4-internal\"}}");
         assertBadRequest("{\"target\":{\"path\":\"aliases/assistant\"}}");
         assertBadRequest("{\"presentAs\":\"toolset\",\"target\":{\"path\":\"models/gpt-4-internal\"}}");
@@ -125,6 +125,67 @@ class AliasPublicApiTest extends ResourceBaseTest {
         // a resource target must be public: the owner of a user bucket could change it at any time
         assertBadRequest("{\"target\":{\"path\":\"applications/" + bucket + "/res-app\"}}");
         assertBadRequest("{\"target\":{\"path\":\"toolsets/" + bucket + "/tools\"}}");
+    }
+
+    @Test
+    @DialConfigLocation(CONFIG)
+    void toolsetAliasRefusesDefaultHeaders() {
+        assertBadRequest("{\"defaultHeaders\":{\"X-Team\":\"a\"},\"target\":{\"path\":\"toolsets/search\"}}");
+
+        assertEquals(200, putAlias("tools-v1", "{\"defaultHeaders\":{},\"target\":{\"path\":\"toolsets/search\"}}").status());
+        Response read = admin(HttpMethod.GET, ALIAS_URL + "tools-v1", null);
+        assertEquals(200, read.status(), read.body());
+        assertFalse(new JsonObject(read.body()).containsKey("defaultHeaders"), read.body());
+    }
+
+    @Test
+    @DialConfigLocation(CONFIG)
+    void storedAliasDefaultHeadersReachTheTargetNotTheListing() {
+        String team = "aliases/public/team-v1";
+        assertEquals(200, putAlias("team-v1",
+                "{\"userRoles\":[\"default-user\"],\"defaultHeaders\":{\"X-Team\":\"b\"},\"target\":{\"path\":\"models/gpt-4-internal\"}}").status());
+        Response read = admin(HttpMethod.GET, ALIAS_URL + "team-v1", null);
+        assertEquals(new JsonObject().put("X-Team", "b"), new JsonObject(read.body()).getJsonObject("defaultHeaders"), read.body());
+
+        AtomicReference<String> header = new AtomicReference<>();
+        try (TestWebServer server = new TestWebServer(4848)) {
+            server.map(HttpMethod.POST, "/openai/deployments/gpt-4/chat/completions", request -> {
+                header.set(request.getHeader("X-Team"));
+                return TestWebServer.createResponse(200, CHAT_RESPONSE, "Content-Type", "application/json");
+            });
+            Response response = chat(team, "default-key");
+            assertEquals(200, response.status(), response.body());
+        }
+        assertEquals("b", header.get());
+
+        Response entry = send(HttpMethod.GET, "/openai/models/" + team, null, "", "api-key", "default-key");
+        assertEquals(200, entry.status(), entry.body());
+        assertFalse(entry.body().contains("X-Team"), entry.body());
+        JsonObject configs = new JsonObject(entry.body()).getJsonObject("interface_configs");
+        assertFalse(configs.isEmpty(), entry.body());
+        for (String type : configs.fieldNames()) {
+            assertTrue(configs.getJsonObject(type).getJsonObject("default_headers").isEmpty(), entry.body());
+        }
+    }
+
+    @Test
+    @DialConfigLocation(CONFIG)
+    void publicAliasCannotPointToRouter() {
+        String routerAlias = "{\"presentAs\":\"model\",\"userRoles\":[\"default-user\"],\"target\":{\"path\":\"routers/r1\"}}";
+        assertBadRequest(routerAlias);
+        // the type router needs a router target, which a public alias cannot have
+        assertBadRequest("{\"presentAs\":\"router\",\"target\":{\"path\":\"applications/public/app\"}}");
+        // a platform alias joins the config, where a router target is allowed
+        assertEquals(200, admin(HttpMethod.PUT, "/v1/aliases/platform/tier-v1", routerAlias).status());
+
+        ResourceDescriptor descriptor = ResourceDescriptorFactory.fromDecoded(ResourceTypes.ALIAS,
+                ResourceDescriptor.PUBLIC_BUCKET, ResourceDescriptor.PUBLIC_LOCATION, "hand-v1");
+        dial.getProxy().getResourceService().putResource(descriptor, routerAlias, EtagHeader.ANY, "test", false);
+        assertEquals(404, chat("aliases/public/hand-v1", "default-key").status());
+        assertFalse(ids(models("default-key")).contains("aliases/public/hand-v1"));
+        Response read = admin(HttpMethod.GET, ALIAS_URL + "hand-v1", null);
+        assertEquals("invalid", new JsonObject(read.body()).getString("status"), read.body());
+        assertEquals("valid", new JsonObject(admin(HttpMethod.GET, "/v1/aliases/platform/tier-v1", null).body()).getString("status"));
     }
 
     @Test
@@ -315,6 +376,29 @@ class AliasPublicApiTest extends ResourceBaseTest {
 
         Response toolsets = send(HttpMethod.GET, "/openai/toolsets", null, "", "api-key", "default-key");
         assertTrue(ids(toolsets).contains("aliases/public/tools-v1"), toolsets.body());
+    }
+
+    @Test
+    @DialConfigLocation(CONFIG)
+    void consentToTheAliasShowsTheResourcesItsTargetDeclares() {
+        verify(send(HttpMethod.PUT, "/v1/applications/public/declaring-app", null, """
+                {
+                  "endpoint": "http://localhost:4848/declaring-app/chat/completions",
+                  "resource_dependencies": [
+                    {"kind": "dial.resourceLink", "link_id": "lnk_files", "target": {"url": "files/{current-user}/reports/"}, "access": ["read"]}
+                  ]
+                }
+                """, "authorization", "admin"), 200);
+        assertEquals(200, putAlias("declaring-v1",
+                "{\"userRoles\":[\"default-user\"],\"target\":{\"path\":\"applications/public/declaring-app\"}}").status());
+
+        Response review = send(HttpMethod.GET, "/v1/consent/aliases/public/declaring-v1", null, null, "api-key", "default-key");
+        assertEquals(200, review.status(), review.body());
+        JsonObject consent = new JsonObject(review.body());
+        assertFalse(consent.getBoolean("accepted"), review.body());
+        JsonArray resources = consent.getJsonObject("consent").getJsonArray("resources");
+        assertNotNull(resources, review.body());
+        assertTrue(resources.encode().contains("files/{current-user}/reports/"), review.body());
     }
 
     @Test

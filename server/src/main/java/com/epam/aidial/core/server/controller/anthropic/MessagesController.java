@@ -18,14 +18,21 @@ import com.epam.aidial.core.server.data.AnthropicErrorData;
 import com.epam.aidial.core.server.data.ErrorData;
 import com.epam.aidial.core.server.function.BaseRequestFunction;
 import com.epam.aidial.core.server.function.BuildUpstreamCacheFn;
+import com.epam.aidial.core.server.function.CollectDeploymentsFn;
 import com.epam.aidial.core.server.function.CollectMessagesTokenUsageFn;
+import com.epam.aidial.core.server.function.CollectRequestApplicationFilesFn;
+import com.epam.aidial.core.server.function.CollectRequestStandardAttachmentsFn;
+import com.epam.aidial.core.server.function.ResolveResourceDependenciesFn;
 import com.epam.aidial.core.server.function.RouterModelFn;
+import com.epam.aidial.core.server.function.enhancement.ApplyDefaultDeploymentSettingsFn;
+import com.epam.aidial.core.server.function.enhancement.EnhanceDeploymentRequestFn;
 import com.epam.aidial.core.server.function.request.MessagesApiRequest;
 import com.epam.aidial.core.server.function.request.RequestObject;
 import com.epam.aidial.core.server.limiter.RateLimitResult;
 import com.epam.aidial.core.server.limiter.SpendCap;
 import com.epam.aidial.core.server.limiter.SpendCaps;
 import com.epam.aidial.core.server.log.AnalyticsLogContext;
+import com.epam.aidial.core.server.proxy.ProxyResponse;
 import com.epam.aidial.core.server.token.MessagesTokenUsageParser;
 import com.epam.aidial.core.server.token.TokenUsage;
 import com.epam.aidial.core.server.tracing.GenAiTraceAttributes;
@@ -35,12 +42,10 @@ import com.epam.aidial.core.storage.http.HttpException;
 import com.epam.aidial.core.storage.http.HttpStatus;
 import io.vertx.core.Future;
 import io.vertx.core.buffer.Buffer;
-import io.vertx.core.http.HttpClientResponse;
 import io.vertx.core.http.HttpHeaders;
 import io.vertx.core.http.HttpServerResponse;
 import lombok.extern.slf4j.Slf4j;
 
-import java.util.ArrayList;
 import java.util.List;
 import javax.annotation.Nullable;
 
@@ -63,15 +68,18 @@ public class MessagesController extends MessagesBaseController {
     }
 
     /**
-     * Appends {@link BuildUpstreamCacheFn} before the base chain's terminal {@code CollectDeploymentsFn},
-     * so upstream cache pinning applies to {@code POST /anthropic/v1/messages} but not to
-     * {@link MessagesCountTokensController}, which inherits the base chain unchanged.
+     * The base chain plus {@link BuildUpstreamCacheFn}: upstream cache pinning applies to {@code POST /anthropic/v1/messages}
+     * but not to {@link MessagesCountTokensController}.
      */
     @Override
     protected List<BaseRequestFunction<RequestObject>> buildEnhancementFunctions() {
-        List<BaseRequestFunction<RequestObject>> functions = new ArrayList<>(super.buildEnhancementFunctions());
-        functions.add(functions.size() - 1, new BuildUpstreamCacheFn(proxy, context, InterfaceType.ANTHROPIC_MESSAGES));
-        return functions;
+        return List.of(new CollectRequestStandardAttachmentsFn(proxy, context),
+                new ApplyDefaultDeploymentSettingsFn(proxy, context, InterfaceType.ANTHROPIC_MESSAGES),
+                new EnhanceDeploymentRequestFn(proxy, context),
+                new CollectRequestApplicationFilesFn(proxy, context),
+                new BuildUpstreamCacheFn(proxy, context, InterfaceType.ANTHROPIC_MESSAGES),
+                new CollectDeploymentsFn(proxy, context),
+                new ResolveResourceDependenciesFn<>(proxy, context));
     }
 
     /**
@@ -135,8 +143,7 @@ public class MessagesController extends MessagesBaseController {
                             @ApiResponse(code = 500),
                             @ApiResponse(code = 502, description = "Bad Gateway - failed to connect to upstream server", body = @ApiSchema(implementation = ErrorData.class)),
                             @ApiResponse(code = 503)
-                    }
-            )
+                    })
     })
     @Override
     public Future<?> handle() {
@@ -179,7 +186,7 @@ public class MessagesController extends MessagesBaseController {
     /**
      * Must run before the first body write. Spend headers go on a 200 only and carry the state read before the request.
      */
-    private void putLimitHeaders(HttpServerResponse response, HttpClientResponse proxyResponse) {
+    private void putLimitHeaders(HttpServerResponse response, ProxyResponse proxyResponse) {
         AnthropicLimitResponses.stripUpstreamRateLimitHeaders(response.headers());
         if (proxyResponse.statusCode() == 200 && spendCaps != null && spendCaps.reported() != null) {
             AnthropicLimitResponses.putSpendHeaders(response.headers(), spendCaps.reported());
@@ -187,7 +194,7 @@ public class MessagesController extends MessagesBaseController {
     }
 
     @Override
-    protected void processResponse(HttpClientResponse proxyResponse) {
+    protected void processResponse(ProxyResponse proxyResponse) {
         if (!context.isStreamingRequest()) {
             proxyResponse.body()
                     .onSuccess(ignore -> context.setUpstreamBodyReceived(true))
@@ -212,10 +219,10 @@ public class MessagesController extends MessagesBaseController {
                 .onFailure(error -> handleResponseError(error, responseStream));
     }
 
-    private Future<Void> handleNonStreamingResponse(HttpClientResponse proxyResponse, Buffer upstreamBody) {
+    private Future<Void> handleNonStreamingResponse(ProxyResponse proxyResponse, Buffer upstreamBody) {
         // the one buffered answer Core does not otherwise re-serialize: a decided request pays a parse for the router name
         Buffer body = context.getDecision() != null && proxyResponse.statusCode() == 200
-                ? RouterModelFn.rewrite(upstreamBody, context.getDecision().getRouterName()) : upstreamBody;
+                ? RouterModelFn.rewrite(upstreamBody, context.getDecision().getAnswerName()) : upstreamBody;
         context.setResponseBody(body);
         context.setResponseBodyTimestamp(System.currentTimeMillis());
         HttpServerResponse response = context.getResponse();
